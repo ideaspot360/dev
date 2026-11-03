@@ -32,3 +32,4 @@ permalink: /about.html
   <h2>Feedback & Contributions</h2>
   <p>Found a typo, outdated benchmark, or edge case in our guides? All code examples and articles are tracked in our open GitHub repository: <a href="https://github.com/ideaspot360/dev" target="_blank" rel="noopener">github.com/ideaspot360/dev</a>. We welcome issues and pull requests.</p>
 </article>
+

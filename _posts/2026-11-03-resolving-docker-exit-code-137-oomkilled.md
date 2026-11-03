@@ -147,3 +147,4 @@ spec:
 ```
 
 By providing equal `requests.memory` and `limits.memory`, Kubernetes assigns the pod a **Guaranteed QoS class**, minimizing the probability of node-pressure eviction under tight cluster resources.
+

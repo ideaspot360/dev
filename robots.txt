@@ -2,3 +2,4 @@ User-agent: *
 Allow: /
 
 Sitemap: https://dev.ideaspot360.com/sitemap.xml
+

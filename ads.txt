@@ -1,3 +1,4 @@
 # Google AdSense ads.txt for dev.ideaspot360.com
 # Format: google.com, pub-XXXXXXXXXXXXXXXX, DIRECT, f08c47fec0942fa0
 # (Will be populated with actual publisher ID upon AdSense approval)
+
