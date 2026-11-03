@@ -1,0 +1,38 @@
+---
+layout: default
+---
+
+<article class="post-content">
+  <header style="margin-bottom: 28px;">
+    <div class="post-meta">
+      <time datetime="{{ page.date | date_to_xmlschema }}">📅 {{ page.date | date: "%B %d, %Y" }}</time>
+      <span>&bull;</span>
+      <span>✍️ {{ page.author | default: site.author.name }}</span>
+      {% if page.tags %}
+      <span>&bull;</span>
+      <div class="tags" style="display: inline-flex; margin-top: 0;">
+        {% for tag in page.tags %}
+        <span class="tag">#{{ tag }}</span>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+    <h1>{{ page.title }}</h1>
+  </header>
+
+  {% include ads_slot.html %}
+
+  <div class="entry-content">
+    {{ content }}
+  </div>
+
+  {% include ads_slot.html %}
+
+  <!-- Author E-E-A-T Box -->
+  <div style="margin-top: 48px; padding: 24px; border: 1px solid var(--border-color); background: var(--card-bg); border-radius: 8px;">
+    <h4 style="margin-bottom: 8px; font-size: 1.1rem;">About the Author</h4>
+    <p style="color: var(--text-muted); font-size: 0.95rem; margin-bottom: 0;">
+      <strong>{{ site.author.name }}</strong> &mdash; {{ site.author.bio }}
+    </p>
+  </div>
+</article>

@@ -1,0 +1,49 @@
+# Site settings
+title: IdeaSpot360 Dev
+subtitle: Practical Engineering & Cloud Architecture Notes
+email: everhashk@gmail.com
+description: >-
+  In-depth troubleshooting guides, cloud infrastructure post-mortems,
+  and production-ready software engineering solutions. No fluff, just working code.
+baseurl: "" # the subpath of your site, e.g. /blog
+url: "https://dev.ideaspot360.com" # the base hostname & protocol for your site
+twitter_username: ideaspot360
+github_username: ideaspot360
+
+# Build settings
+markdown: kramdown
+kramdown:
+  input: GFM
+  syntax_highlighter: rouge
+  syntax_highlighter_opts:
+    css_class: 'highlight'
+
+# SEO and Social
+author:
+  name: Justin (IdeaSpot360 Lead Engineer)
+  bio: Cloud & Backend Systems Architect specializing in distributed systems, Kubernetes, and high-throughput backend services.
+  avatar: /assets/images/author.png
+
+# Navigation
+header_pages:
+  - about.md
+
+# Ads & Analytics (Configurable)
+google_analytics: "" # e.g. G-XXXXXXXXXX
+google_adsense_client: "" # e.g. ca-pub-XXXXXXXXXXXXXXXX
+
+# Plugins
+plugins:
+  - jekyll-feed
+  - jekyll-seo-tag
+  - jekyll-sitemap
+
+# Exclude from processing
+exclude:
+  - .sass-cache/
+  - .jekyll-cache/
+  - gemfiles/
+  - Gemfile
+  - Gemfile.lock
+  - node_modules/
+  - vendor/
