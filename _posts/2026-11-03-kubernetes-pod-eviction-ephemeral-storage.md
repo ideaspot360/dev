@@ -2,7 +2,7 @@
 title: "Fixing Kubernetes Pod Evictions and CrashLoopBackOff: Ephemeral Storage Limits & EmptyDir Sizing"
 category: "Cloud & DevOps"
 tags: [kubernetes, devops, docker, containers, troubleshooting]
-author: "Justin (IdeaSpot360 Lead Engineer)"
+author: "IdeaSpot360 Engineering Notes"
 excerpt: "When your Kubernetes pods suddenly enter an Evicted or CrashLoopBackOff state due to 'ephemeral-storage exceeded', increasing CPU or RAM limits will not prevent node drain. Here is how k8s local storage accounting actually works."
 ---
 

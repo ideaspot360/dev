@@ -20,8 +20,8 @@ kramdown:
 
 # SEO and Social
 author:
-  name: Justin (IdeaSpot360 Lead Engineer)
-  bio: Cloud & Backend Systems Architect specializing in distributed systems, Kubernetes, and high-throughput backend services.
+  name: IdeaSpot360 Engineering Notes
+  bio: An open technical notebook sharing hands-on post-mortems, kernel-level root causes, and production-ready configs.
   avatar: /assets/images/author.png
 
 # Navigation

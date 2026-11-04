@@ -56,3 +56,4 @@ permalink: /privacy.html
   <h2>6. Contact Us</h2>
   <p>If you have any questions or require more information about our Privacy Policy, please feel free to contact our engineering editorial team at: <strong><a href="mailto:everhashk@gmail.com">everhashk@gmail.com</a></strong>.</p>
 </article>
+
