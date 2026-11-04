@@ -1,0 +1,56 @@
+---
+layout: default
+title: "404: Page Not Found"
+permalink: /404.html
+---
+
+<div style="max-width: 720px; margin: 40px auto; text-align: center;">
+  <div style="display: inline-block; padding: 6px 14px; background: var(--accent-light); color: var(--accent-color); border: 1px solid var(--border-color); border-radius: 20px; font-size: 0.85rem; font-weight: 600; font-family: monospace; margin-bottom: 16px;">
+    HTTP_STATUS_404_NOT_FOUND
+  </div>
+
+  <h1 style="font-size: 3rem; margin-bottom: 12px; font-weight: 800; letter-spacing: -0.03em;">
+    404: Endpoint Evicted
+  </h1>
+
+  <p style="color: var(--text-muted); font-size: 1.1rem; line-height: 1.6; margin-bottom: 32px;">
+    The resource you requested does not exist on this cluster. It may have been relocated, evicted, or garbage-collected.
+  </p>
+
+  <!-- Terminal Style Mock Trace -->
+  <div style="text-align: left; background: var(--pre-bg); color: var(--pre-text); padding: 18px 22px; border-radius: 8px; border: 1px solid var(--border-color); font-family: 'JetBrains Mono', 'Fira Code', Consolas, monospace; font-size: 0.88rem; margin-bottom: 36px; box-shadow: var(--shadow);">
+    <div style="color: #64748b; margin-bottom: 8px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 6px;">
+      // Terminal Debug Console
+    </div>
+    <div style="color: #ef4444;">[ERROR] RouteLookupFailedException: Failed to resolve URI</div>
+    <div style="color: #94a3b8;">&gt; Host: dev.ideaspot360.com</div>
+    <div style="color: #94a3b8;">&gt; Status: 404 (Resource Missing)</div>
+    <div style="color: #10b981;">&gt; Resolution: Fallback to main article index</div>
+  </div>
+
+  <div style="display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-bottom: 56px;">
+    <a href="{{ '/' | relative_url }}" style="padding: 12px 24px; background: var(--accent-color); color: #ffffff; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 0.95rem;">
+      &larr; Return to All Articles
+    </a>
+    <a href="{{ '/about.html' | relative_url }}" style="padding: 12px 24px; background: var(--card-bg); color: var(--text-color); border: 1px solid var(--border-color); text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 0.95rem;">
+      About This Publication
+    </a>
+  </div>
+
+  <!-- Recommended Articles to prevent bounce -->
+  <div style="text-align: left; border-top: 1px solid var(--border-color); padding-top: 36px;">
+    <h3 style="font-size: 1.2rem; margin-bottom: 20px;">Or explore our recent post-mortems:</h3>
+    <div style="display: flex; flex-direction: column; gap: 14px;">
+      {% for post in site.posts limit:3 %}
+      <a href="{{ post.url | relative_url }}" style="text-decoration: none; display: block; padding: 14px 18px; background: var(--card-bg); border: 1px solid var(--border-color); border-radius: 6px; transition: border-color 0.2s;">
+        <div style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 4px;">
+          📅 {{ post.date | date: "%B %d, %Y" }} &bull; {{ post.category }}
+        </div>
+        <div style="font-weight: 600; color: var(--link-color); font-size: 1rem;">
+          {{ post.title }}
+        </div>
+      </a>
+      {% endfor %}
+    </div>
+  </div>
+</div>
