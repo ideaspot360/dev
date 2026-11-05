@@ -6,7 +6,7 @@ author: "IdeaSpot360 Engineering Notes"
 excerpt: "When Redis throws 'OOM command not allowed', increasing instance RAM often triggers catastrophic latency spikes during BGSAVE. Here is how jemalloc memory fragmentation and maxmemory-policy actually interact under heavy write load."
 ---
 
-During a sudden surge in session validation traffic on an e-commerce checkout cluster, every write command (`SET`, `HSET`, `LPUSH`) sent to the primary Redis node was abruptly rejected. Application workers began throwing cascading timeouts, while the Redis CLI returned the following raw terminal error:
+When a Redis instance operates with key eviction disabled (`maxmemory-policy: noeviction`) or under high write concurrency with unexpired keys, the engine abruptly rejects all state-mutating commands (`SET`, `HSET`, `LPUSH`) the moment memory allocation breaches the configured ceiling. Client drivers trigger cascading connection timeouts, while the Redis CLI returns the following raw terminal error:
 
 ```text
 (error) OOM command not allowed when used memory > 'maxmemory'.
@@ -54,7 +54,7 @@ The intuitive reaction of many on-call engineers is to double the instance size 
 
 ### Why this led to a cluster-wide outage:
 1. **Copy-on-Write (COW) Exhaustion during BGSAVE:**  
-   Redis persists snapshots using a `fork()` system call. While modern Linux kernels optimize this through Copy-on-Write, high write rates during flash sales force page duplication across memory pages. When Redis allocated 24GB on a 32GB instance, the background RDB snapshot worker triggered an OS-level Out-of-Memory event (`mm/oom_kill.c`), causing the Linux kernel to abruptly kill the Redis master daemon (`SIGKILL`).
+   Redis persists snapshots using a `fork()` system call. While modern Linux kernels optimize this through Copy-on-Write, high write concurrency forces rapid page duplication across memory pages. When Redis allocated 24GB on a 32GB instance, the background RDB snapshot worker triggered an OS-level Out-of-Memory event (`mm/oom_kill.c`), causing the Linux kernel to abruptly kill the Redis master daemon (`SIGKILL`).
 2. **The `noeviction` Default Trap:**  
    The default Redis eviction policy is `noeviction`. Under `noeviction`, Redis will never delete keys—even expired ones—when `maxmemory` is reached. It simply returns errors for any command requiring memory allocation while serving reads. Bumping limits merely delayed the crash by 20 minutes.
 
