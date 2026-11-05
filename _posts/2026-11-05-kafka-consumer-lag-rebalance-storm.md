@@ -190,3 +190,4 @@ Verify cluster stability post-deployment by querying JMX metrics via Prometheus/
    Must remain strictly at `0`. Any increment indicates consumers continuing to trip `max.poll.interval.ms`.
 
 By enforcing bounded batch sizes (`max.poll.records`) and deploying incremental cooperative assignment, Kafka consumer clusters remain immune to cascading rebalance storms even during massive input traffic spikes.
+
