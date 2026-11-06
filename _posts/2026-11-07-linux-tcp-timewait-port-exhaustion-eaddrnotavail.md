@@ -211,3 +211,4 @@ ss -s
 | **Total Usable Ephemeral Ports** | 28,231 ports | 64,511 ports | **+128% Capacity** |
 
 By coupling Linux kernel socket reuse (`tcp_tw_reuse = 1`) with transport-layer HTTP connection pooling, outbound networking remains rock solid even during massive high-throughput bursts.
+
