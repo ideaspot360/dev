@@ -24,5 +24,6 @@ jobs:
 
       - name: Create empty commit to trigger GitHub Pages build
         run: |
-          git commit --allow-empty -m "chore(schedule): trigger daily Jekyll rebuild for $(date '+%Y-%m-%d') [skip ci]"
+          git commit --allow-empty -m "chore(schedule): trigger daily Jekyll rebuild for $(date '+%Y-%m-%d')"
           git push origin main
+
