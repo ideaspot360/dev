@@ -2,9 +2,9 @@ name: Daily Scheduled Jekyll Build
 
 on:
   schedule:
-    # 매일 한국 시간(KST) 오전 10:35에 자동 실행 (UTC 01:35)
-    # cron: '분 시 일 월 요일' (UTC 기준)
-    - cron: '35 1 * * *'
+    # 매일 한국 시간(KST) 오전 09:00 (UTC 00:00) 기준으로 cron 발동
+    # 이후 워크플로우 내부에서 10~55분 사이 랜덤 지터(Anti-Bot Jitter) 적용
+    - cron: '0 0 * * *'
   workflow_dispatch: # GitHub 웹 화면에서 수동 즉시 실행 가능
 
 permissions:
@@ -21,6 +21,14 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Anti-bot random jitter delay (10~55min)
+        run: |
+          # 헌법: 기계적 정각 발행 금지 / 안티봇 랜덤 분(Jitter) 원칙
+          # 600~3300초(10분~55분) 사이 랜덤 대기 → 실제 발행: KST 09:10~09:55 사이 랜덤
+          DELAY=$((RANDOM % 2701 + 600))
+          echo "Anti-bot jitter: waiting ${DELAY} seconds ($(( DELAY / 60 )) min $(( DELAY % 60 )) sec)..."
+          sleep $DELAY
 
       - name: Create empty commit to trigger GitHub Pages build
         run: |
