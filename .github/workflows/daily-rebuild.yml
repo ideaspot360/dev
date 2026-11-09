@@ -1,0 +1,28 @@
+name: Daily Scheduled Jekyll Build
+
+on:
+  schedule:
+    # 매일 한국 시간(KST) 오전 10:35에 자동 실행 (UTC 01:35)
+    # cron: '분 시 일 월 요일' (UTC 기준)
+    - cron: '35 1 * * *'
+  workflow_dispatch: # GitHub 웹 화면에서 수동 즉시 실행 가능
+
+permissions:
+  contents: write
+
+jobs:
+  trigger-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create empty commit to trigger GitHub Pages build
+        run: |
+          git commit --allow-empty -m "chore(schedule): trigger daily Jekyll rebuild for $(date '+%Y-%m-%d') [skip ci]"
+          git push origin main
