@@ -11,7 +11,6 @@ twitter_username: ideaspot360
 github_username: ideaspot360
 
 # Build settings
-future: true
 markdown: kramdown
 kramdown:
   input: GFM
