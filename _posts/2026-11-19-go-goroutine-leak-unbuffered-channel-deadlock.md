@@ -111,3 +111,4 @@ func sendWithTimeout(ctx context.Context, payload []byte) error {
 By changing `make(chan error)` to `make(chan error, 1)`, the child goroutine can always write its result to the 1-slot buffer non-blockingly and terminate cleanly, allowing the garbage collector to reclaim the goroutine's stack and memory.
 
 After applying this single-line patch, goroutines remained flat at ~450 across all traffic spikes, and memory consumption stabilized under 420 MB.
+

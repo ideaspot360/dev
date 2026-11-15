@@ -106,3 +106,4 @@ With the 4-character hex prefix (`16^4 = 65,536` potential distinct partition pa
 - **HTTP 503 SlowDown Error Rate**: Dropped from 38.4% to **0.00%**.
 - **End-to-End Batch Export Time**: Reduced from 4+ hours down to **18 minutes**.
 - **Effective Write Throughput**: Scaled seamlessly to 48,000 PUTs/sec without a single throttling incident.
+

@@ -105,3 +105,4 @@ The definitive architectural fix is reusing TCP sessions across requests:
 ```
 
 After deploying NGINX keep-alive and kernel `tcp_tw_reuse`, active `TIME_WAIT` sockets collapsed from 28,000+ to under 120, eliminating 99% of TCP handshake overhead and dropping p99 latency to 3.8ms.
+

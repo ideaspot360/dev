@@ -74,3 +74,4 @@ Following the switch to Generational ZGC under production load:
 - **Maximum STW Pause**: Plummeted from 2,419ms to **0.38ms** (99.98% reduction).
 - **Time-to-Safepoint (TTSP)**: Normalized to <1.2ms.
 - **p99.9 Application Latency**: Dropped from 4,800ms to **4.1ms**, completely eradicating downstream timeout exceptions.
+
