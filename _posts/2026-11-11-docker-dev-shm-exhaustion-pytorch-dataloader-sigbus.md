@@ -1,4 +1,5 @@
 ---
+category: "Cloud & DevOps"
 layout: post
 title: "Fixing Docker /dev/shm Exhaustion: Python PyTorch DataLoader Bus Error (SIGBUS)"
 date: 2026-11-11 11:18:00 +0900

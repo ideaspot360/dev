@@ -1,4 +1,5 @@
 ---
+category: "Database & Storage"
 layout: post
 title: "PostgreSQL Production Emergency: Transaction ID Wraparound and Autovacuum Freeze Starvation"
 date: 2026-11-17 11:08:00 +0900

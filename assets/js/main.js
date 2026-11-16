@@ -61,7 +61,121 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // 3. Ultra-Precision Pan-Zoom Lightbox Engine
   initPanZoomLightbox();
+
+  // 4. Interactive Category Filter Engine
+  initCategoryFilter();
 });
+
+function initCategoryFilter() {
+  const nav = document.getElementById("category-filter-nav");
+  const postList = document.getElementById("post-list");
+  if (!nav || !postList) return;
+
+  const buttons = nav.querySelectorAll(".category-btn");
+  const cards = postList.querySelectorAll(".post-card");
+  const noPostsMsg = document.getElementById("no-posts-found");
+
+  // Dynamically count posts per category and update badges
+  const counts = { all: cards.length };
+  cards.forEach((card) => {
+    const cat = card.getAttribute("data-category") || "Engineering";
+    counts[cat] = (counts[cat] || 0) + 1;
+  });
+
+  buttons.forEach((btn) => {
+    const targetCat = btn.getAttribute("data-category");
+    const countBadge = btn.querySelector(".category-count");
+    if (countBadge) {
+      if (targetCat === "all") {
+        countBadge.textContent = counts.all || 0;
+      } else if (counts[targetCat]) {
+        countBadge.textContent = counts[targetCat];
+      }
+    }
+  });
+
+  // Filter Function
+  function applyFilter(categoryName, updateHash = true) {
+    let visibleCount = 0;
+
+    buttons.forEach((b) => {
+      const match = b.getAttribute("data-category") === categoryName;
+      b.classList.toggle("active", match);
+      b.setAttribute("aria-selected", match ? "true" : "false");
+    });
+
+    cards.forEach((card) => {
+      const cardCat = card.getAttribute("data-category");
+      const isVisible = categoryName === "all" || cardCat === categoryName;
+
+      if (isVisible) {
+        card.style.display = "block";
+        card.classList.remove("fade-in");
+        void card.offsetWidth; // Trigger reflow
+        card.classList.add("fade-in");
+        visibleCount++;
+      } else {
+        card.style.display = "none";
+        card.classList.remove("fade-in");
+      }
+    });
+
+    if (noPostsMsg) {
+      noPostsMsg.style.display = visibleCount === 0 ? "block" : "none";
+    }
+
+    if (updateHash) {
+      if (categoryName === "all") {
+        history.replaceState(null, "", window.location.pathname);
+      } else {
+        const slug = categoryName.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+        history.replaceState(null, "", `#cat-${slug}`);
+      }
+    }
+  }
+
+  // Button Click Events
+  buttons.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const cat = btn.getAttribute("data-category");
+      applyFilter(cat, true);
+    });
+  });
+
+  // Category Pill Click Inside Cards
+  document.addEventListener("click", (e) => {
+    const pill = e.target.closest(".category-pill");
+    if (pill) {
+      e.preventDefault();
+      e.stopPropagation();
+      const catName = pill.textContent.trim();
+      applyFilter(catName, true);
+      window.scrollTo({ top: nav.offsetTop - 80, behavior: "smooth" });
+    }
+  });
+
+  // Handle Initial URL Hash (e.g., #cat-cloud-devops)
+  function checkHash() {
+    const hash = window.location.hash;
+    if (hash && hash.startsWith("#cat-")) {
+      const slug = hash.replace("#cat-", "");
+      let foundCategory = "all";
+      buttons.forEach((btn) => {
+        const cat = btn.getAttribute("data-category");
+        if (cat.toLowerCase().replace(/[^a-z0-9]+/g, "-") === slug) {
+          foundCategory = cat;
+        }
+      });
+      if (foundCategory !== "all") {
+        applyFilter(foundCategory, false);
+      }
+    }
+  }
+
+  checkHash();
+  window.addEventListener("hashchange", checkHash);
+}
+
 
 function initPanZoomLightbox() {
   const images = document.querySelectorAll(".entry-content img, article.post-content img");

@@ -1,6 +1,6 @@
 ---
 title: "Fixing Redis OOM: 'command not allowed when used memory > maxmemory' - Eviction Policies and jemalloc Fragmentation"
-category: "Database & Backend"
+category: "Database & Storage"
 tags: [redis, caching, backend, devops, database, troubleshooting]
 author: "IdeaSpot360 Engineering Notes"
 excerpt: "When Redis throws 'OOM command not allowed', increasing instance RAM often triggers catastrophic latency spikes during BGSAVE. Here is how jemalloc memory fragmentation and maxmemory-policy actually interact under heavy write load."

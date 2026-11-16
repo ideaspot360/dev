@@ -1,4 +1,5 @@
 ---
+category: "Systems & Networking"
 layout: post
 title: "Resolving Kafka LeaderNotAvailableException: Under-Replicated Partitions & Min In-Sync Replicas"
 date: 2026-11-14 11:05:00 +0900

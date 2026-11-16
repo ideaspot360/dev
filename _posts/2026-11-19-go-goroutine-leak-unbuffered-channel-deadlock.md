@@ -1,4 +1,5 @@
 ---
+category: "Systems & Networking"
 layout: post
 title: "Production Post-Mortem: Silent Goroutine Leak via Unbuffered Channel Deadlocks"
 date: 2026-11-19 11:25:00 +0900

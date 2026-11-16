@@ -2,7 +2,7 @@
 layout: post
 title: "Fixing Kafka Consumer Lag & Rebalance Storms: CommitFailedException, max.poll.interval.ms, and Cooperative Sticky Assignor"
 date: 2026-11-05 10:00:00 +0900
-category: "Backend & Distributed Systems"
+category: "Systems & Networking"
 tags: [kafka, distributed-systems, backend, spring-boot, microservices, troubleshooting]
 author: "IdeaSpot360 Engineering Notes"
 excerpt: "When Kafka consumers repeatedly crash with CommitFailedException and trigger rebalance storms, increasing max.poll.interval.ms hides thread starvation. Here is how group coordinator timeouts, poll records sizing, and cooperative sticky assignors actually operate."

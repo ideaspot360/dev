@@ -7,14 +7,39 @@ layout: default
   <p>Production-tested troubleshooting, cloud architecture, and modern backend engineering notes without the fluff.</p>
 </section>
 
+<!-- Interactive Category Filter Bar -->
+<section class="category-section">
+  <div class="category-nav" id="category-filter-nav" role="tablist" aria-label="Topic Categories">
+    <button class="category-btn active" data-category="all" role="tab" aria-selected="true">
+      <span class="category-name">All Topics</span>
+      <span class="category-count" id="count-all">22</span>
+    </button>
+    <button class="category-btn" data-category="Cloud & DevOps" role="tab" aria-selected="false">
+      <span class="category-icon">☁️</span>
+      <span class="category-name">Cloud & DevOps</span>
+      <span class="category-count" id="count-cloud">6</span>
+    </button>
+    <button class="category-btn" data-category="Database & Storage" role="tab" aria-selected="false">
+      <span class="category-icon">🗄️</span>
+      <span class="category-name">Database & Storage</span>
+      <span class="category-count" id="count-db">8</span>
+    </button>
+    <button class="category-btn" data-category="Systems & Networking" role="tab" aria-selected="false">
+      <span class="category-icon">⚡</span>
+      <span class="category-name">Systems & Networking</span>
+      <span class="category-count" id="count-sys">8</span>
+    </button>
+  </div>
+</section>
+
 <section>
-  <div class="post-list">
+  <div class="post-list" id="post-list">
     {% for post in site.posts %}
-    <a href="{{ post.url | relative_url }}" class="post-card">
+    <a href="{{ post.url | relative_url }}" class="post-card" data-category="{{ post.category | default: 'Engineering' }}">
       <div class="post-meta">
         <time datetime="{{ post.date | date_to_xmlschema }}">📅 {{ post.date | date: "%b %d, %Y" }}</time>
         <span>&bull;</span>
-        <span>{{ post.category | default: "Engineering" }}</span>
+        <span class="category-pill cat-{{ post.category | slugify }}">{{ post.category | default: "Engineering" }}</span>
       </div>
       <h2>{{ post.title }}</h2>
       <p class="post-excerpt">{{ post.excerpt | strip_html | strip_newlines | truncate: 180 }}</p>
@@ -30,5 +55,7 @@ layout: default
     <p style="color: var(--text-muted); text-align: center; padding: 40px 0;">No articles published yet. Stay tuned!</p>
     {% endfor %}
   </div>
+  <div id="no-posts-found" class="no-posts-found" style="display: none;">
+    <p>No articles found in this category yet. Check back soon!</p>
+  </div>
 </section>
-

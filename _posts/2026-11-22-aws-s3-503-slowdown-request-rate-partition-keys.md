@@ -1,4 +1,5 @@
 ---
+category: "Cloud & DevOps"
 layout: post
 title: "Production Post-Mortem: Mitigating AWS S3 503 SlowDown Throttling via High-Entropy Partition Prefixes"
 date: 2026-11-22 10:29:00 +0900

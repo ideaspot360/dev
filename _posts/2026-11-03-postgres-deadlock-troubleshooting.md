@@ -1,6 +1,6 @@
 ---
 title: "Debugging PostgreSQL Deadlocks: Root Cause, Row-Level Lock Queues & Advisory Locks"
-category: "Database & Backend"
+category: "Database & Storage"
 tags: [postgresql, database, backend, sql, troubleshooting]
 author: "IdeaSpot360 Engineering Notes"
 excerpt: "When PostgreSQL throws 'deadlock detected: Process 4120 waits for ShareLock on transaction', simply retrying hides race conditions. Here is how row-level lock trees and foreign key validation actually behave."

@@ -1,4 +1,5 @@
 ---
+category: "Database & Storage"
 layout: post
 title: "Fixing Elasticsearch CircuitBreakingException: Data Too Large & Fielddata Cache OOM"
 date: 2026-11-13 10:29:00 +0900

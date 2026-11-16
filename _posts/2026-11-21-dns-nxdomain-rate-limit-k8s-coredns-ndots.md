@@ -1,4 +1,5 @@
 ---
+category: "Cloud & DevOps"
 layout: post
 title: "Production Post-Mortem: Kubernetes 5-Second DNS Latency Spikes and ndots:5 CoreDNS Saturation"
 date: 2026-11-21 11:15:00 +0900

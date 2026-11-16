@@ -1,4 +1,5 @@
 ---
+category: "Database & Storage"
 layout: post
 title: "Fixing Redis OOM: maxmemory-policy & Volatile-TTL Eviction Under High Write Loads"
 date: 2026-11-16 10:14:00 +0900

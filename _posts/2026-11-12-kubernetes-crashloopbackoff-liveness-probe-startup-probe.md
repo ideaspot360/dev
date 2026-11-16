@@ -1,4 +1,5 @@
 ---
+category: "Cloud & DevOps"
 layout: post
 title: "Troubleshooting Kubernetes CrashLoopBackOff: Liveness Probe Misconfiguration & Startup Probes"
 date: 2026-11-12 10:46:00 +0900

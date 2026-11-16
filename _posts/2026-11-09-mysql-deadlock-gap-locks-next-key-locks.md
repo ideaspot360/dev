@@ -1,4 +1,5 @@
 ---
+category: "Database & Storage"
 layout: post
 title: "Fixing MySQL Deadlock in High-Concurrency Transactions: Gap Locks vs Next-Key Locks"
 date: 2026-11-09 10:14:00 +0900

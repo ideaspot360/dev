@@ -2,7 +2,7 @@
 layout: post
 title: "JVM Metaspace OutOfMemoryError & ClassLoader Leaks: Why Jacking Up MaxMetaspaceSize Fails and How Native Memory Tracking Fixes It"
 date: 2026-11-08 09:00:00 +0900
-category: "Backend & Performance"
+category: "Systems & Networking"
 tags: [jvm, java, spring-boot, memory-leak, performance-tuning, troubleshooting]
 author: "IdeaSpot360 Engineering Notes"
 excerpt: "When Spring Boot services crash with java.lang.OutOfMemoryError: Metaspace, endlessly increasing -XX:MaxMetaspaceSize invites host kernel OOM kills. Here is how Native Memory Tracking (NMT), ClassLoader lifecycles, and dynamic proxy cache sizing resolve native leaks."

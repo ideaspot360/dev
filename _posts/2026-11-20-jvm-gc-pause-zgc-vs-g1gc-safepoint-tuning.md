@@ -1,4 +1,5 @@
 ---
+category: "Systems & Networking"
 layout: post
 title: "Production Post-Mortem: Multi-Second Safepoint Latency in Java: Migrating G1GC to Generational ZGC"
 date: 2026-11-20 10:48:00 +0900

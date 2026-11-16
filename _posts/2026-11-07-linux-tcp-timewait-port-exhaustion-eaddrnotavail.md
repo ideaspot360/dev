@@ -2,7 +2,7 @@
 layout: post
 title: "Linux TCP TIME_WAIT Saturation & EADDRNOTAVAIL: Why tcp_tw_recycle Fails and How tcp_tw_reuse Solves Port Exhaustion"
 date: 2026-11-07 07:00:00 +0900
-category: "Network & Infrastructure"
+category: "Systems & Networking"
 tags: [linux, networking, tcp-ip, troubleshooting, high-throughput, microservices]
 author: "IdeaSpot360 Engineering Notes"
 excerpt: "When microservices flood upstream APIs, active TCP connection closures trigger massive TIME_WAIT port exhaustion with EADDRNOTAVAIL (Cannot assign requested address). Here is why tcp_tw_recycle breaks behind NAT and how tcp_tw_reuse with socket pooling fixes it."

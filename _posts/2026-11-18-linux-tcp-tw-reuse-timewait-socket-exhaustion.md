@@ -1,4 +1,5 @@
 ---
+category: "Systems & Networking"
 layout: post
 title: "Production Post-Mortem: Linux TCP TIME_WAIT Socket Exhaustion and tcp_tw_reuse Pitfalls"
 date: 2026-11-18 10:37:00 +0900

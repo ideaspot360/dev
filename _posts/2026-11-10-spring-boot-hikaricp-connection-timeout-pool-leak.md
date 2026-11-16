@@ -1,4 +1,5 @@
 ---
+category: "Database & Storage"
 layout: post
 title: "Resolving Spring Boot HikariCP Connection Timeout: Pool Leak & LeakDetectionThreshold"
 date: 2026-11-10 10:37:00 +0900

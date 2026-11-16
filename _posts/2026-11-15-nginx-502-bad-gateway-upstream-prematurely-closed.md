@@ -1,4 +1,5 @@
 ---
+category: "Systems & Networking"
 layout: post
 title: "Fixing Nginx 502 Bad Gateway: upstream prematurely closed connection & keepalive_timeout"
 date: 2026-11-15 10:52:00 +0900
