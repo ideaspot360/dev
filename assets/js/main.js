@@ -81,7 +81,7 @@ function initPanZoomLightbox() {
     <div class="panzoom-viewport" id="pz-viewport">
       <img class="panzoom-image" id="pz-image" src="" alt="Zoomable Image">
     </div>
-    <div class="panzoom-hint">🖱️ 휠: 줌 인/아웃 | 드래그: 이동 (Pan) | 더블클릭: 2.5x 확대 | ESC: 닫기</div>
+    <div class="panzoom-hint">🖱️ 휠: 줌 인/아웃 | 드래그/방향키: 이동 | 더블클릭: 2.5x | +, -: 줌 | 0/R: 리셋 | ESC: 닫기</div>
   `;
   document.body.appendChild(modal);
 
@@ -250,10 +250,39 @@ function initPanZoomLightbox() {
     }
   });
 
-  // Close on ESC Key
+  // Keyboard Navigation & Shortcuts (+, -, 0, R, Arrow keys, ESC)
   window.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && modal.classList.contains("active")) {
+    if (!modal.classList.contains("active")) return;
+
+    if (e.key === "Escape") {
       closeModal();
+    } else if (e.key === "+" || e.key === "=") {
+      e.preventDefault();
+      zoomAt(scale * 1.25, 0, 0);
+      updateTransform(true);
+    } else if (e.key === "-" || e.key === "_") {
+      e.preventDefault();
+      zoomAt(scale * 0.8, 0, 0);
+      updateTransform(true);
+    } else if (e.key === "0" || e.key === "r" || e.key === "R") {
+      e.preventDefault();
+      resetZoom();
+    } else if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      translateX += 50;
+      updateTransform(true);
+    } else if (e.key === "ArrowRight") {
+      e.preventDefault();
+      translateX -= 50;
+      updateTransform(true);
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      translateY += 50;
+      updateTransform(true);
+    } else if (e.key === "ArrowDown") {
+      e.preventDefault();
+      translateY -= 50;
+      updateTransform(true);
     }
   });
 }
