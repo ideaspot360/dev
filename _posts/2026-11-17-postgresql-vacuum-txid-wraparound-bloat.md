@@ -44,6 +44,18 @@ In this incident, autovacuum workers were starved due to overly conservative cos
 3. **Oldest TXID Distance Exceeded**:
    `datfrozenxid` in `pg_database` drifted past `autovacuum_freeze_max_age` (200,000,000), crossing into emergency failsafe territory.
 
+## Common Missteps: Dangerous Workarounds When Facing Vacuum Lag
+
+When PostgreSQL transaction ID age advances dangerously or autovacuum workers consume noticeable disk I/O, teams often consider two tempting but catastrophic moves:
+
+### Misstep 1: Disabling or Severely Throttling Autovacuum During Peak Hours
+When autovacuum causes disk I/O spikes during busy periods, a dangerously common reflex is disabling autovacuum (`autovacuum = off`) or cranking `autovacuum_vacuum_cost_delay` to high values to "stop it from competing with our user queries."
+* **Why It Is Disastrous**: Turning off autovacuum only guarantees a complete production outage later. PostgreSQL's 32-bit transaction counter never stops incrementing. Postponing vacuuming merely allows `age(datfrozenxid)` to march toward the 2-billion limit. Once `autovacuum_freeze_max_age` is breached, the engine launches forced anti-wraparound vacuum workers regardless of whether `autovacuum = off` is set, and if they still cannot complete in time, the postmaster hard-shuts down and rejects all client connections.
+
+### Misstep 2: Running `VACUUM FULL` on Bloated Production Tables
+Another common mistake when tables bloat is issuing `VACUUM FULL`.
+* **Why It Fails in Production**: Unlike regular `VACUUM`, `VACUUM FULL` completely rewrites the relation into a new disk file and acquires an `ACCESS EXCLUSIVE` lock. This blocks all concurrent `SELECT`, `INSERT`, `UPDATE`, and `DELETE` queries for the entire duration of the rewrite. On multi-hundred-gigabyte tables, this creates a total application freeze for hours and requires 2x free disk space, frequently triggering disk exhaustion mid-run.
+
 ## Incident Resolution & Single-User Recovery
 Because the engine entered `FATAL` emergency mode, all TCP/Unix-socket client connections were rejected. Recovery required executing `VACUUM FREEZE` in standalone single-user mode.
 

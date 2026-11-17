@@ -40,6 +40,22 @@ Two distinct problems compounded to create the 4.8-second disaster:
 1. **Safepoint Bias & Counted Loops**: In Java, JIT-compiled loops with `int` counters historically omit safepoint polling checks by default (`-XX:+UseCountedLoopSafepoints` was not explicitly enabled). A long-running array hashing loop prevented a worker thread from yielding, causing all other 63 threads to stall for 2.2 seconds simply waiting to enter the safepoint.
 2. **G1GC Humongous Allocations & Evacuation Failures**: Deserializing large 8MB transaction settlement batches created "Humongous Objects" that bypassed the young generation and directly fragmented contiguous 16MB G1 regions, forcing synchronous multi-second STW compaction phases.
 
+## Common Missteps: Why Naive JVM Heap Tuning Fails
+
+When Java applications experience multi-second latency spikes from GC pauses and Time-to-Safepoint (TTSP) delays, teams frequently try intuitive adjustments that fail to solve the underlying mechanism:
+
+### Misstep 1: Blindly Expanding Heap Size (`-Xmx32g -> -Xmx64g` or `-Xmx128g`)
+The most natural first reaction to GC pauses is to assume the JVM is running low on heap space and simply allocate more memory.
+* **Why It Fails**: In Stop-the-World collectors like G1GC, a larger heap merely reduces the frequency of pauses while dramatically increasing their duration. When G1GC eventually encounters humongous object fragmentation or evacuation failures on a 64GB or 128GB heap, the STW phase has to mark, copy, and compact an even larger graph of objects. A 2.4-second pause easily transforms into an 8-to-15-second freeze, making timeout cascades far worse.
+
+### Misstep 2: Setting Unrealistic Target Pauses (`-XX:MaxGCPauseMillis=50`)
+Another common attempt is forcing G1GC to adhere to very low pause goals, such as `-XX:MaxGCPauseMillis=50` or `20`.
+* **Why It Backfires**: G1GC uses heuristics to estimate how many regions it can collect within the pause target. When the target is set unnaturally low, G1GC collects only a tiny fraction of garbage per cycle. Garbage generation quickly outpaces reclamation, leading to concurrent marking exhaustion, heap saturation, and ultimately a catastrophic Full GC fallback that halts all threads for seconds.
+
+### Misstep 3: Blaming Downstream Network or DB Timeouts
+Because the symptom manifests as client disconnections or missed heartbeats, teams often spend days tuning downstream TCP socket timeouts, database pool query timeouts, or client retry counts.
+* **Why It Misses the Cause**: When mutator threads are stalled waiting for a rogue loop thread to reach a safepoint, the entire JVM is frozen in user space. The issue is not that downstream systems are slow; the application itself is suspended and cannot even read completed socket responses from OS kernel buffers.
+
 ## The Paradigm Shift: Generational ZGC
 Introduced in JDK 21 via JEP 439, **Generational ZGC** decouples pause times from heap size. While G1GC performs object evacuation during Stop-the-World pauses, ZGC performs marking, relocation, and reference remapping **concurrently** while Java threads continue executing.
 

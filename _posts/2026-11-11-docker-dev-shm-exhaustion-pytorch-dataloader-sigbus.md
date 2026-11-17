@@ -50,7 +50,21 @@ PyTorch DataLoader spawns multiple worker processes to load images and pre-proce
 
 ---
 
-## 2. Before vs. After Remediation
+## 2. Common Missteps: What Doesn't Work (And Why)
+
+When PyTorch abruptly dies with a `Bus error` inside DataLoader workers, engineers typically reach for two quick workarounds. Both are deeply problematic in real production workflows:
+
+### Misstep 1: Throttling `num_workers=0` or Slashing Batch Size
+The most immediate reflex is setting `num_workers=0` in the DataLoader, forcing tensor transforms into the main Python process.
+* **The Problem**: While this avoids POSIX shared memory allocations and prevents the `SIGBUS` crash, it completely bottlenecks the GPU pipeline. The training loop now has to wait synchronously for CPU image decoding and data augmentation between every mini-batch. In our benchmarks, GPU compute utilization dropped from **98% down to 17%**, turning an 8-hour training run into a 45-hour crawl. Reducing the batch size to single digits similarly harms training convergence and model throughput.
+
+### Misstep 2: Passing `--ipc=host` Without Considering Security
+Another common piece of advice circulating on discussion forums is passing `--ipc=host` to the `docker run` command.
+* **The Problem**: While this allows the container to share the host's `/dev/shm` directly, it completely tears down container namespace isolation. In shared multi-tenant clusters or strict corporate infrastructure, sharing the host IPC namespace grants the container visibility into host POSIX message queues and shared memory segments used by unrelated processes. Many enterprise Kubernetes admission controllers explicitly reject pods configured with `hostIPC: true` for security compliance.
+
+---
+
+## 3. Before vs. After Remediation
 
 ### Approach A: Docker CLI / Compose Hardening
 Override the default 64MB shared memory via `--shm-size`:

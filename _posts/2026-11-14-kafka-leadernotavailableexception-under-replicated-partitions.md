@@ -7,7 +7,7 @@ categories: [Backend, Kafka]
 tags: [Kafka, EventDriven, DistributedSystems, LeaderElection, KRaft]
 ---
 
-During rolling broker restarts or sudden network partitions in high-volume Apache Kafka clusters, producers frequently experience burst message publish failures accompanied by `LeaderNotAvailableException` and soaring `UnderReplicatedPartitions` metrics.
+During rolling broker restarts or transient network hiccups, Kafka producers often get hit with burst publish failures accompanied by `LeaderNotAvailableException` and `NotEnoughReplicasException`, while cluster dashboards flash spikes in `UnderReplicatedPartitions`.
 
 The producer error log displays continuous record batch aborts:
 
@@ -43,7 +43,21 @@ When Broker 3 restarts for OS patching, its local partition replicas temporarily
 
 ---
 
-## 2. Before vs. After Remediation
+## 2. Common Missteps: Dangerous Workarounds That Compromise Durability
+
+When producers are blocked by `NotEnoughReplicasException`, the pressure to restore traffic often pushes teams toward dangerous shortcuts that trade durability for availability:
+
+### Dangerous Shortcut 1: Downgrading Producer Durability (`acks=1` or `acks=0`)
+The fastest way to silence producer errors in the short term is relaxing client acknowledgments—changing `acks=all` to `acks=1`.
+* **The Danger**: When `acks=1`, the producer considers a message successfully sent the moment the single partition leader writes it to local disk, completely bypassing `min.insync.replicas`. If that leader broker crashes or restarts before follower replicas fetch the uncommitted log segments, those records are permanently lost. For financial ledgers, audit trails, or order event streams, silent data loss is far worse than transient backpressure.
+
+### Dangerous Shortcut 2: Enabling `unclean.leader.election.enable=true`
+Another tempting reflex is toggling `unclean.leader.election.enable=true` on the cluster to force partition availability at all costs when the in-sync replica count drops below quorum.
+* **The Danger**: This allows an out-of-sync replica—one that may have missed thousands of committed records—to be elected partition leader. The moment the new unclean leader begins accepting writes, the high watermark resets, and all previous un-replicated records on the old leader are permanently truncated. This causes irreversible state divergence between producers and downstream consumers.
+
+---
+
+## 3. Before vs. After Remediation
 
 ### Approach A: Balance `replica.lag.time.max.ms` & Broker Heap GC
 Short lag thresholds trigger premature ISR evictions during normal GC pauses. Adjust cluster-wide broker settings in `server.properties`:
