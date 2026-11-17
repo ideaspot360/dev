@@ -16,7 +16,7 @@ Message:      The node was low on resource: ephemeral-storage.
               Container app was using 6291456000, requesting 1073741824.
 ```
 
-Or subsequently:
+Or subsequently in cluster event streams:
 
 ```text
 Events:
@@ -26,9 +26,7 @@ Events:
   Normal   Killing    2m                 kubelet            Stopping container billing-worker
 ```
 
-Unlike CPU throttling (which merely delays response times) or RAM exhaustion (which triggers `OOMKilled exit code 137`), **ephemeral storage eviction immediately terminates the pod and schedules a reschedule**. If multiple pods on the same worker node breach storage thresholds simultaneously, cascading node evictions can disrupt cluster stability.
-
-Here is how to identify where untracked disk bloat originates inside container runtimes and configure bulletproof ephemeral storage boundaries.
+Unlike CPU throttling (which merely delays response times) or RAM exhaustion (which triggers `OOMKilled exit code 137`), ephemeral storage eviction immediately terminates the pod and schedules a reschedule. If multiple pods on the same worker node breach storage thresholds simultaneously, cascading node evictions can disrupt cluster stability.
 
 ---
 
@@ -57,51 +55,45 @@ resources:
 ```
 
 ### Why this fails:
-Kubelet calculates a container’s local ephemeral storage consumption ($S_{ephemeral}$) as the aggregate of three distinct layers:
+Kubelet calculates a container’s local ephemeral storage consumption as the aggregate of three distinct layers:
 
-$$S_{ephemeral} = S_{\text{container writable layer (rootfs)}} + S_{\text{stdout/stderr logs}} + S_{\text{emptyDir volumes}}$$
+1. **The Container Writable Layer (`upperdir`):** Dynamic files written directly to the container root filesystem outside mounted volumes.
+2. **Container stdout/stderr Logs:** Managed by containerd under `/var/log/pods/`.
+3. **Mounted `emptyDir` Volumes:** Local directories provisioned by kubelet under `/var/lib/kubelet/pods/<pod-uid>/volumes/kubernetes.io~empty-dir/`.
 
 Even if your container runtime truncates `stdout` logs at `10MB`, applications that:
 1. Generate uncompressed PDF exports or temporary CSV reports in `/tmp`
-2. Download dynamic model weights or ML artifacts at runtime
-3. Retain unpruned Lucene/Elasticsearch index segments in local directories
+2. Download intermediate ML model weights directly into working directories
+3. Fail to purge ephemeral SQLite or RocksDB caches
 
 will rapidly bloat the container's **writable layer (`upperdir`)**. Once this layer breaches the kubelet eviction threshold, the node drops the hammer regardless of CPU or memory margins.
 
 ---
 
-## 3. Diagnosing Disk Consumption Inside the Pod
+## 3. Root Cause Analysis: How Kubelet Measures Storage Exceeded
 
-Before the pod is killed, identify which directory is ballooning in storage. Execute an interactive exec into a running replica:
-
-```bash
-kubectl exec -it <pod-name> -n production -- df -h
-```
-
-Then identify disk hogs by depth:
+To locate which specific directory breached local limits before the container gets killed, execute a direct scan inside the running pod or directly on the node's overlayfs path:
 
 ```bash
-kubectl exec -it <pod-name> -n production -- du -ah / 2>/dev/null | sort -rh | head -n 20
+# Step 1: Trace root directory storage consumption within the pod
+kubectl exec -it billing-worker-7f9b8c64-x8k2p -n production -- du -h -d 1 / 2>/dev/null | sort -hr | head -n 10
 ```
 
-Typical output revealing the leak:
+Sample output pinpointing runaway write directories:
+
 ```text
-4.8G    /tmp/report_cache
+4.8G    /tmp
 1.2G    /var/log/application.log
 320M    /app/node_modules
 ```
 
-Notice `/tmp/report_cache` consumed nearly 5GB of the container's root file system.
+Notice `/tmp` consumed nearly 5GB of the container's root file system. By default, `/tmp` writes directly to `overlayfs` on the host root EBS volume. Kubelet's periodic housekeeping loop (default every 10 seconds) executes `statfs` across node partitions. When free storage drops below the node eviction threshold (`nodefs.available<15%`), kubelet sorts candidate pods by storage consumption relative to requests and evicts the highest consumer immediately.
 
 ---
 
 ## 4. The Architectural Fix: Decoupling Temp Storage with Memory-Backed `emptyDir`
 
-To protect the container filesystem from unconstrained writes, explicitly route high-throughput temporary directories (`/tmp`, `/app/cache`) to an isolated `emptyDir` volume.
-
-### Implementation: RAM-Backed Temp Mount
-
-For workloads generating ephemeral artifacts, mounting `emptyDir` backed by `medium: Memory` guarantees supercharged I/O speeds while preventing disk exhaustion on the host EBS root volume:
+To protect the container filesystem from unconstrained writes, explicitly route high-throughput temporary directories (`/tmp`, `/app/cache`) to an isolated `emptyDir` volume backed by RAM tmpfs:
 
 ```diff
 --- deploy/kubernetes/billing-worker.yaml.orig
@@ -126,8 +118,31 @@ For workloads generating ephemeral artifacts, mounting `emptyDir` backed by `med
 +          emptyDir:
 +            medium: Memory
 +            sizeLimit: "512Mi"
-+```
+```
 
 ### Key Differences & Benefits:
 1. **Explicit `ephemeral-storage` Limits**: Guarantees that if disk writes exceed `4Gi`, kubelet evicts *only* this rogue pod before it exhausts the host node's root filesystem and destabilizes neighboring services.
 2. **`medium: Memory` for `/tmp`**: Directs all temporary files into a fast `tmpfs` RAM slice. If the app forgets to clean up temporary exports, it will trip the `512Mi` limit cleanly without touching physical disk sectors.
+
+---
+
+## 5. Verification: Confirming Pod Ephemeral Storage Compliance
+
+After deploying the modified manifest, verify that storage accounting is actively monitored by the kubelet and that the `emptyDir` memory limit is honored:
+
+```bash
+# 1. Inspect pod resource specifications and live events
+kubectl describe pod -l app=billing-worker -n production | grep -A 8 "Limits:"
+
+# 2. Verify tmpfs mount inside the active container
+kubectl exec -it deploy/billing-worker -n production -- df -h /tmp
+```
+
+Expected terminal output:
+
+```text
+Filesystem      Size  Used Avail Use% Mounted on
+tmpfs           512M  4.0K  512M   1% /tmp
+```
+
+The billing worker now operates with deterministic disk boundaries, eliminating cluster-wide cascade evictions and ensuring neighboring workloads remain unaffected during batch processing spikes.
