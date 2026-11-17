@@ -2,7 +2,7 @@
 layout: post
 title: "Fixing PyTorch CUDA OOM: Allocator Memory Fragmentation & max_split_size_mb Tuning"
 date: 2026-11-23 10:14:00 +0900
-category: "AI & Machine Learning"
+category: "Systems & Networking"
 tags: ['PyTorch', 'CUDA', 'DeepLearning', 'GPU', 'OutOfMemory', 'Troubleshooting']
 ---
 

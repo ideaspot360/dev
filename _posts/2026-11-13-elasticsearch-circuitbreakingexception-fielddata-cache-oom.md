@@ -119,3 +119,27 @@ Adjust the parent and fielddata breaker limits in `elasticsearch.yml` to prevent
 * **Heap Utilization**: Peak stabilized from 98% (OOM edge) to a predictable **58%**.
 * **Zero 429 Errors**: Handled 4,000 aggregation queries/sec using efficient column-store `doc_values` without JVM heap degradation.
 
+---
+
+## Production Verification & Monitoring Runbook
+
+Execute the following CLI commands to verify circuit breaker trip counts, real-time heap pressure, and fielddata memory footprint across all cluster nodes:
+
+```bash
+# 1. Inspect live circuit breaker statistics and tripped count via curl
+curl -s -XGET "http://localhost:9200/_nodes/stats/breaker?pretty" | grep -E "tripped|limit_size_in_bytes|estimated_size_in_bytes" -A 2
+
+# 2. Monitor per-node JVM heap percentage and RAM utilization
+curl -s -XGET "http://localhost:9200/_cat/nodes?v&h=name,heap.percent,ram.percent,fielddata.memory_size"
+
+# 3. Clear existing fielddata cache across specific problem indices
+curl -s -XPOST "http://localhost:9200/orders/_cache/clear?fielddata=true"
+
+# 4. Check Elasticsearch daemon logs for heap allocation spikes
+journalctl -u elasticsearch -n 50 --no-pager | grep -i "circuit"
+```
+
+### Production Best Practices Checklist
+* **Strict Schema Governance**: Always enforce `dynamic: strict` or explicitly define multi-fields on text inputs to ensure developers cannot inadvertently execute aggregations against raw `text` fields.
+* **Heap Headroom**: Ensure total JVM heap does not exceed 31 GB to maintain Compressed Ordinary Object Pointers (Compressed OOPs). Allocate the remaining 50% of node RAM to the Linux OS page cache for Lucene `doc_values` disk buffer efficiency.
+

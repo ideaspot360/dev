@@ -2,7 +2,7 @@
 layout: post
 title: "Optimizing Triton Inference Server Dynamic Batching & P99 Queue Delay Under Burst Traffic"
 date: 2026-11-29 11:32:00 +0900
-category: "AI & Machine Learning"
+category: "Systems & Networking"
 tags: ['Triton', 'Inference', 'ModelServing', 'Performance', 'HighThroughput', 'Latency']
 ---
 

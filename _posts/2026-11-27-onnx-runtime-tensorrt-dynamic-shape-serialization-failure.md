@@ -2,7 +2,7 @@
 layout: post
 title: "Fixing ONNX Runtime TensorRT Dynamic Shape Engine Serialization Failures in Production Serving"
 date: 2026-11-27 11:18:00 +0900
-category: "AI & Machine Learning"
+category: "Systems & Networking"
 tags: ['ONNX', 'TensorRT', 'DeepLearning', 'ModelServing', 'Inference', 'NVIDIA']
 ---
 

@@ -112,3 +112,24 @@ spec:
 * **Rolling Updates**: Zero container restarts during production deployment.
 * **Cold Starts**: Successfully absorbed 70-second startup spikes without triggering false-positive kills.
 
+---
+
+## Production Verification & Runbook Commands
+
+Execute the following CLI commands to verify probe transitions in real time during continuous deployment:
+
+```bash
+# 1. Track container rollout status and startup probe progression
+kubectl rollout status deployment/order-service --timeout=180s
+
+# 2. Inspect kubelet events for probe failures and restart count
+kubectl describe pod -l app=order-service | grep -E "Restart Count:|Last State:|Events:" -A 10
+
+# 3. Verify probe HTTP responses directly from within the container
+kubectl exec -it deploy/order-service -- curl -Iv http://localhost:8080/actuator/health/liveness
+```
+
+### Production Best Practices Checklist
+* **Decouple Startup from Liveness**: Never use aggressive liveness timeouts to gauge whether an application is alive. Allocate a generous `startupProbe` budget ($periodSeconds \times failureThreshold$) that accommodates worst-case JVM JIT compilation, database migration scripts, and cache pre-warming.
+* **Keep Liveness Probes Lightweight**: The `/actuator/health/liveness` endpoint should only verify that internal threads are not deadlocked. Never include remote database or third-party HTTP dependencies in the liveness check, as external downtime will trigger cascading pod restarts throughout the entire cluster.
+

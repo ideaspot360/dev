@@ -107,3 +107,25 @@ The definitive architectural fix is reusing TCP sessions across requests:
 
 After deploying NGINX keep-alive and kernel `tcp_tw_reuse`, active `TIME_WAIT` sockets collapsed from 28,000+ to under 120, eliminating 99% of TCP handshake overhead and dropping p99 latency to 3.8ms.
 
+---
+
+## Production Verification & Runbook Monitoring Commands
+
+To verify that socket recycling is operating correctly and ephemeral port starvation has subsided, execute the following verification commands across your gateway nodes:
+
+```bash
+# 1. Inspect summary of current TCP socket states via ss
+ss -s
+
+# 2. Count active sockets in TIME_WAIT state to verify drainage
+ss -tan state time-wait | wc -l
+
+# 3. Check kernel TCP memory pressure and dropped connections via netstat
+netstat -s | grep -E "sockets tripped|listen queue|overflowed"
+
+# 4. Verify live keep-alive reuse against upstream backends
+curl -Iv --http1.1 http://10.244.3.45:8080/v1/orders/validate -H "Connection: keep-alive"
+```
+
+* **Long-Term Production Alerting**: Configure Prometheus alerts on `node_netstat_Tcp_TimeWait > 15000` to flag upstream keep-alive regressions before socket exhaustion reaches critical thresholds.
+

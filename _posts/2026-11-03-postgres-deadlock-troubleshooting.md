@@ -31,12 +31,12 @@ Instead of papering over lock contention with blind application retries, solving
 
 ---
 
-## 2. Common False Fix: Why Application-Level Retries Fail
+## 2. The Wrong Fix (Initial Misdiagnosis & Why Application-Level Retries Fail)
 
-Consider two microservice endpoints updating orders and inventory balances concurrently:
+A standard instinctive reaction to deadlocks in high-throughput microservices is simply wrapping queries in exponential backoff retry loops:
 
 ```python
-# WRONG FIX: Blind retry loops without lock order synchronization
+# The Wrong Fix (Initial Incorrect Approach): Blind retry loops without lock order synchronization
 @retry(exceptions=DeadlockDetected, max_attempts=5, backoff=0.2)
 def execute_order_settlement(order_id, user_id, amount):
     with db.transaction():
@@ -53,11 +53,20 @@ with db.transaction():
     audit_user_balance(user_id)
 ```
 
-If Service A locks `user_balance` while Service B locks `orders`, both workers block each other. After `deadlock_timeout` (default `1s`), PostgreSQL aborts one transaction. Retrying merely repeats the contention cycle under high throughput, creating database CPU spikes.
+**Why this failed in production:**
+If Service A locks `user_balance` while Service B locks `orders`, both workers block each other. After `deadlock_timeout` (default `1s`), PostgreSQL aborts one transaction. Retrying merely repeats the contention cycle under high throughput, creating database CPU spikes, thread pool exhaustion in HikariCP, and $P_{99}$ latency degradation across all dependent microservices.
 
 ---
 
-## 3. Investigating Lock Contention with `pg_locks`
+## 3. Root Cause Analysis: Asymmetric Lock Acquisition Order & Row Locks
+
+At the PostgreSQL storage engine level, row-level locks are tracked within the shared memory lock table (`LockManager`). When a transaction issues an `UPDATE` or `SELECT ... FOR UPDATE`, it acquires an `ExclusiveLock` on the targeted tuple (`ctid`). 
+
+If Transaction 1 holds an exclusive tuple lock on row A and requests row B, while Transaction 2 holds an exclusive tuple lock on row B and requests row A, neither transaction can make forward progress. Because PostgreSQL transactions run inside cooperative process workers, the engine initiates a deadlock detection cycle after `deadlock_timeout` expires. The deadlock detector traverses the dependency wait graph, identifies the directed cycle, and terminates the youngest transaction with a `deadlock detected` error.
+
+---
+
+## 4. Investigating Lock Contention with `pg_locks`
 
 To inspect live lock wait queues before the deadlock detector terminates transactions, execute:
 
@@ -89,7 +98,7 @@ WHERE NOT blocked_locks.granted;
 
 ---
 
-## 4. Architectural Solutions
+## 5. Architectural Solutions
 
 ### Solution A: Strict Deterministic Ordering (Alphabetical / ID Sort)
 Whenever updating multiple rows in batch, **always sort primary keys in ascending order** prior to issuing SQL statements:
@@ -105,7 +114,7 @@ Whenever updating multiple rows in batch, **always sort primary keys in ascendin
 When every worker acquires row locks in identical numerical sequence ($12 \to 44 \to 85$), cyclic deadlocks become mathematically impossible.
 
 ### Solution B: Application-Level Advisory Locks
-For complex workflows spanning multiple tables where row sorting is impractical, use PostgreSQL advisory locks:
+For complex workflows spanning multiple tables where row sorting is impractical, use PostgreSQL transactional advisory locks:
 
 ```sql
 -- Acquire transactional advisory lock based on user_id hash
@@ -116,4 +125,27 @@ UPDATE accounts SET balance = balance - :amount WHERE user_id = :userId;
 UPDATE orders SET status = 'PAID' WHERE user_id = :userId;
 
 -- Lock automatically releases upon COMMIT or ROLLBACK
+```
+
+---
+
+## 6. Verification CLI & Production Monitoring
+
+Verify active lock wait times and deadlock rate reduction via standard terminal CLI tools:
+
+```bash
+# Verify PostgreSQL service status and deadlocks via CLI
+systemctl status postgresql
+
+# Query active deadlocks from PostgreSQL runtime statistics
+psql -h 127.0.0.1 -U postgres -d production_db -c "
+SELECT datname, deadlocks, conflicts, temp_files 
+FROM pg_stat_database 
+WHERE datname = current_database();"
+
+# Monitor real-time transaction lock waits via psql CLI
+psql -h 127.0.0.1 -U postgres -d production_db -c "
+SELECT count(*) AS waiting_queries 
+FROM pg_stat_activity 
+WHERE wait_event_type = 'Lock';"
 ```

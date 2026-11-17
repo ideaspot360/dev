@@ -2,7 +2,7 @@
 layout: post
 title: "Troubleshooting Kubernetes GPU Scheduling & NVIDIA Container Toolkit Driver Mismatch"
 date: 2026-11-28 10:41:00 +0900
-category: "AI & Machine Learning"
+category: "Cloud & DevOps"
 tags: ['Kubernetes', 'GPU', 'NVIDIA', 'DevOps', 'Troubleshooting', 'Containers']
 ---
 

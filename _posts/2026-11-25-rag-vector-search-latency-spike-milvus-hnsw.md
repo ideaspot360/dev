@@ -2,7 +2,7 @@
 layout: post
 title: "Resolving RAG Vector Search Latency Spikes: Milvus HNSW Index Parameter & M/efConstruction Tuning"
 date: 2026-11-25 10:38:00 +0900
-category: "AI & Machine Learning"
+category: "Database & Storage"
 tags: ['RAG', 'Milvus', 'VectorSearch', 'HNSW', 'Embeddings', 'Performance']
 ---
 

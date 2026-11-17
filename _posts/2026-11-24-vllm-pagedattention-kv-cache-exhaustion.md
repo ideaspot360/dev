@@ -2,7 +2,7 @@
 layout: post
 title: "Troubleshooting vLLM PagedAttention KV Cache Exhaustion & GPU OOM Under High Concurrency"
 date: 2026-11-24 11:27:00 +0900
-category: "AI & Machine Learning"
+category: "Systems & Networking"
 tags: ['vLLM', 'LLM', 'PagedAttention', 'KVCache', 'Inference', 'Production']
 ---
 

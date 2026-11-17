@@ -2,7 +2,7 @@
 layout: post
 title: "Preventing Infinite Tool-Calling Loops & Runaway Cost Spikes in LLM Autonomous Agents"
 date: 2026-11-26 12:49:00 +0900
-category: "AI & Machine Learning"
+category: "Cloud & DevOps"
 tags: ['LangChain', 'LLM', 'Agents', 'ToolCalling', 'Reliability', 'CostOptimization']
 ---
 
