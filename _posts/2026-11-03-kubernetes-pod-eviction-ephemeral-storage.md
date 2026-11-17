@@ -28,7 +28,7 @@ Events:
 
 Unlike CPU throttling (which merely delays response times) or RAM exhaustion (which triggers `OOMKilled exit code 137`), **ephemeral storage eviction immediately terminates the pod and schedules a reschedule**. If multiple pods on the same worker node breach storage thresholds simultaneously, cascading node evictions can disrupt cluster stability.
 
-Here is the exact diagnostic workflow to pinpoint runaway disk consumption and configure bulletproof ephemeral storage boundaries.
+Here is how to identify where untracked disk bloat originates inside container runtimes and configure bulletproof ephemeral storage boundaries.
 
 ---
 
@@ -103,38 +103,30 @@ To protect the container filesystem from unconstrained writes, explicitly route 
 
 For workloads generating ephemeral artifacts, mounting `emptyDir` backed by `medium: Memory` guarantees supercharged I/O speeds while preventing disk exhaustion on the host EBS root volume:
 
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: billing-worker
-  namespace: production
-spec:
-  replicas: 3
-  template:
-    spec:
-      containers:
-        - name: billing-worker
-          image: ideaspot360/billing-worker:v2.1.0
-          resources:
-            requests:
-              cpu: "1000m"
-              memory: "2Gi"
-              ephemeral-storage: "2Gi"
-            limits:
-              cpu: "2000m"
-              memory: "2Gi"
-              ephemeral-storage: "4Gi"
-          volumeMounts:
-            - name: scratch-storage
-              mountPath: /tmp
-      volumes:
-        - name: scratch-storage
-          emptyDir:
-            # Memory medium uses tmpfs (consumes container RAM limit instead of host disk)
-            medium: Memory
-            sizeLimit: "512Mi"
-```
+```diff
+--- deploy/kubernetes/billing-worker.yaml.orig
++++ deploy/kubernetes/billing-worker.yaml
+@@ -14,6 +14,14 @@
+           resources:
+             requests:
+               cpu: "1000m"
+               memory: "2Gi"
++              ephemeral-storage: "2Gi"
+             limits:
+               cpu: "2000m"
+               memory: "2Gi"
++              # Evict this specific rogue pod before node disk exhaustion
++              ephemeral-storage: "4Gi"
++          volumeMounts:
++            - name: scratch-storage
++              mountPath: /tmp
++      volumes:
++        - name: scratch-storage
++          # Route temporary disk writes to RAM tmpfs
++          emptyDir:
++            medium: Memory
++            sizeLimit: "512Mi"
++```
 
 ### Key Differences & Benefits:
 1. **Explicit `ephemeral-storage` Limits**: Guarantees that if disk writes exceed `4Gi`, kubelet evicts *only* this rogue pod before it exhausts the host node's root filesystem and destabilizes neighboring services.

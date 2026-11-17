@@ -56,7 +56,7 @@ The most common initial reflex is calling `torch.cuda.empty_cache()` at the end 
 
 ### Misstep 2: Slashing Per-Device Batch Size to 1
 Another common reaction is dropping the micro-batch size from 4 or 2 down to 1 and attempting to compensate with higher gradient accumulation steps.
-* **Why It Backfires**: While a smaller batch size lowers the baseline activation memory, it does not prevent memory fragmentation when sequences have varying lengths. Variable-length sequences still produce irregular tensor allocations that leave fragmented holes in the allocator pool. Moreover, running batch size 1 underutilizes Tensor Core throughput and inflates total gradient synchronization overhead across GPUs.
+* **Why It Backfires**: While a smaller batch size lowers the baseline activation memory, it does not prevent memory fragmentation when sequences have varying lengths. Variable-length sequences still produce irregular tensor allocations that leave fragmented holes in the allocator pool. On top of that, running batch size 1 underutilizes Tensor Core throughput and inflates total gradient synchronization overhead across GPUs.
 
 ---
 

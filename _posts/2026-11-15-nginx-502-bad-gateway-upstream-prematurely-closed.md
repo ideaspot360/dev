@@ -89,7 +89,7 @@ server {
 +       proxy_http_version 1.1;       # Required for upstream keepalive
 +       proxy_set_header Connection ""; # Clear Hop-by-Hop 'close' header
 +       proxy_next_upstream error timeout invalid_header http_502 http_503;
-+       proxy_next_upstream_tries 3;  # Seamlessly retry on another upstream if race occurs!
++       proxy_next_upstream_tries 3;  # Retry on another upstream if race occurs!
     }
 }
 ```

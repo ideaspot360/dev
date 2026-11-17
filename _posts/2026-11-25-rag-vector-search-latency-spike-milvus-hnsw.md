@@ -114,4 +114,4 @@ Tuning HNSW requires balancing graph density (`M`) and build quality (`efConstru
 
 * **Query Latency**: P99 search duration dropped from **5,420ms down to 24.8ms** (a 99.5% reduction).
 * **Storage I/O**: Disk read IOPS dropped from 18,500 to **0.0**, as the entire working index now resides pinned inside RAM.
-* **Recall Trade-Off**: Recall@10 dropped by an imperceptible **0.4%** (from 98.7% to 98.3%), while query throughput scaled seamlessly from 800 to over 3,200 requests/sec across the cluster.
+* **Recall Trade-Off**: Recall@10 dropped by an imperceptible **0.4%** (from 98.7% to 98.3%), while query throughput scaled from 800 to over 3,200 requests/sec across the cluster.

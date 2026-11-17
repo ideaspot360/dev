@@ -57,7 +57,21 @@ If the external payment gateway lags or takes 3 seconds, all 30 pool connections
 
 ---
 
-## 2. Before vs. After Remediation
+## 2. Common Missteps: Why Blindly Increasing HikariCP Pool Size Backfires
+
+When `Connection is not available, request timed out after 30000ms` strikes production, the instinctive operational reflex is almost always to increase the pool size:
+
+### Misstep 1: Blindly Jacking Up `maximum-pool-size` (e.g., from 30 to 150)
+The most common initial reaction is increasing `maximum-pool-size` to 100 or 200, believing the application simply outgrew its connection quota.
+* **Why It Backfires**: If connection starvation is caused by threads holding connections during external HTTP calls, increasing pool size merely delays the inevitable. The extra connections are rapidly consumed by more waiting threads, shifting the bottleneck directly onto PostgreSQL. The database engine experiences massive context switching overhead and locks up on connection limits (`max_connections`), triggering a full cluster outage.
+
+### Misstep 2: Increasing `connection-timeout` to 60+ Seconds
+Another common temptation is extending `connection-timeout` from 30 seconds to 60 or 90 seconds to "prevent timeouts."
+* **Why It Fails**: This worsens the problem. Instead of failing fast and allowing circuit breakers to trip, client requests hang for over a minute, exhausting Tomcat/Undertow worker threads (`max-threads`) and cascading into total web server unresponsiveness (HTTP 504 / connection drops).
+
+---
+
+## 3. Before vs. After Remediation
 
 ### Architecture Fix: Isolate Transaction Boundaries
 Never perform long-running blocking I/O (REST calls, PDF generation, email sending) inside `@Transactional`.

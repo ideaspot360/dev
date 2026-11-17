@@ -7,7 +7,7 @@ categories: [Database, MySQL]
 tags: [MySQL, InnoDB, Deadlock, GapLock, NextKeyLock, Concurrency]
 ---
 
-In high-throughput e-commerce and payment environments running MySQL InnoDB under the default `REPEATABLE READ` isolation level, deadlocks frequently occur during concurrent `INSERT` operations—even when transactions operate on completely distinct primary keys.
+Running MySQL InnoDB under the default `REPEATABLE READ` isolation level can create baffling deadlocks during concurrent `INSERT` operations—even when transactions operate on completely distinct primary keys.
 
 Below is the exact deadlock graph extracted from `SHOW ENGINE INNODB STATUS` during peak traffic:
 
@@ -64,10 +64,24 @@ In InnoDB's `REPEATABLE READ`, range queries or `SELECT ... FOR UPDATE` on non-e
 
 ---
 
-## 2. Before vs. After Remediation
+## 2. Common Missteps: Why Naive Deadlock Fixes Fail
+
+When deadlocks strike on concurrent inserts, developers often attempt two intuitive fixes:
+
+### Misstep 1: Wrapping Inserts in Blind Application Retries
+A common reflex is catching `MySQLTransactionRollbackException` (Error 1213) in application code and retrying up to 3 or 5 times in a loop.
+* **Why It Fails**: While retrying absorbs isolated collisions, it amplifies contention during traffic spikes. Multiple concurrent transactions caught in cyclical gap locks simply re-trigger the same lock wait cycle, blowing up $P_{99}$ latency and compounding database connection pool exhaustion.
+
+### Misstep 2: Shifting to Table-Level or Global Locks
+Another tempting workaround is issuing pessimistic `LOCK TABLES` or coarse Redis distributed locks around insert routines.
+* **Why It Backfires**: Serializing all inserts through global locks destroys write concurrency, turning a fast database engine into a single-threaded bottleneck and causing application thread pools to back up under normal load.
+
+---
+
+## 3. Before vs. After Remediation
 
 ### Approach A: Shift Isolation Level to `READ COMMITTED`
-In modern microservices, gap locks on secondary reads often cause more downtime than benefit. Changing isolation to `READ COMMITTED` completely disables Gap Locking (except for foreign-key validation and duplicate-key checks).
+In real-world write-heavy workloads, gap locks on secondary reads often cause more production deadlocks than the phantom reads they are designed to prevent. Changing isolation to `READ COMMITTED` completely disables Gap Locking (except for foreign-key validation and duplicate-key checks).
 
 ```diff
 # /etc/mysql/my.cnf

@@ -210,5 +210,5 @@ ss -s
 | **Host CPU Utilization** | 78% (Kernel softirq / ksoftirqd) | 24% (Efficient I/O) | **54% CPU Freed** |
 | **Total Usable Ephemeral Ports** | 28,231 ports | 64,511 ports | **+128% Capacity** |
 
-By coupling Linux kernel socket reuse (`tcp_tw_reuse = 1`) with transport-layer HTTP connection pooling, outbound networking remains rock solid even during massive high-throughput bursts.
+Enabling `tcp_tw_reuse` at the kernel layer while keeping HTTP client connections pooled eliminates the ephemeral port bottleneck at both ends of the stack.
 

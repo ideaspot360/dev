@@ -64,6 +64,18 @@ Analyzing the stack traces pinpointed the exact channel deadlock line:
 #   0x7a892a    internal/dispatcher.sendWithTimeout.func1+0x6a  /app/internal/dispatcher/worker.go:58
 ```
 
+## Common Missteps: Why Naive Fixes Fail
+
+When Go microservices exhibit linear memory growth, teams frequently misdiagnose the symptom:
+
+### Misstep 1: Blaming the Go GC and Forcing Periodic `runtime.GC()`
+A common initial reaction is suspecting garbage collector inertia or heap fragmentation, leading teams to call `runtime.GC()` or tune `GOGC` aggressively (e.g. `GOGC=50`).
+* **Why It Fails**: Leaked goroutines are not dead objects waiting to be swept. Because they are active execution contexts blocked on channel synchronization, their stacks and captured references are treated by the GC as active roots. Forcing GC cycles simply burns CPU without freeing a single byte of leaked memory.
+
+### Misstep 2: Blindly Expanding Container Memory Limits
+Another reflexive band-aid is bumping Kubernetes memory limits from 8 GiB to 32 GiB.
+* **Why It Backfires**: Since the leak rate is linear with respect to traffic volume and downstream timeout rate, increasing memory only buys time. Instead of crashing at 24 hours, the service crashes at 72 hours—typically during peak business traffic when restarting takes longer and impacts more users.
+
 ## The Anti-Pattern: Unbuffered Channel with Context Timeout
 
 ```go

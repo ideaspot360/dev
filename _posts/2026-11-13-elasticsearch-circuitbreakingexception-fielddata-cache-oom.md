@@ -7,7 +7,7 @@ categories: [Database, Elasticsearch]
 tags: [Elasticsearch, CircuitBreaker, JVM, Heap, FullTextSearch, BigData]
 ---
 
-In production search clusters running Elasticsearch 8.x, aggregation or heavy wildcard queries frequently trigger the cluster's internal circuit breakers, abruptly terminating user queries with HTTP 429 or 503 errors.
+Running aggregations or wildcard queries against large Elasticsearch indices can suddenly trip the internal circuit breakers, cutting off search queries with HTTP 429 and 503 errors.
 
 The client log reports a severe memory threshold violation:
 
@@ -51,7 +51,21 @@ The root cause stems from developers running **aggregations, sorting, or scripti
 
 ---
 
-## 2. Before vs. After Remediation
+## 2. Common Missteps: Dangerous Workarounds for Circuit Breaker Tripping
+
+When Elasticsearch circuit breakers start tripping, teams often attempt quick fixes that put cluster stability at risk:
+
+### Misstep 1: Blindly Raising Circuit Breaker Limits (`indices.breaker.total.limit`)
+The quickest reaction is bumping `indices.breaker.total.limit` from 70% or 95% higher, or disabling breaker limits on specific nodes.
+* **Why It Backfires**: Circuit breakers exist to prevent OutOfMemoryError crashes. Raising or disabling breaker limits doesn't reduce the memory consumption of in-memory Fielddata—it simply allows rogue queries to consume all remaining heap until the JVM crashes with `java.lang.OutOfMemoryError: Java heap space`, bringing down data nodes and forcing expensive partition recovery.
+
+### Misstep 2: Enabling `fielddata: true` on Unindexed Text Fields
+Another frequent attempt to make aggregations work on raw text fields is toggling `"fielddata": true` in mapping definitions.
+* **Why It Fails**: Fielddata loads the entire inverted index into unmanaged JVM heap at query time. For high-cardinality string fields, this immediately locks up gigabytes of heap memory that cannot be reclaimed until node eviction, guaranteeing repeated circuit breaker trips.
+
+---
+
+## 3. Before vs. After Remediation
 
 ### Architecture Fix: Migrate Aggregations to `doc_values` via Multi-Fields
 Never enable `fielddata: true` on raw text. Instead, leverage on-disk, column-oriented **`doc_values`** using `keyword` multi-fields:

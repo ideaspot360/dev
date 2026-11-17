@@ -189,5 +189,5 @@ Verify cluster stability post-deployment by querying JMX metrics via Prometheus/
 3. **`kafka_consumer_coordinator_failed_rebalance_total`**:  
    Must remain strictly at `0`. Any increment indicates consumers continuing to trip `max.poll.interval.ms`.
 
-By enforcing bounded batch sizes (`max.poll.records`) and deploying incremental cooperative assignment, Kafka consumer clusters remain immune to cascading rebalance storms even during massive input traffic spikes.
+Keeping `max.poll.records` bounded and switching to cooperative rebalancing prevents the consumer group from tearing itself apart whenever downstream processing slows down.
 

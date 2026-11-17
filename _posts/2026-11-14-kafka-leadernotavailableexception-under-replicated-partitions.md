@@ -77,7 +77,7 @@ Short lag thresholds trigger premature ISR evictions during normal GC pauses. Ad
 ```
 
 ### Approach B: Producer Retry & Backoff Resilience
-Harden the producer configuration to seamlessly absorb transient leader election windows without dropping events:
+Harden the producer configuration to absorb transient leader election windows without dropping events:
 
 ```diff
 # application.yml

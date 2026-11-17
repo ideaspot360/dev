@@ -80,7 +80,7 @@ maxmemory 14gb
 ```
 
 **Why this fails:**
-Setting `allkeys-lru` flushes mission-critical session tokens and rate-limiter buckets that lack TTL along with simple cache keys. Furthermore, increasing `maxmemory` to 14 GB on a 16 GB host leaves insufficient headroom for `BGSAVE` fork page table duplications and jemalloc overhead, causing the Linux kernel OOM-Killer to forcefully kill the Redis daemon with `SIGKILL` (`Exit Code 137`).
+Setting `allkeys-lru` flushes mission-critical session tokens and rate-limiter buckets that lack TTL along with simple cache keys. At the same time, increasing `maxmemory` to 14 GB on a 16 GB host leaves insufficient headroom for `BGSAVE` fork page table duplications and jemalloc overhead, causing the Linux kernel OOM-Killer to forcefully kill the Redis daemon with `SIGKILL` (`Exit Code 137`).
 
 ---
 

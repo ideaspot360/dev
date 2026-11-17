@@ -45,8 +45,14 @@ $$\text{Load Factor} = \frac{32,000 \text{ req/sec}}{3,500 \text{ limit/sec}} \a
 
 S3 index servers hosting that partition immediately triggered HTTP `503 SlowDown` responses to protect internal storage nodes from starvation.
 
-## Common Anti-Patterns: Why Naive Retries Fail
+## Common Anti-Patterns: What We Tried First (And Why It Failed)
+
+### Misstep 1: Blindly Relying on Client Retry Loops
 The default SDK exponential backoff retry policy exacerbated the disaster. When 32,000 threads simultaneously hit `503 SlowDown` and backed off for synchronized intervals (jitter was insufficiently wide), they returned in waves, creating destructive **retry storms** that kept the prefix in a permanent throttling lock.
+
+### Misstep 2: Creating Multiple S3 Buckets
+Another naive reflex is provisioning 10 different S3 buckets and round-robining writes across buckets.
+* **Why It Backfires**: Creating extra buckets introduces major configuration complexity, complicates IAM policies and downstream ETL processing, and completely misses how S3 works: prefix limits scale within a single bucket automatically once entropy is introduced into key names.
 
 ## The Production Architectural Fix: High-Entropy Hash Prefixes
 To scale beyond the 3,500 req/sec limit, requests must be distributed uniformly across multiple independent S3 internal partitions. This is achieved by prefixing object keys with a deterministic hexadecimal hash of the entity ID or file UUID.
@@ -106,5 +112,5 @@ With the 4-character hex prefix (`16^4 = 65,536` potential distinct partition pa
 
 - **HTTP 503 SlowDown Error Rate**: Dropped from 38.4% to **0.00%**.
 - **End-to-End Batch Export Time**: Reduced from 4+ hours down to **18 minutes**.
-- **Effective Write Throughput**: Scaled seamlessly to 48,000 PUTs/sec without a single throttling incident.
+- **Effective Write Throughput**: Scaled to 48,000 PUTs/sec without a single throttling incident.
 

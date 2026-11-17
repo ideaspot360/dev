@@ -18,7 +18,7 @@ CONTEXT:  while updating tuple (42, 18) in relation "orders"
 
 A common anti-pattern is wrapping queries in exponential backoff retry loops. While retrying mitigates transient collisions, it drastically increases query latency tail percentiles ($P_{99}$) and conceals architectural race conditions under peak traffic.
 
-Here is the exact diagnostic workflow to pinpoint deadlocking queries and restructure locking order.
+Instead of papering over lock contention with blind application retries, solving deadlocks requires inspecting PostgreSQL lock wait queues and enforcing consistent resource ordering across transactions.
 
 ---
 

@@ -20,7 +20,7 @@ State:          Terminated
 
 Exit code `137` is not arbitrary: in POSIX systems, fatal signals result in an exit code of `128 + n`. Signal 9 is `SIGKILL` ($128 + 9 = 137$). Because `SIGKILL` cannot be caught, blocked, or handled by the JVM process, shutdown hooks never execute, thread dumps are never generated, and your APM agent ceases transmitting telemetry mid-flight.
 
-Here is the exact diagnostic workflow and configuration fix for production workloads.
+Understanding what caused exit code 137 requires digging into how the Linux kernel cgroup memory controller accounts for resident memory versus JVM heap limits.
 
 ---
 

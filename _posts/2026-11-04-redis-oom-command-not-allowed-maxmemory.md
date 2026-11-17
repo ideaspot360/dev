@@ -139,5 +139,5 @@ Biggest list found 'mq:events:deadletter' has 42918 items
 Biggest hash found 'cart:items:582109' has 821 fields
 ```
 
-Treat Redis memory not as an infinite sink, but as an active buffer. Without proper `maxmemory-policy` and active defragmentation, horizontal scaling only scales your memory waste.
+Setting explicit maxmemory boundaries, choosing a deliberate eviction policy, and enabling active defragmentation keeps the Redis memory footprint predictable without resorting to unnecessary cluster expansion.
 

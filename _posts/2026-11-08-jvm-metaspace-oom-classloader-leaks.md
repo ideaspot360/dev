@@ -217,10 +217,10 @@ Stress testing with 5,000,000 synthetic validation requests over 72 hours:
 | Metric | Before Tuning (Uncached CGLIB) | After Tuning (Cached + NMT Tuning) | Impact |
 | :--- | :--- | :--- | :--- |
 | **Loaded Class Count** | 52,490 classes (Runaway) | 3,842 classes (Stable flatline) | **92.7% Fewer Classes** |
-| **Committed Metaspace** | 512 MiB (OOM Crash at 42 hrs) | 148 MiB (Rock solid) | **-71.1% Metaspace Footprint** |
+| **Committed Metaspace** | 512 MiB (OOM Crash at 42 hrs) | 148 MiB (Stable) | **-71.1% Metaspace Footprint** |
 | **ClassLoaders Active** | 24,110 ClassLoaders | 18 ClassLoaders | **Eliminated Leaking Loaders** |
 | **P99 Response Latency**| 84 ms (Class definition lock) | 4.1 ms (Pre-compiled bytecodes) | **95.1% Latency Reduction** |
 | **Container OOM Kills** | Daily crashes (`SIGKILL 137`) | 0 Crashes (30 days uninterrupted) | **100% Stability** |
 
-Never treat `OutOfMemoryError: Metaspace` by blindingly increasing memory allocations. Decoupling dynamic class generation from request lifecycles and strictly managing ClassLoader caches is the only architectural guarantee against native JVM memory exhaustion.
+When Metaspace expands indefinitely, caching generated proxy classes and ensuring dynamic ClassLoaders can be garbage-collected fixes the root cause without having to endlessly inflate MaxMetaspaceSize.
 
