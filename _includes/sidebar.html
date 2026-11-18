@@ -1,0 +1,164 @@
+<!-- blogs/dev/_includes/sidebar.html -->
+<aside class="sidebar-nav" id="sidebar-nav" aria-label="Article categories and technical topics">
+  
+  <!-- 1. Sidebar Header (Mobile Drawer Close Button) -->
+  <div class="sidebar-drawer-header">
+    <div class="drawer-title">
+      <span class="drawer-logo">⚡</span>
+      <span class="drawer-name">IdeaSpot360 Dev</span>
+    </div>
+    <button id="drawer-close-btn" class="drawer-close-btn" aria-label="Close navigation menu">✕</button>
+  </div>
+
+  <!-- 2. Real-Time Tokenized Quick Search Box -->
+  <div class="sidebar-search">
+    <span class="sidebar-search-icon" aria-hidden="true">🔍</span>
+    <input 
+      type="search" 
+      id="sidebar-search-input" 
+      class="sidebar-search-input" 
+      placeholder="Filter posts or tags... (Ctrl+K)" 
+      aria-label="Filter articles by title, tag, or keyword"
+      autocomplete="off"
+      spellcheck="false"
+    >
+    <button id="sidebar-search-clear" class="sidebar-search-clear" aria-label="Clear search query" title="Clear">✕</button>
+  </div>
+
+  <!-- Screen reader live announcement for a11y -->
+  <div class="sr-only" aria-live="polite" id="search-live-status"></div>
+
+  <!-- 3. Dynamic Categories Taxonomy Navigation (Whitelisted Master Categories) -->
+  <nav class="sidebar-section" aria-label="Categories">
+    <div class="sidebar-section-title">CATEGORIES</div>
+    
+    <ul class="category-accordion" id="category-accordion">
+      
+      <!-- All Articles Root Item -->
+      <li class="category-group">
+        <button class="category-group-header active" data-category="all" id="cat-btn-all" aria-selected="true" aria-expanded="false">
+          <span class="category-group-title">
+            <span class="cat-icon">📁</span>
+            <span class="cat-label">All Articles</span>
+          </span>
+          <span class="category-badge-count" data-count-cat="all">{{ site.posts.size }}</span>
+        </button>
+      </li>
+
+      <!-- Whitelisted 3 Official Master Categories -->
+      {% assign official_categories = "Cloud & DevOps|Database & Storage|Systems & Networking" | split: "|" %}
+      {% for cat_name in official_categories %}
+        {% assign cat_posts = site.categories[cat_name] %}
+        {% if cat_posts.size > 0 %}
+          {% assign cat_slug = cat_name | slugify %}
+          
+          <li class="category-group" data-cat-group="{{ cat_name }}">
+            <div class="category-group-header-wrapper">
+              <button class="category-group-header" data-category="{{ cat_name }}" id="cat-btn-{{ cat_slug }}" aria-expanded="false" aria-controls="sublist-{{ cat_slug }}">
+                <span class="category-group-title">
+                  <span class="cat-icon">
+                    {% case cat_name %}
+                      {% when "Cloud & DevOps" %}☁️
+                      {% when "Database & Storage" %}🗄️
+                      {% when "Systems & Networking" %}⚡
+                      {% else %}📂
+                    {% endcase %}
+                  </span>
+                  <span class="cat-label">{{ cat_name }}</span>
+                </span>
+                <span class="category-group-meta">
+                  <span class="category-badge-count" data-count-cat="{{ cat_name }}">{{ cat_posts.size }}</span>
+                  <span class="category-toggle-arrow" aria-hidden="true">▶</span>
+                </span>
+              </button>
+            </div>
+
+            <!-- Pure CSS Grid Collapsible Sublist -->
+            <div class="category-sublist" id="sublist-{{ cat_slug }}">
+              <div class="category-sublist-inner">
+                
+                <!-- Curated Sub-Topics extracted from posts -->
+                {% assign collected_tags = "" | split: "" %}
+                {% for post in cat_posts %}
+                  {% for tag in post.tags %}
+                    {% assign tag_str = tag | strip | downcase %}
+                    {% unless collected_tags contains tag_str %}
+                      {% assign collected_tags = collected_tags | push: tag_str %}
+                    {% endunless %}
+                  {% endfor %}
+                {% endfor %}
+
+                {% for tag in collected_tags limit: 6 %}
+                  <a href="{{ '/' | relative_url }}#cat={{ cat_slug }}&tag={{ tag | slugify }}" class="category-subitem" data-parent-category="{{ cat_name }}" data-tag="{{ tag }}">
+                    <span class="subitem-bullet">&bull;</span>
+                    <span class="subitem-name">{{ tag }}</span>
+                  </a>
+                {% endfor %}
+
+                <a href="{{ '/' | relative_url }}#cat={{ cat_slug }}" class="category-subitem-all" data-category="{{ cat_name }}">
+                  View all {{ cat_posts.size }} {{ cat_name }} articles &rarr;
+                </a>
+
+              </div>
+            </div>
+          </li>
+        {% endif %}
+      {% endfor %}
+    </ul>
+  </nav>
+
+  <!-- 4. Curated Series & Deep-Dive Tracks -->
+  <div class="sidebar-section">
+    <div class="sidebar-section-title">SERIES & TRACKS</div>
+    <ul class="sidebar-series-list">
+      <li class="series-item">
+        <a href="{{ '/' | relative_url }}#search=oom" class="series-link" data-search-trigger="oom">
+          <span class="series-badge">SERIES</span>
+          <span class="series-title">OOM Post-Mortems</span>
+          <span class="series-count">6</span>
+        </a>
+      </li>
+      <li class="series-item">
+        <a href="{{ '/' | relative_url }}#search=deadlock" class="series-link" data-search-trigger="deadlock">
+          <span class="series-badge">SERIES</span>
+          <span class="series-title">Deadlock Diagnostics</span>
+          <span class="series-count">4</span>
+        </a>
+      </li>
+      <li class="series-item">
+        <a href="{{ '/' | relative_url }}#search=timeout" class="series-link" data-search-trigger="timeout">
+          <span class="series-badge">SERIES</span>
+          <span class="series-title">Connection & Timeout</span>
+          <span class="series-count">5</span>
+        </a>
+      </li>
+    </ul>
+  </div>
+
+  <!-- 5. Popular Tags Cloud -->
+  <div class="sidebar-section">
+    <div class="sidebar-section-title">POPULAR TAGS</div>
+    <div class="sidebar-tags-cloud">
+      {% assign sorted_tags = site.tags | sort %}
+      {% for tag_group in sorted_tags %}
+        {% assign tag_name = tag_group[0] %}
+        {% assign tag_posts = tag_group[1] %}
+        {% if tag_posts.size >= 2 %}
+          <a href="{{ '/' | relative_url }}#tag={{ tag_name | slugify }}" class="sidebar-tag-pill" data-tag="{{ tag_name }}">
+            #{{ tag_name }} <span class="tag-count">{{ tag_posts.size }}</span>
+          </a>
+        {% endif %}
+      {% endfor %}
+    </div>
+  </div>
+
+  <!-- 6. Footer Utility Links -->
+  <div class="sidebar-footer-links">
+    <a href="{{ '/feed.xml' | relative_url }}" class="sidebar-meta-link" target="_blank" rel="noopener">📡 RSS</a>
+    <span class="meta-sep">&bull;</span>
+    <a href="https://github.com/ideaspot360/dev" class="sidebar-meta-link" target="_blank" rel="noopener">🐙 GitHub</a>
+    <span class="meta-sep">&bull;</span>
+    <a href="{{ '/about.html' | relative_url }}" class="sidebar-meta-link">ℹ️ About</a>
+  </div>
+
+</aside>

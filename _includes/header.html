@@ -1,15 +1,22 @@
 <header class="site-header">
   <div class="container header-inner">
-    <a class="site-title" href="{{ '/' | relative_url }}">
-      {{ site.title }}
-      <span class="badge">PROD</span>
-    </a>
+    <div class="header-left">
+      <!-- Mobile Navigation Drawer Toggle (Visible only < 1024px) -->
+      <button id="mobile-drawer-toggle" class="mobile-nav-toggle-btn" aria-label="Open navigation menu" aria-expanded="false">
+        <span class="hamburger-icon">☰</span>
+      </button>
+
+      <a class="site-title" href="{{ '/' | relative_url }}">
+        {{ site.title }}
+        <span class="badge">PROD</span>
+      </a>
+    </div>
+
     <nav class="site-nav">
       <a href="{{ '/' | relative_url }}">Articles</a>
       <a href="{{ '/about.html' | relative_url }}">About</a>
       <a href="{{ '/privacy.html' | relative_url }}">Privacy</a>
-      <button id="theme-toggle" class="theme-toggle" aria-label="Toggle theme">🌙 Dark</button>
+      <button id="theme-toggle" class="theme-toggle" aria-label="Toggle dark/light theme">🌙 Dark</button>
     </nav>
   </div>
 </header>
-

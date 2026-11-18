@@ -2,15 +2,27 @@
 <html lang="en">
   {% include head.html %}
   <body>
+    <!-- Mobile Drawer Dimmed Backdrop Overlay -->
+    <div id="drawer-backdrop" class="drawer-backdrop" aria-hidden="true"></div>
+
     {% include header.html %}
 
     <main class="site-content">
-      <div class="container">
-        {{ content }}
+      <div class="layout-container {% if page.layout_type == 'full' or page.no_sidebar %}layout-fullwidth{% else %}layout-2col{% endif %}">
+        
+        <!-- Persistent 2-Column Sidebar Navigation -->
+        {% unless page.layout_type == 'full' or page.no_sidebar %}
+          {% include sidebar.html %}
+        {% endunless %}
+
+        <!-- Main Content Area -->
+        <div class="main-content-column" id="main-content-column">
+          {{ content }}
+        </div>
+
       </div>
     </main>
 
     {% include footer.html %}
   </body>
 </html>
-

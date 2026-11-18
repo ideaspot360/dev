@@ -7,35 +7,47 @@ layout: default
   <p>Production-tested troubleshooting, cloud architecture, and modern backend engineering notes without the fluff.</p>
 </section>
 
-<!-- Interactive Category Filter Bar -->
-<section class="category-section">
-  <div class="category-nav" id="category-filter-nav" role="tablist" aria-label="Topic Categories">
-    <button class="category-btn active" data-category="all" role="tab" aria-selected="true">
-      <span class="category-name">All Topics</span>
-      <span class="category-count" id="count-all">22</span>
-    </button>
-    <button class="category-btn" data-category="Cloud & DevOps" role="tab" aria-selected="false">
-      <span class="category-icon">☁️</span>
-      <span class="category-name">Cloud & DevOps</span>
-      <span class="category-count" id="count-cloud">6</span>
-    </button>
-    <button class="category-btn" data-category="Database & Storage" role="tab" aria-selected="false">
-      <span class="category-icon">🗄️</span>
-      <span class="category-name">Database & Storage</span>
-      <span class="category-count" id="count-db">8</span>
-    </button>
-    <button class="category-btn" data-category="Systems & Networking" role="tab" aria-selected="false">
-      <span class="category-icon">⚡</span>
-      <span class="category-name">Systems & Networking</span>
-      <span class="category-count" id="count-sys">8</span>
-    </button>
+<!-- Active Filter Status & View Controls Toolbar -->
+<section class="filter-status-bar" id="filter-status-bar">
+  <div class="filter-status-info">
+    <span class="filter-label">Topic:</span>
+    <span class="filter-target" id="active-filter-name">All Articles</span>
+    <span class="filter-count" id="active-filter-count">({{ site.posts.size }})</span>
+    <button id="filter-reset-btn" class="filter-reset-btn" style="display: none;" title="Reset filter">✕ Reset</button>
+  </div>
+  
+  <div class="filter-controls-group">
+    <!-- Sort Selector -->
+    <select id="sort-selector" class="sort-selector" aria-label="Sort articles">
+      <option value="latest">Latest First</option>
+      <option value="oldest">Oldest First</option>
+      <option value="title">Title A-Z</option>
+    </select>
+
+    <!-- View Mode Toggle Buttons -->
+    <div class="view-mode-toggle" role="group" aria-label="View Mode">
+      <button class="view-btn active" id="view-card-btn" title="Card View" aria-pressed="true">▦ Cards</button>
+      <button class="view-btn" id="view-compact-btn" title="Compact List View" aria-pressed="false">≡ Compact</button>
+    </div>
   </div>
 </section>
 
+<!-- Search Status Banner (Shown when searching) -->
+<div id="search-status-banner" class="search-status-banner" style="display: none;">
+  <span id="search-banner-text">Showing search results</span>
+  <button id="search-banner-clear" class="search-banner-clear">✕ Clear Search</button>
+</div>
+
+<!-- Posts List Container (Preserved static HTML for 100% SEO crawlers) -->
 <section>
   <div class="post-list" id="post-list">
     {% for post in site.posts %}
-    <a href="{{ post.url | relative_url }}" class="post-card" data-category="{{ post.category | default: 'Engineering' }}">
+    <a href="{{ post.url | relative_url }}" class="post-card" 
+       data-category="{{ post.category | default: 'Engineering' }}" 
+       data-categories="{{ post.categories | join: ',' | downcase }}"
+       data-tags="{{ post.tags | join: ',' | downcase }}" 
+       data-title="{{ post.title | downcase }}" 
+       data-date="{{ post.date | date: '%Y-%m-%d' }}">
       <div class="post-meta">
         <time datetime="{{ post.date | date_to_xmlschema }}">📅 {{ post.date | date: "%b %d, %Y" }}</time>
         <span>&bull;</span>
@@ -55,7 +67,17 @@ layout: default
     <p style="color: var(--text-muted); text-align: center; padding: 40px 0;">No articles published yet. Stay tuned!</p>
     {% endfor %}
   </div>
+
+  <!-- Empty Search / Filter State -->
   <div id="no-posts-found" class="no-posts-found" style="display: none;">
-    <p>No articles found in this category yet. Check back soon!</p>
+    <p>No articles found matching your criteria. Try another search or reset the filter.</p>
+    <button class="category-btn" onclick="document.getElementById('filter-reset-btn').click();" style="margin-top: 12px;">Reset Filter</button>
+  </div>
+
+  <!-- Hybrid Progressive Pagination Bar -->
+  <div id="pagination-wrapper" class="pagination-wrapper" style="display: none;">
+    <button id="pagination-prev" class="page-nav-btn" aria-label="Previous page">&lsaquo; Prev</button>
+    <div id="pagination-numbers" class="pagination-numbers"></div>
+    <button id="pagination-next" class="page-nav-btn" aria-label="Next page">Next &rsaquo;</button>
   </div>
 </section>

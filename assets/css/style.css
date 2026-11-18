@@ -693,3 +693,685 @@ footer.site-footer {
 
 
 
+
+
+/* ============================================================
+   2-Column Layout, Sticky Sidebar, Accordion & Search Styles
+   Zero-framework, High-Performance, Dark/Light Theme Integrated
+   ============================================================ */
+
+:root {
+  --sidebar-width: 280px;
+  --header-height: 64px;
+  --layout-max-width: 1320px;
+  --nav-item-radius: 6px;
+  --drawer-width: 300px;
+  --transition-speed: 0.2s;
+  --transition-bezier: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* 1. Extended Layout Container & CSS Grid */
+.layout-container {
+  width: 100%;
+  margin: 0 auto;
+  padding: 24px 20px;
+}
+
+.layout-container.layout-2col {
+  max-width: var(--layout-max-width);
+  display: grid;
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  gap: 36px;
+  align-items: start;
+  position: relative;
+}
+
+.layout-container.layout-fullwidth {
+  max-width: 860px;
+}
+
+/* Header and Footer alignment with 1320px 2-column layout */
+.site-header .container,
+.site-footer .container {
+  max-width: var(--layout-max-width, 1320px);
+  padding: 0 20px;
+}
+
+.main-content-column {
+  min-width: 0; /* Prevents overflow of code blocks/pre inside CSS Grid */
+  width: 100%;
+  overflow-wrap: break-word; /* Essential: prevents long unbroken tokens/URLs from expanding grid width */
+  word-break: break-word;
+}
+
+.post-card {
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+
+/* 2. Sticky Sidebar with Independent Scroll & Custom Scrollbar */
+.sidebar-nav {
+  position: sticky;
+  top: calc(var(--header-height) + 20px);
+  height: calc(100vh - var(--header-height) - 40px);
+  height: calc(100dvh - var(--header-height) - 40px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 12px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-color) transparent;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+.sidebar-nav::-webkit-scrollbar {
+  width: 4px;
+}
+.sidebar-nav::-webkit-scrollbar-track {
+  background: transparent;
+}
+.sidebar-nav::-webkit-scrollbar-thumb {
+  background-color: var(--border-color);
+  border-radius: 10px;
+}
+.sidebar-nav::-webkit-scrollbar-thumb:hover {
+  background-color: var(--text-muted);
+}
+
+/* 3. Sidebar Search Input Box */
+.sidebar-search {
+  position: relative;
+  width: 100%;
+}
+
+.sidebar-search-input {
+  width: 100%;
+  padding: 9px 32px 9px 34px;
+  background-color: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: var(--nav-item-radius);
+  color: var(--text-color);
+  font-size: 0.88rem;
+  outline: none;
+  transition: border-color var(--transition-speed) ease, box-shadow var(--transition-speed) ease;
+}
+
+.sidebar-search-input:focus {
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 3px var(--accent-light);
+}
+
+.sidebar-search-icon {
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 0.85rem;
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+.sidebar-search-clear {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 4px;
+  display: none;
+}
+.sidebar-search-clear.visible {
+  display: block;
+}
+
+/* 4. Taxonomy Accordion */
+.sidebar-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sidebar-section-title {
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  padding-left: 6px;
+}
+
+.category-accordion {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.category-group {
+  margin: 0;
+  padding: 0;
+}
+
+.category-group-header-wrapper {
+  display: flex;
+  align-items: center;
+}
+
+.category-group-header {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--nav-item-radius);
+  color: var(--text-color);
+  font-size: 0.9rem;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--transition-speed) ease, border-color var(--transition-speed) ease;
+}
+
+.category-group-header:hover {
+  background-color: var(--card-bg);
+  border-color: var(--border-color);
+}
+
+.category-group-header.active {
+  background-color: var(--accent-light);
+  border-color: var(--accent-color);
+  color: var(--accent-color);
+  font-weight: 600;
+}
+
+.category-group-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cat-icon {
+  font-size: 1rem;
+  flex-shrink: 0;
+}
+
+.cat-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.category-group-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.category-badge-count {
+  font-size: 0.75rem;
+  padding: 2px 7px;
+  background-color: var(--border-color);
+  color: var(--text-muted);
+  border-radius: 12px;
+  font-weight: 600;
+}
+
+.category-group-header.active .category-badge-count {
+  background-color: var(--accent-color);
+  color: #fff;
+}
+
+.category-toggle-arrow {
+  font-size: 0.7rem;
+  transition: transform var(--transition-speed) var(--transition-bezier);
+  color: var(--text-muted);
+  display: inline-block;
+}
+
+.category-group.open .category-toggle-arrow {
+  transform: rotate(90deg);
+}
+
+/* Pure CSS Grid 0fr <-> 1fr Collapsible Sublist */
+.category-sublist {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.25s var(--transition-bezier);
+}
+
+.category-group.open .category-sublist {
+  grid-template-rows: 1fr;
+}
+
+.category-sublist-inner {
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  padding-left: 28px;
+  gap: 3px;
+  margin-top: 2px;
+}
+
+.category-subitem {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  text-decoration: none;
+  border-radius: 4px;
+  transition: color var(--transition-speed) ease, background-color var(--transition-speed) ease;
+}
+
+.category-subitem:hover {
+  color: var(--accent-color);
+  background-color: var(--card-bg);
+}
+
+.category-subitem.active {
+  color: var(--accent-color);
+  font-weight: 600;
+}
+
+.category-subitem-all {
+  display: block;
+  font-size: 0.78rem;
+  color: var(--accent-color);
+  text-decoration: none;
+  padding: 6px 8px 8px 8px;
+  font-weight: 500;
+}
+.category-subitem-all:hover {
+  text-decoration: underline;
+}
+
+/* 5. Series & Tracks */
+.sidebar-series-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.series-link {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 10px;
+  background-color: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: var(--nav-item-radius);
+  text-decoration: none;
+  color: var(--text-color);
+  font-size: 0.83rem;
+  transition: border-color var(--transition-speed) ease;
+}
+
+.series-link:hover {
+  border-color: var(--accent-color);
+}
+
+.series-badge {
+  font-size: 0.65rem;
+  font-weight: 700;
+  padding: 2px 5px;
+  background-color: #ef4444;
+  color: #fff;
+  border-radius: 3px;
+}
+
+.series-title {
+  flex-grow: 1;
+  margin-left: 8px;
+  font-weight: 500;
+}
+
+.series-count {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+/* 6. Tags Cloud */
+.sidebar-tags-cloud {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.sidebar-tag-pill {
+  font-size: 0.78rem;
+  padding: 4px 8px;
+  background-color: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 14px;
+  color: var(--text-muted);
+  text-decoration: none;
+  transition: all var(--transition-speed) ease;
+}
+
+.sidebar-tag-pill:hover,
+.sidebar-tag-pill.active {
+  border-color: var(--accent-color);
+  color: var(--accent-color);
+  background-color: var(--accent-light);
+}
+
+.tag-count {
+  font-size: 0.7rem;
+  opacity: 0.7;
+}
+
+/* 7. Sidebar Footer Utility Links */
+.sidebar-footer-links {
+  margin-top: auto;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.8rem;
+}
+
+.sidebar-meta-link {
+  color: var(--text-muted);
+  text-decoration: none;
+}
+.sidebar-meta-link:hover {
+  color: var(--accent-color);
+}
+.meta-sep {
+  color: var(--border-color);
+}
+
+/* 8. Filter Toolbar & View Controls */
+.filter-status-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 24px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.filter-status-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.95rem;
+}
+
+.filter-target {
+  font-weight: 700;
+  color: var(--accent-color);
+}
+
+.filter-count {
+  color: var(--text-muted);
+  font-size: 0.88rem;
+}
+
+.filter-reset-btn {
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  cursor: pointer;
+  margin-left: 6px;
+}
+.filter-reset-btn:hover {
+  color: #ef4444;
+  border-color: #ef4444;
+}
+
+.filter-controls-group {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.sort-selector {
+  background-color: var(--card-bg);
+  color: var(--text-color);
+  border: 1px solid var(--border-color);
+  border-radius: var(--nav-item-radius);
+  padding: 6px 10px;
+  font-size: 0.85rem;
+  outline: none;
+}
+
+.view-mode-toggle {
+  display: flex;
+  border: 1px solid var(--border-color);
+  border-radius: var(--nav-item-radius);
+  overflow: hidden;
+}
+
+.view-btn {
+  background-color: var(--card-bg);
+  color: var(--text-muted);
+  border: none;
+  padding: 6px 12px;
+  font-size: 0.82rem;
+  cursor: pointer;
+  font-weight: 500;
+  transition: all var(--transition-speed) ease;
+}
+
+.view-btn.active {
+  background-color: var(--accent-color);
+  color: #fff;
+}
+
+/* 9. Search Status Banner */
+.search-status-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background-color: var(--accent-light);
+  border: 1px solid var(--accent-color);
+  border-radius: var(--nav-item-radius);
+  padding: 10px 16px;
+  margin-bottom: 20px;
+  font-size: 0.9rem;
+  color: var(--accent-color);
+  font-weight: 500;
+}
+
+.search-banner-clear {
+  background: transparent;
+  border: none;
+  color: var(--accent-color);
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+.search-banner-clear:hover {
+  text-decoration: underline;
+}
+
+/* 10. Compact List View Sizing & Layout */
+.post-list.compact-view {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.post-list.compact-view .post-card {
+  padding: 12px 16px;
+  margin-bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.post-list.compact-view .post-card .post-excerpt,
+.post-list.compact-view .post-card .tags {
+  display: none !important;
+}
+
+.post-list.compact-view .post-card h2 {
+  font-size: 0.95rem;
+  margin: 0;
+  flex-grow: 1;
+}
+
+.post-list.compact-view .post-card .post-meta {
+  margin-bottom: 0;
+  flex-shrink: 0;
+}
+
+/* 11. Pagination Bar */
+.pagination-wrapper {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin-top: 40px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border-color);
+}
+
+.page-nav-btn, .page-number-btn {
+  background-color: var(--card-bg);
+  border: 1px solid var(--border-color);
+  color: var(--text-color);
+  padding: 7px 12px;
+  border-radius: var(--nav-item-radius);
+  font-size: 0.85rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--transition-speed) ease;
+}
+
+.page-nav-btn:hover:not(:disabled),
+.page-number-btn:hover {
+  border-color: var(--accent-color);
+  color: var(--accent-color);
+}
+
+.page-number-btn.active {
+  background-color: var(--accent-color);
+  border-color: var(--accent-color);
+  color: #fff;
+  font-weight: 700;
+}
+
+.page-nav-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* 12. Mobile Responsive Off-Canvas Drawer (< 1024px) */
+.mobile-nav-toggle-btn {
+  display: none;
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: var(--nav-item-radius);
+  color: var(--text-color);
+  font-size: 1.2rem;
+  padding: 6px 10px;
+  cursor: pointer;
+  margin-right: 12px;
+}
+
+.drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  z-index: 999;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.3s ease, visibility 0.3s ease;
+}
+
+.drawer-backdrop.active {
+  opacity: 1;
+  visibility: visible;
+}
+
+.sidebar-drawer-header {
+  display: none;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.drawer-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  font-size: 1.1rem;
+}
+
+.drawer-close-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 1.2rem;
+  cursor: pointer;
+  padding: 4px;
+}
+
+@media (max-width: 1023px) {
+  .mobile-nav-toggle-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .layout-container.layout-2col {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+
+  .sidebar-nav {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 82vw;
+    max-width: var(--drawer-width);
+    height: 100vh;
+    height: 100dvh;
+    background-color: var(--bg-color);
+    z-index: 1000;
+    padding: 20px;
+    box-shadow: 4px 0 24px rgba(0, 0, 0, 0.4);
+    transform: translateX(-100%);
+    transition: transform 0.3s var(--transition-bezier);
+  }
+
+  .sidebar-nav.drawer-open {
+    transform: translateX(0);
+  }
+
+  .sidebar-drawer-header {
+    display: flex;
+  }
+}
