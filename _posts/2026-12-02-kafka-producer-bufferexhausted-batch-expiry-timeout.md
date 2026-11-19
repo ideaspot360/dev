@@ -1,7 +1,7 @@
 ---
 layout: post
 title: "Fixing Kafka Producer BufferExhaustedException & Record Expiring Batch Timeouts Under Heavy Ingestion"
-date: 2026-12-02 10:44:00 +0900
+date: 2026-12-02 10:14:52 +0900
 category: "Cloud & DevOps"
 tags: ['Kafka', 'Producer', 'BufferExhausted', 'Backpressure', 'DistributedSystems', 'Troubleshooting']
 ---

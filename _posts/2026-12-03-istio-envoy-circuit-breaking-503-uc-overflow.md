@@ -1,7 +1,7 @@
 ---
 layout: post
 title: "Mitigating Istio Envoy 503 UC Connection Termination & Circuit Breaker Pending Request Overflow"
-date: 2026-12-03 11:39:00 +0900
+date: 2026-12-03 11:06:28 +0900
 category: "Cloud & DevOps"
 tags: ['Kubernetes', 'Istio', 'Envoy', 'ServiceMesh', 'CircuitBreaker', 'Troubleshooting']
 ---

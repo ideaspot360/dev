@@ -1,7 +1,7 @@
 ---
 layout: post
 title: "Troubleshooting MongoDB WiredTiger Cache Eviction Starvation & Read/Write Ticket Depletion"
-date: 2026-12-01 11:17:00 +0900
+date: 2026-12-01 10:38:19 +0900
 category: "Database & Storage"
 tags: ['MongoDB', 'WiredTiger', 'Database', 'CacheEviction', 'Performance', 'Troubleshooting']
 ---

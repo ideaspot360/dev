@@ -1,7 +1,7 @@
 ---
 layout: post
 title: "Resolving gRPC HTTP/2 Flow Control Window Exhaustion and Stream Deadlocks Under High-Throughput Streaming"
-date: 2026-11-30 10:28:00 +0900
+date: 2026-11-30 10:52:43 +0900
 category: "Systems & Networking"
 tags: ['gRPC', 'HTTP2', 'FlowControl', 'Streaming', 'Microservices', 'Troubleshooting']
 ---
@@ -82,41 +82,47 @@ To remediate the deadlock, we adjusted both the initial stream flow control wind
 ```diff
 --- internal/transport/grpc_client.go.orig
 +++ internal/transport/grpc_client.go
-@@ -14,6 +14,14 @@
+@@ -14,6 +14,19 @@
  func NewTelemetryClient(ctx context.Context, target string) (*grpc.ClientConn, error) {
+-	// Default dialer without HTTP/2 window tuning (defaults: 64 KB stream / conn window)
+-	return grpc.DialContext(ctx, target,
+-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+-	)
 +	// Configure high-throughput HTTP/2 flow control windows
 +	const (
 +		streamWindowSize = 4 * 1024 * 1024  // 4 MB initial stream window
 +		connWindowSize   = 16 * 1024 * 1024 // 16 MB initial connection window
 +	)
 +
- 	return grpc.DialContext(ctx, target,
- 		grpc.WithTransportCredentials(insecure.NewCredentials()),
++	return grpc.DialContext(ctx, target,
++		grpc.WithTransportCredentials(insecure.NewCredentials()),
 +		grpc.WithInitialWindowSize(streamWindowSize),
 +		grpc.WithInitialConnWindowSize(connWindowSize),
 +		grpc.WithDefaultCallOptions(
 +			grpc.MaxCallRecvMsgSize(32*1024*1024),
 +			grpc.MaxCallSendMsgSize(32*1024*1024),
 +		),
- 	)
++	)
  }
 ```
 
 ```diff
 --- internal/transport/grpc_server.go.orig
 +++ internal/transport/grpc_server.go
-@@ -10,6 +10,12 @@
+@@ -10,6 +10,17 @@
  func NewTelemetryServer() *grpc.Server {
+-	// Default server with standard 64 KB flow control window
+-	return grpc.NewServer()
 +	const (
 +		serverStreamWindowSize = 4 * 1024 * 1024  // 4 MB stream window
 +		serverConnWindowSize   = 16 * 1024 * 1024 // 16 MB connection window
 +	)
 +
- 	return grpc.NewServer(
++	return grpc.NewServer(
 +		grpc.InitialWindowSize(serverStreamWindowSize),
 +		grpc.InitialConnWindowSize(serverConnWindowSize),
 +		grpc.MaxConcurrentStreams(1000),
- 	)
++	)
  }
 ```
 
@@ -125,10 +131,13 @@ To remediate the deadlock, we adjusted both the initial stream flow control wind
 ```diff
 --- deploy/envoy/envoy-config.yaml.orig
 +++ deploy/envoy/envoy-config.yaml
-@@ -18,6 +18,10 @@
+@@ -18,6 +18,13 @@
          typed_config:
            "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
            http2_protocol_options:
+-            # Default stream window is 65535 bytes (64 KB) causing rapid buffer starvation
+-            initial_stream_window_size: 65535
++            # Explicitly scale up flow control windows to match ingress pipeline bandwidth
 +            initial_stream_window_size: 4194304    # 4 MB
 +            initial_connection_window_size: 16777216 # 16 MB
 +            max_concurrent_streams: 1024
