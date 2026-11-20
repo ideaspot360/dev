@@ -29,8 +29,8 @@ header_pages:
   - about.md
 
 # Ads & Analytics (Configurable)
-google_analytics: "" # e.g. G-XXXXXXXXXX
-google_adsense_client: "" # e.g. ca-pub-XXXXXXXXXXXXXXXX
+google_analytics: "G-8SMMP0YD5B"
+google_adsense_client: "ca-pub-9298402368500516"
 
 # Plugins
 plugins:
