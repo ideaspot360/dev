@@ -20,7 +20,7 @@ Status:       Failed
 Reason:       Evicted
 Message:      The node was low on resource: ephemeral-storage. 
               Threshold quantity: 5368709120, available: 4194304000. 
-              Container app was using 6291456000, requesting 1073741824.
+              Container billing-worker was using 6291456000, requesting 1073741824.
 ```
 
 Or subsequently in cluster event streams:
@@ -56,8 +56,8 @@ A common reaction to storage eviction is tuning logging frameworks (e.g., Logbac
 # WRONG FIX: Assuming standard container logs are the sole culprit
 resources:
   requests:
-    cpu: "500m"
-    memory: "1Gi"
+    cpu: "1000m"
+    memory: "2Gi"
   # Omitting ephemeral-storage limits under the assumption that stdout log rotation handles it
 ```
 
@@ -105,7 +105,7 @@ To protect the container filesystem from unconstrained writes, explicitly route 
 ```diff
 --- deploy/kubernetes/billing-worker.yaml.orig
 +++ deploy/kubernetes/billing-worker.yaml
-@@ -14,6 +14,14 @@
+@@ -14,6 +14,15 @@
            resources:
              requests:
                cpu: "1000m"
@@ -113,7 +113,9 @@ To protect the container filesystem from unconstrained writes, explicitly route 
 +              ephemeral-storage: "2Gi"
              limits:
                cpu: "2000m"
-               memory: "2Gi"
+-              memory: "2Gi"
++              # Scaled from 2Gi to 2560Mi to absorb the 512Mi tmpfs memory footprint
++              memory: "2560Mi"
 +              # Evict this specific rogue pod before node disk exhaustion
 +              ephemeral-storage: "4Gi"
 +          volumeMounts:
@@ -127,9 +129,11 @@ To protect the container filesystem from unconstrained writes, explicitly route 
 +            sizeLimit: "512Mi"
 ```
 
-### Key Differences & Benefits:
-1. **Explicit `ephemeral-storage` Limits**: Guarantees that if disk writes exceed `4Gi`, kubelet evicts *only* this rogue pod before it exhausts the host node's root filesystem and destabilizes neighboring services [Source: Kubernetes Documentation - Local Ephemeral Storage](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/#local-ephemeral-storage).
-2. **`medium: Memory` for `/tmp`**: Directs all temporary files into a fast `tmpfs` RAM slice. Note that in Kubernetes, files written to a `medium: Memory` volume count against the container's **memory limit** (cgroup memory), rather than ephemeral-storage [Source: Kubernetes Documentation - Volumes emptyDir](https://kubernetes.io/docs/concepts/storage/volumes/#emptydir). Ensure container memory limits account for the `sizeLimit` (512Mi) to prevent unexpected container OOMKilled events.
+### Key Architectural Takeaways:
+1. **Explicit `ephemeral-storage` Limits**: Guarantees that if disk writes outside mounted volumes exceed `4Gi`, kubelet evicts *only* this rogue pod before it exhausts the host node's root filesystem and destabilizes neighboring services [Source: Kubernetes Documentation - Local Ephemeral Storage](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/#local-ephemeral-storage).
+2. **`medium: Memory` vs. Standard `emptyDir` Sizing**:
+   - **RAM-backed `emptyDir` (`medium: Memory`)**: Directs temporary files into a fast `tmpfs` RAM slice. Note that in Kubernetes, files written to a `medium: Memory` volume count against the container's **memory limit** (`shmem` in cgroup memory), rather than ephemeral-storage [Source: Kubernetes Documentation - Volumes emptyDir](https://kubernetes.io/docs/concepts/storage/volumes/#emptydir). To prevent an unexpected `OOMKilled exit code 137`, `resources.limits.memory` is scaled from `2Gi` (2048Mi) to `2560Mi`, providing dedicated headroom for the `512Mi` `sizeLimit`.
+   - **Disk-backed `emptyDir` (Standard)**: If a batch workload requires multiple gigabytes of temporary disk storage (such as the 4.8GB PDF/CSV spikes discovered during investigation), omit `medium: Memory` and configure an `emptyDir` with `sizeLimit: 4Gi`. Standard `emptyDir` writes are accounted toward `ephemeral-storage` on local node storage, safeguarding container RAM cgroups entirely [Source: Kubernetes Documentation - Managing Ephemeral Storage](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/#local-ephemeral-storage).
 
 ---
 
@@ -138,7 +142,7 @@ To protect the container filesystem from unconstrained writes, explicitly route 
 After deploying the modified manifest, verify that storage accounting is actively monitored by the kubelet and that the `emptyDir` memory limit is honored:
 
 ```bash
-# 1. Inspect pod resource specifications and live events
+# 1. Inspect pod resource specifications and live limits
 kubectl describe pod -l app=billing-worker -n production | grep -A 8 "Limits:"
 
 # 2. Verify tmpfs mount inside the active container
@@ -148,6 +152,17 @@ kubectl exec -it deploy/billing-worker -n production -- df -h /tmp
 Expected terminal output:
 
 ```text
+# Step 1 Output: Active resource boundaries
+    Limits:
+      cpu:                2
+      ephemeral-storage:  4Gi
+      memory:             2560Mi
+    Requests:
+      cpu:                1
+      ephemeral-storage:  2Gi
+      memory:             2Gi
+
+# Step 2 Output: Verified tmpfs isolation for scratch space
 Filesystem      Size  Used Avail Use% Mounted on
 tmpfs           512M  4.0K  512M   1% /tmp
 ```
