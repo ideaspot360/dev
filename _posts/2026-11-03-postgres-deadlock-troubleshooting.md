@@ -13,6 +13,7 @@ fact_check_sources:
   - "https://www.postgresql.org/docs/current/functions-info.html"
   - "https://www.postgresql.org/docs/current/monitoring-stats.html"
   - "https://www.postgresql.org/docs/current/errcodes-appendix.html"
+  - "https://www.postgresql.org/docs/current/pgrowlocks.html"
 ---
 
 When concurrent database transactions attempt to acquire conflicting row-level or table-level locks in cyclic dependencies, the PostgreSQL lock manager throws error code `40P01` [Source: PostgreSQL Documentation - Error Codes & Deadlocks](https://www.postgresql.org/docs/current/errcodes-appendix.html):
@@ -73,29 +74,41 @@ If Service A locks `user_balance` while Service B locks `orders`, both workers b
 
 At the PostgreSQL storage engine level, row-level locks behave fundamentally differently from table-level locks. Unlike table-level or explicit advisory locks, PostgreSQL does **not** store granted row-level locks inside the shared memory lock table (`LockManager`). Tracking millions of individual row locks in shared memory would quickly exhaust server RAM. Instead, PostgreSQL writes row-level lock metadata directly into the storage layer within the tuple header fields on disk—specifically `t_xmax` and the `t_infomask`/`t_infomask2` status bits (or a `MultiXactId` pointer if multiple concurrent transactions hold shared locks) [Source: PostgreSQL Documentation - Explicit Locking](https://www.postgresql.org/docs/current/explicit-locking.html).
 
-Because active row locks reside on disk in tuple headers, they do not appear as granted entries in the `pg_locks` view [Source: PostgreSQL Documentation - The pg_locks View](https://www.postgresql.org/docs/current/view-pg-locks.html). However, when a concurrent transaction attempts to update or lock a tuple that is already held:
+Because active row locks reside on disk in tuple headers, they do not appear as granted entries in the `pg_locks` view [Source: PostgreSQL Documentation - The pg_locks View](https://www.postgresql.org/docs/current/view-pg-locks.html). However, when concurrent transactions attempt to update or lock tuples held by one another, PostgreSQL coordinates contention through a two-tiered locking protocol:
 
-1. **Tuple Lock Queue:** The waiting backend requests an ephemeral `tuple` lock in shared memory (`locktype = 'tuple'`) on the target physical tuple (`ctid`). This establishes a fair, sequential queue of transactions waiting for that single row.
+1. **Tuple Lock Queue:** When a backend attempts to modify a row already locked by an uncommitted transaction, it first requests an ephemeral `tuple` lock in shared memory (`locktype = 'tuple'`) on the target physical tuple (`ctid`). This establishes a fair, sequential queue of transactions waiting for that physical row.
 2. **Transaction Lock Wait:** Once it secures its place in the tuple queue, the waiting backend requests a `ShareLock` on the `transactionid` of the transaction currently holding the row lock (the transaction ID stamped into `t_xmax`).
 
+In our production deadlock incident:
+- **Process 21402** held the row lock on `tuple (42, 18)` in `orders` and attempted to update a balance record held by Transaction `849201`. Thus, Process 21402 waited for `ShareLock on transaction 849201` (blocked by Process 21408).
+- **Process 21408** (owning Transaction `849201`) attempted to update `tuple (42, 18)` in `orders`. Because Process 21402 held the tuple lock, Process 21408 queued up and waited for `ExclusiveLock on tuple (42, 18)` (blocked by Process 21402).
+
 ```text
-[Transaction 1: XID 849201] ───(holds tuple (42, 18))───► [Row in orders table]
-       ▲                                                          │
-       │ waits for ShareLock on XID 849208                        │
-       │                                                          ▼
-[Process 21402]                                            [Process 21408]
-       ▲                                                          │
-       │                                                          │
-       └─── blocked by Process 21402 ◄─── waits for tuple (42,18) ┘
+       ┌─────────────────────────────────────────────────────────┐
+       │                      Process 21402                      │
+       │  - Holds: Lock on tuple (42, 18) in "orders" table      │
+       │  - Requests: Row held by active Transaction 849201      │
+       └──────────────┬───────────────────────────▲──────────────┘
+                      │                           │
+    Waits for         │                           │  Blocks Process 21408
+    ShareLock on      │                           │  on ExclusiveLock
+    Transaction 849201│                           │  for tuple (42, 18)
+                      │                           │
+                      ▼                           │
+       ┌──────────────────────────────────────────┴──────────────┐
+       │                      Process 21408                      │
+       │  - Holds: Transaction 849201 (user balance row)         │
+       │  - Requests: ExclusiveLock on tuple (42, 18) in "orders"│
+       └─────────────────────────────────────────────────────────┘
 ```
 
-When two or more transactions acquire locks in asymmetric order (e.g., Transaction 1 holds Row A and requests Row B, while Transaction 2 holds Row B and requests Row A), neither transaction can proceed. When `deadlock_timeout` (default `1s`) elapses without progress, the PostgreSQL deadlock detector executes a cycle-detection search across the wait-for dependency graph. It selects one transaction as the victim, aborts it, rolls back its modifications, and raises `ERROR: 40P01 deadlock detected`.
+When two or more transactions acquire locks in asymmetric order, neither transaction can make progress. When `deadlock_timeout` (default `1s`) elapses without progress, the PostgreSQL deadlock detector executes a cycle-detection search across the wait-for dependency graph. It selects one transaction as the victim, aborts it, rolls back its modifications, and raises `ERROR: 40P01 deadlock detected`.
 
 ---
 
-## 4. Investigating Lock Contention with `pg_locks` & `pg_blocking_pids`
+## 4. Investigating Lock Contention with `pg_locks`, `pg_blocking_pids` & `pgrowlocks`
 
-To identify blocked and blocking queries in real time before the deadlock detector terminates transactions, use PostgreSQL's built-in session diagnostics.
+To identify blocked and blocking queries in real time before the deadlock detector terminates transactions, use PostgreSQL's built-in session diagnostics and contrib tools.
 
 ### Method 1: Fast Lock Inspection via `pg_blocking_pids`
 PostgreSQL provides the `pg_blocking_pids(pid)` session information function, which directly returns an array of backend PIDs blocking the given process [Source: PostgreSQL Documentation - Session Information Functions](https://www.postgresql.org/docs/current/functions-info.html#FUNCTIONS-INFO-SESSION-TABLE):
@@ -147,12 +160,43 @@ WHERE NOT blocked_locks.granted
   AND blocking_locks.granted;
 ```
 
+### Method 3: Direct On-Disk Row Lock Inspection with `pgrowlocks`
+Because active row locks reside on disk in tuple headers rather than in `pg_locks`, inspecting which specific rows are locked requires the official `pgrowlocks` extension [Source: PostgreSQL Documentation - pgrowlocks](https://www.postgresql.org/docs/current/pgrowlocks.html):
+
+```sql
+-- Enable the official contrib extension
+CREATE EXTENSION IF NOT EXISTS pgrowlocks;
+
+-- Inspect on-disk tuple locking states, holding XIDs, modes, and PIDs for relation "orders"
+SELECT locked_row, locker, multi, modes, pids 
+FROM pgrowlocks('orders');
+```
+
+This returns the exact tuple ID (`locked_row` as `ctid`), the locker transaction ID (`locker`), whether it involves a multi-transaction (`multi`), held lock modes, and the operating backend PIDs.
+
 ---
 
 ## 5. Architectural Solutions
 
-### Solution A: Strict Deterministic Ordering (Primary Key Sorting)
-The most resilient defense against cyclic deadlocks is ensuring that all concurrent transactions access and lock shared entities in a strictly identical order (such as ascending primary key or alphabetical identifier order):
+### Solution A: Strict Deterministic Ordering (Global Hierarchy & Primary Key Sorting)
+The primary defense against cyclic deadlocks is ensuring that all concurrent transactions access and lock shared entities in a strictly identical order.
+
+#### 1. Cross-Table Deterministic Ordering (Fixing the Service A vs Service B Deadlock)
+In workflows touching multiple tables, enforce a global resource acquisition hierarchy across all application services:
+
+```diff
+  # Service B: Reconcile and audit
+  with db.transaction():
+-     # Flawed: Inverted table order acquires locks on 'orders' before 'user_balance'
+-     update_order_status(order_id, 'PROCESSING')
+-     audit_user_balance(user_id)
++     # Correct: Enforce global table hierarchy across all services: accounts/balance FIRST, orders SECOND
++     audit_user_balance(user_id)
++     update_order_status(order_id, 'PROCESSING')
+```
+
+#### 2. Intra-Table Batch Ordering (Primary Key Sorting)
+When updating multiple rows in the same table, sort keys deterministically before execution:
 
 ```diff
 - -- Unsorted batch updates risk circular lock order acquisition across threads
@@ -176,23 +220,38 @@ FOR UPDATE;
 
 When every concurrent transaction requests row locks in identical numerical order ($12 \to 44 \to 85$), cyclic dependency graphs become mathematically impossible.
 
-### Solution B: Application-Level Transactional Advisory Locks
-When business workflows involve operations across multiple distinct tables where row sorting is impractical, acquire an explicit transactional advisory lock (`pg_advisory_xact_lock`) [Source: PostgreSQL Documentation - Explicit Locking: Advisory Locks](https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS):
+### Solution B: Collision-Free Transactional Advisory Locks
+When business workflows involve operations across multiple distinct tables where row sorting is impractical, acquire an explicit transactional advisory lock (`pg_advisory_xact_lock`) [Source: PostgreSQL Documentation - Explicit Locking: Advisory Locks](https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS).
+
+Advisory locks live entirely in shared memory (`LockManager`) and release automatically at transaction termination when invoked with the `_xact_` suffix.
+
+#### Eliminating 32-bit Hash Collision Vulnerabilities
+Using `hashtext('user_' || :userId)` outputs a signed 32-bit integer ($2^{32} \approx 4.29 \times 10^9$). Due to the Birthday Paradox, a 50% collision probability occurs at approximately $2^{16} = 65,536$ concurrent distinct keys, risking false serialization where unrelated users block each other.
+
+To prevent hash collisions, use PostgreSQL's built-in 2-key integer namespacing or direct 64-bit keys:
 
 ```sql
--- Acquire transactional advisory lock based on user ID hash
-SELECT pg_advisory_xact_lock(hashtext('user_account_' || :userId));
+-- Option 1: Two-key namespacing (classid integer, objid integer) - Zero hash collision risk
+-- classid 1001 represents USER_ACCOUNT_LOCK, objid is the numeric user ID
+SELECT pg_advisory_xact_lock(1001, :userId);
+
+-- Option 2: Direct 64-bit bigint key for BIGSERIAL or Snowflake primary keys
+SELECT pg_advisory_xact_lock(:userBigIntId);
 
 -- Proceed with safe multi-table operations
 UPDATE accounts SET balance = balance - :amount WHERE user_id = :userId;
 UPDATE orders SET status = 'PAID' WHERE user_id = :userId;
-
 -- Lock automatically releases upon transaction COMMIT or ROLLBACK
 ```
 
-Unlike row locks, advisory locks live entirely in shared memory (`LockManager`) and release automatically at transaction termination when invoked with the `_xact_` suffix.
+If string keys (such as UUIDs) must be hashed, use a 64-bit hash instead of 32-bit `hashtext`:
 
-### Solution C: Fine-Grained Locking with `FOR NO KEY UPDATE`
+```sql
+-- 64-bit hash key from UUID to minimize collision probability to near-zero
+SELECT pg_advisory_xact_lock(('x' || substr(md5('user_account_' || :userUuid), 1, 16))::bit(64)::bigint);
+```
+
+### Solution C: Fine-Grained Locking with `FOR NO KEY UPDATE` & `SKIP LOCKED`
 In PostgreSQL 9.3 and later, `UPDATE` statements that do not modify unique index columns acquire `FOR NO KEY UPDATE` locks rather than exclusive locks. When writing explicit row-locking queries for rows referenced by foreign keys, use:
 
 ```sql
@@ -201,6 +260,18 @@ SELECT * FROM orders WHERE id = :orderId FOR NO KEY UPDATE;
 ```
 
 This prevents unnecessary deadlocks caused by concurrent foreign key validation checks on referenced parent records [Source: PostgreSQL Documentation - Explicit Locking: Row-Level Locks](https://www.postgresql.org/docs/current/explicit-locking.html).
+
+For asynchronous task queues and job processing workers, use `SKIP LOCKED` to eliminate lock waits entirely:
+
+```sql
+-- Worker retrieves next available pending order without blocking or deadlocking concurrent workers
+SELECT id, payload 
+FROM background_tasks 
+WHERE status = 'PENDING' 
+ORDER BY id 
+LIMIT 1 
+FOR UPDATE SKIP LOCKED;
+```
 
 ---
 
@@ -212,8 +283,12 @@ Verify PostgreSQL runtime lock contention and monitor deadlock frequency using c
 # 1. Verify PostgreSQL service status
 systemctl status postgresql
 
-# 2. Inspect active deadlock timeout configuration
+# 2. Inspect active deadlock timeout configuration and enable lock wait logging
 psql -h 127.0.0.1 -U postgres -d production_db -c "SHOW deadlock_timeout;"
+
+# Enable automatic logging of statements waiting longer than deadlock_timeout (default 1s)
+psql -h 127.0.0.1 -U postgres -d production_db -c "ALTER SYSTEM SET log_lock_waits = 'on';"
+psql -h 127.0.0.1 -U postgres -d production_db -c "SELECT pg_reload_conf();"
 
 # 3. Query historical deadlock counters from pg_stat_database
 psql -h 127.0.0.1 -U postgres -d production_db -c "
@@ -243,3 +318,4 @@ WHERE cardinality(pg_blocking_pids(pid)) > 0;"
 * [Source: PostgreSQL Official Documentation - Session Information Functions](https://www.postgresql.org/docs/current/functions-info.html#FUNCTIONS-INFO-SESSION-TABLE)
 * [Source: PostgreSQL Official Documentation - The Statistics Collector](https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-DATABASE-VIEW)
 * [Source: PostgreSQL Official Documentation - PostgreSQL Error Codes](https://www.postgresql.org/docs/current/errcodes-appendix.html)
+* [Source: PostgreSQL Official Documentation - pgrowlocks](https://www.postgresql.org/docs/current/pgrowlocks.html)
