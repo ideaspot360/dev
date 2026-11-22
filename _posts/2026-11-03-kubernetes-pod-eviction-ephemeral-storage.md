@@ -1,9 +1,16 @@
 ---
+layout: post
 title: "Fixing Kubernetes Pod Evictions and CrashLoopBackOff: Ephemeral Storage Limits & EmptyDir Sizing"
+date: 2026-11-03 10:24:43 +0900
 category: "Cloud & DevOps"
 tags: [kubernetes, devops, docker, containers, troubleshooting]
 author: "IdeaSpot360 Engineering Notes"
 excerpt: "When your Kubernetes pods suddenly enter an Evicted or CrashLoopBackOff state due to 'ephemeral-storage exceeded', increasing CPU or RAM limits will not prevent node drain. Here is how k8s local storage accounting actually works."
+verification_date: "2026-11-23"
+fact_check_sources:
+  - "https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/#local-ephemeral-storage"
+  - "https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/"
+  - "https://kubernetes.io/docs/concepts/storage/volumes/#emptydir"
 ---
 
 One of the most elusive production failures in Kubernetes clusters occurs when a pod transitions from `Running` to `Evicted` without throwing memory OOM warnings or application-level stack traces:
@@ -26,7 +33,7 @@ Events:
   Normal   Killing    2m                 kubelet            Stopping container billing-worker
 ```
 
-Unlike CPU throttling (which merely delays response times) or RAM exhaustion (which triggers `OOMKilled exit code 137`), ephemeral storage eviction immediately terminates the pod and schedules a reschedule. If multiple pods on the same worker node breach storage thresholds simultaneously, cascading node evictions can disrupt cluster stability.
+Unlike CPU throttling (which merely delays response times) or RAM exhaustion (which triggers `OOMKilled exit code 137`), ephemeral storage eviction immediately terminates the pod and schedules a reschedule. If multiple pods on the same worker node breach storage thresholds simultaneously, cascading node evictions can disrupt cluster stability [Source: Kubernetes Documentation - Node-pressure Eviction](https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/).
 
 ---
 
@@ -55,7 +62,7 @@ resources:
 ```
 
 ### Why this fails:
-Kubelet calculates a container’s local ephemeral storage consumption as the aggregate of three distinct layers:
+Kubelet calculates a container’s local ephemeral storage consumption as the aggregate of three distinct layers [Source: Kubernetes Documentation - Local Ephemeral Storage](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/#local-ephemeral-storage):
 
 1. **The Container Writable Layer (`upperdir`):** Dynamic files written directly to the container root filesystem outside mounted volumes.
 2. **Container stdout/stderr Logs:** Managed by containerd under `/var/log/pods/`.
@@ -87,7 +94,7 @@ Sample output pinpointing runaway write directories:
 320M    /app/node_modules
 ```
 
-Notice `/tmp` consumed nearly 5GB of the container's root file system. By default, `/tmp` writes directly to `overlayfs` on the host root EBS volume. Kubelet's periodic housekeeping loop (default every 10 seconds) executes `statfs` across node partitions. When free storage drops below the node eviction threshold (`nodefs.available<15%`), kubelet sorts candidate pods by storage consumption relative to requests and evicts the highest consumer immediately.
+Notice `/tmp` consumed nearly 5GB of the container's root file system. By default, `/tmp` writes directly to `overlayfs` on the host root EBS volume. Kubelet's periodic housekeeping loop (default every 10 seconds) executes `statfs` across node partitions [Source: Kubernetes Documentation - Node-pressure Eviction](https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/). When free storage drops below the node eviction threshold (`nodefs.available<15%`), kubelet sorts candidate pods by storage consumption relative to requests and evicts the highest consumer immediately.
 
 ---
 
@@ -121,8 +128,8 @@ To protect the container filesystem from unconstrained writes, explicitly route 
 ```
 
 ### Key Differences & Benefits:
-1. **Explicit `ephemeral-storage` Limits**: Guarantees that if disk writes exceed `4Gi`, kubelet evicts *only* this rogue pod before it exhausts the host node's root filesystem and destabilizes neighboring services.
-2. **`medium: Memory` for `/tmp`**: Directs all temporary files into a fast `tmpfs` RAM slice. If the app forgets to clean up temporary exports, it will trip the `512Mi` limit cleanly without touching physical disk sectors.
+1. **Explicit `ephemeral-storage` Limits**: Guarantees that if disk writes exceed `4Gi`, kubelet evicts *only* this rogue pod before it exhausts the host node's root filesystem and destabilizes neighboring services [Source: Kubernetes Documentation - Local Ephemeral Storage](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/#local-ephemeral-storage).
+2. **`medium: Memory` for `/tmp`**: Directs all temporary files into a fast `tmpfs` RAM slice. Note that in Kubernetes, files written to a `medium: Memory` volume count against the container's **memory limit** (cgroup memory), rather than ephemeral-storage [Source: Kubernetes Documentation - Volumes emptyDir](https://kubernetes.io/docs/concepts/storage/volumes/#emptydir). Ensure container memory limits account for the `sizeLimit` (512Mi) to prevent unexpected container OOMKilled events.
 
 ---
 
@@ -146,3 +153,11 @@ tmpfs           512M  4.0K  512M   1% /tmp
 ```
 
 The billing worker now operates with deterministic disk boundaries, eliminating cluster-wide cascade evictions and ensuring neighboring workloads remain unaffected during batch processing spikes.
+
+---
+
+## 6. Official References & Source Attribution
+
+* [Source: Kubernetes Official Documentation - Managing Ephemeral Storage](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/#local-ephemeral-storage)
+* [Source: Kubernetes Official Documentation - Node-pressure Eviction](https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/)
+* [Source: Kubernetes Official Documentation - Volumes (emptyDir)](https://kubernetes.io/docs/concepts/storage/volumes/#emptydir)
