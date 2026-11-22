@@ -13,6 +13,7 @@ fact_check_sources:
   - "https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/"
   - "https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/"
   - "https://docs.oracle.com/en/java/javase/21/docs/specs/man/java.html"
+  - "https://bugs.openjdk.org/browse/JDK-8346874"
 ---
 
 When a production containerized service abruptly terminates without emitting an application-level stack trace or triggering framework shutdown hooks, inspecting the container runtime state in Kubernetes exposes the following termination status [Source: Kubernetes Documentation - Pod Lifecycle & Container Status](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/):
@@ -25,7 +26,7 @@ State:          Terminated
   Finished:     Mon, 03 Nov 2026 01:38:05 UTC
 ```
 
-Exit code `137` is mathematically deterministic under POSIX standard conventions: when a process is killed by an uncatchable signal $n$, the process exit code equals $128 + n$. Because `SIGKILL` corresponds to signal `9`, the resulting status is $128 + 9 = 137$ [Source: Linux Kernel Documentation - Control Group v2](https://docs.kernel.org/admin-guide/cgroup-v2.html). Since `SIGKILL` operates directly at the kernel scheduling level, the JVM process cannot intercept it, prevent execution halt, generate Java thread dumps, or transmit APM crash diagnostics.
+Exit code `137` is mathematically deterministic under POSIX standard conventions: when a process is killed by an uncatchable signal $n$, standard process runners and container runtimes report an exit code equal to $128 + n$ [Source: Docker Engine Documentation - Resource Constraints](https://docs.docker.com/engine/containers/resource_constraints/). Because `SIGKILL` corresponds to signal `9`, the resulting status is $128 + 9 = 137$. Since `SIGKILL` operates directly at the kernel scheduling level via the OOM killer [Source: Linux Kernel Documentation - Control Group v2](https://docs.kernel.org/admin-guide/cgroup-v2.html), the JVM process cannot intercept it, prevent execution halt, generate Java thread dumps, or transmit APM crash diagnostics.
 
 Resolving exit code 137 requires diagnosing how the Linux kernel cgroups memory subsystem accounts for anonymous resident memory versus how Hotspot allocates off-heap buffers.
 
@@ -72,15 +73,15 @@ A containerized Java application's real physical memory footprint ($M_{\text{tot
 
 $$M_{\text{total}} = \text{Heap} + \text{Metaspace} + \text{Thread Stacks} + \text{Direct ByteBuffers} + \text{CodeCache} + \text{GC Overhead} + \text{Native C/C++}$$
 
-When `-Xmx` is configured to `1800MB` inside a `2048MB` cgroup, exactly **248MB** remains for the rest of the JVM runtime:
+When `-Xmx` is configured to `1800m` (`1800 MiB`) inside a `2Gi` (`2048 MiB`) cgroup, exactly **248 MiB** remains for the rest of the JVM runtime:
 
-1. **Thread Stacks:** 200 concurrent HTTP request threads $\times$ 1MB default thread stack (`-Xss1m`) = **200MB**.
-2. **Direct Memory (Netty / WebFlux):** Off-heap byte buffers allocated for non-blocking network socket I/O easily scale beyond **150MB** under heavy ingress payload handling.
-3. **Metaspace:** Spring Boot applications with comprehensive dependencies load between 15,000 and 22,000 classes, demanding **140MB–190MB** of native off-heap storage.
-4. **Reserved Code Cache:** JIT compiler C1/C2 tiered native compilation buffers allocate between **64MB and 128MB**.
-5. **Garbage Collection Structures:** G1GC Card Tables, Remembered Sets (RSet), and parallel worker marking queues allocate an additional **80MB–120MB**.
+1. **Thread Stacks:** 200 concurrent HTTP request threads $\times$ 1 MiB default thread stack (`-Xss1m`) = **200 MiB**.
+2. **Direct Memory (Netty / WebFlux):** Off-heap byte buffers allocated for non-blocking network socket I/O easily scale beyond **150 MiB** under heavy ingress payload handling.
+3. **Metaspace:** Spring Boot applications with comprehensive dependencies load between 15,000 and 22,000 classes, demanding **140 MiB–190 MiB** of native off-heap storage.
+4. **Reserved Code Cache:** JIT compiler C1/C2 tiered native compilation buffers allocate between **64 MiB and 128 MiB**.
+5. **Garbage Collection Structures:** G1GC Card Tables, Remembered Sets (RSet), and parallel worker marking queues allocate an additional **80 MiB–120 MiB**.
 
-The moment ingress throughput increases, Netty direct buffer allocations push the process RSS across the 2048MB boundary. The Linux kernel immediately dispatches `SIGKILL` to enforce cgroup limits, causing the container to terminate even though Java heap utilization was only at 60%.
+Summing these native pools yields an off-heap requirement of **634 MiB to 788 MiB**, far exceeding the remaining **248 MiB** margin. The moment ingress throughput increases, Netty direct buffer allocations push the process RSS across the 2048 MiB boundary. The Linux kernel immediately dispatches `SIGKILL` to enforce cgroup limits, causing the container to terminate even though Java heap utilization was only at 60%.
 
 ---
 
@@ -116,7 +117,7 @@ dmesg -T | grep -E -i "oom_reaper|killed process"
 The resulting kernel audit record illustrates the exact allocation state at death:
 
 ```text
-[Mon Nov  3 01:38:05 2026] Memory cgroup out of memory: Killed process 38421 (java) total-vm:4918204kB, anon-rss:2097152kB, file-rss:1248kB, shmem-rss:0kB, UID:1000 pgtables:8204kB oom_score_adj:988
+[Mon Nov  3 01:38:05 2026] Memory cgroup out of memory: Killed process 38421 (java) total-vm:4918204kB, anon-rss:2097152kB, file-rss:1248kB, shmem-rss:0kB, UID:1000 pgtables:8204kB oom_score_adj:969
 [Mon Nov  3 01:38:05 2026] oom_reaper: reaped process 38421 (java), now anon-rss:0kB, file-rss:0kB, shmem-rss:0kB
 ```
 
@@ -144,6 +145,15 @@ In standalone Docker environments, running containers with `--memory` but omitti
   docker run -d --name billing-app --memory 2g --memory-swap 2g ideaspot360/billing-service:v2.1.0
   ```
 
+### Edge Case: Linux 6.12+ Kernel Regression & Container Detection Failure (JDK-8346874)
+
+In modern 2024–2026 production fleets deployed on Linux kernel 6.12 or newer, a subtle kernel-JVM interaction regression can silently trigger exit code 137 [Source: OpenJDK Bug System - JDK-8346874](https://bugs.openjdk.org/browse/JDK-8346874):
+
+* **Kernel Structural Change:** Linux 6.12 restructured internal cgroup accounting interfaces and dropped certain legacy entries from `/proc/cgroups` (specifically unmounting legacy cpuset hooks under unified hierarchy).
+* **Hotspot Detection Failure:** Earlier OpenJDK builds (Java 21 prior to 21.0.6, Java 17 prior to 17.0.14) parsed `/proc/cgroups` to verify controller availability. Under kernel 6.12+, Hotspot erroneously assumes container support is unavailable, resetting its cgroup provider to `none`.
+* **Ergonomics Miscalculation:** Consequently, the JVM ignores container memory limits and calculates its heap bounds based on the worker node's total physical memory ($32\text{ GiB}$) rather than the $2\text{ Gi}$ container limit. The application immediately breaches the container's cgroup boundary upon allocating initial heap pools during startup.
+* **Mitigation:** Ensure base container images are updated to Eclipse Temurin 21.0.6+ or 17.0.14+ (which resolves JDK-8347811 by querying `/sys/fs/cgroup/cgroup.controllers` directly). In environments constrained to older JDK releases, supply an explicit maximum heap fallback (such as `-Xmx1433m`) alongside container percentage directives.
+
 ---
 
 ## 4. The Production Fix: Dynamic Percentage Tuning & Headroom Reservation
@@ -155,16 +165,16 @@ Modern OpenJDK builds (Java 11, 17, and 21) are container-aware through `-XX:+Us
 ```diff
 # Container environment configuration (Dockerfile or Kubernetes Pod spec):
 
-- ENV JAVA_OPTS="-Xms1800m -Xmx1800m"
-+ ENV JAVA_OPTS="-XX:+UseContainerSupport \
-+                -XX:MaxRAMPercentage=70.0 \
-+                -XX:InitialRAMPercentage=50.0 \
-+                -XX:MaxMetaspaceSize=256m \
-+                -XX:ReservedCodeCacheSize=128m \
-+                -XX:MaxDirectMemorySize=256m \
-+                -XX:+ExitOnOutOfMemoryError \
-+                -XX:+HeapDumpOnOutOfMemoryError \
-+                -XX:HeapDumpPath=/dumps/oom.hprof"
+- ENV JAVA_TOOL_OPTIONS="-Xms1800m -Xmx1800m"
++ ENV JAVA_TOOL_OPTIONS="-XX:+UseContainerSupport \
++                        -XX:MaxRAMPercentage=70.0 \
++                        -XX:InitialRAMPercentage=50.0 \
++                        -XX:MaxMetaspaceSize=256m \
++                        -XX:ReservedCodeCacheSize=128m \
++                        -XX:MaxDirectMemorySize=256m \
++                        -XX:+ExitOnOutOfMemoryError \
++                        -XX:+HeapDumpOnOutOfMemoryError \
++                        -XX:HeapDumpPath=/dumps/oom.hprof"
 ```
 
 ### Architectural Rationale for Flags:
@@ -172,6 +182,7 @@ Modern OpenJDK builds (Java 11, 17, and 21) are container-aware through `-XX:+Us
 * **`-XX:MaxRAMPercentage=70.0`**: Calculates the maximum heap as $70\%$ of the cgroup memory limit ($2048\text{ MiB} \times 0.70 \approx 1433\text{ MiB}$). This guarantees $30\%$ ($615\text{ MiB}$) of unallocated headroom for thread stacks, Metaspace, Netty direct byte buffers, and OS structures.
 * **`-XX:InitialRAMPercentage=50.0`**: Prevents immediate heap allocation at startup, allowing JVM memory expansion to follow steady-state workload demands.
 * **`-XX:MaxMetaspaceSize=256m`**: Enforces a strict ceiling on class metadata, preventing classloader leaks from consuming off-heap headroom.
+* **`-XX:ReservedCodeCacheSize=128m`**: Caps JIT compiler native compiled bytecode buffers, avoiding unbounded off-heap native memory consumption under high code paths.
 * **`-XX:MaxDirectMemorySize=256m`**: Binds direct byte buffers allocated via `ByteBuffer.allocateDirect()` and Netty `ByteBufAllocator`, preventing off-heap network buffers from exceeding available margin.
 * **`-XX:+ExitOnOutOfMemoryError`**: Instructs Hotspot to terminate immediately with a diagnostic error message if Java heap exhaustion occurs, preventing the process from hanging before kernel intervention.
 * **`-XX:+HeapDumpOnOutOfMemoryError`**: Captures a snapshot of object graphs to persistent storage `/dumps/oom.hprof` for post-mortem analysis with Eclipse MAT or VisualVM.
@@ -215,6 +226,7 @@ spec:
                 -XX:MaxRAMPercentage=70.0
                 -XX:InitialRAMPercentage=50.0
                 -XX:MaxMetaspaceSize=256m
+                -XX:ReservedCodeCacheSize=128m
                 -XX:MaxDirectMemorySize=256m
                 -XX:+ExitOnOutOfMemoryError
                 -XX:+HeapDumpOnOutOfMemoryError
@@ -286,14 +298,21 @@ OpenJDK Runtime Environment Temurin-21.0.4+7 (build 21.0.4+7-LTS)
 
 ### Step 3: Audit Off-Heap Allocations with Native Memory Tracking (NMT)
 
-To isolate off-heap memory growth during load testing, enable Native Memory Tracking:
+To isolate off-heap memory growth during load testing, configure Native Memory Tracking:
 
 ```bash
-# Add -XX:NativeMemoryTracking=summary to JAVA_TOOL_OPTIONS, then query baseline
-kubectl exec -it deployment/billing-service -n production -- jcmd 1 VM.native_memory baseline
+# 1. Standard Summary Tracking (~1% CPU overhead, safe for staging/production):
+# Configure in pod env: -XX:NativeMemoryTracking=summary
+# Establish initial baseline after service warmup:
+kubectl exec -it deployment/billing-service -n production -c app -- jcmd 1 VM.native_memory baseline
 
-# After applying load test traffic, diff against baseline to identify expanding pools
-kubectl exec -it deployment/billing-service -n production -- jcmd 1 VM.native_memory detail.diff
+# After applying load test traffic, diff against baseline to identify expanding memory categories:
+kubectl exec -it deployment/billing-service -n production -c app -- jcmd 1 VM.native_memory summary.diff scale=MB
+
+# 2. Call-Site Detail Tracking (5-10% CPU overhead, recommended for staging diagnostics):
+# Configure in pod env: -XX:NativeMemoryTracking=detail
+# Diff against baseline to pinpoint exact native call-sites (e.g., direct byte buffer allocations):
+kubectl exec -it deployment/billing-service -n production -c app -- jcmd 1 VM.native_memory detail.diff scale=MB
 ```
 
 ### Step 4: Verify Kubernetes Pod QoS Class and oom_score_adj
