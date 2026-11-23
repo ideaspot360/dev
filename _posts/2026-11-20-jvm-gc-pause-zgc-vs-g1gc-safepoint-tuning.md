@@ -12,6 +12,7 @@ fact_check_sources:
   - "https://openjdk.org/jeps/439"
   - "https://openjdk.org/jeps/376"
   - "https://openjdk.org/jeps/312"
+  - "https://bugs.openjdk.org/browse/JDK-8189761"
   - "https://docs.oracle.com/en/java/javase/21/gctuning/"
   - "https://github.com/openjdk/jdk/blob/master/src/hotspot/share/gc/z/zBarrier.inline.hpp"
   - "https://github.com/openjdk/jdk/blob/master/src/hotspot/share/runtime/safepoint.cpp"
@@ -113,17 +114,19 @@ When a VM Operation (such as `VM_G1CollectForAllocation`) requests a global safe
 
 The time that elapses between Phase 2 (arming the poll) and Phase 3 (the moment the last lagging mutator thread parks itself) is formally designated as **Time-to-Safepoint (TTSP)**, logged by `-Xlog:safepoint` as `Reaching safepoint`.
 
-### 2. The C2 JIT Counted Loop Safepoint Elision Defect
+### 2. The C2 JIT Counted Loop Safepoint Elision Defect and Loop Strip Mining
 
 The 2,210ms TTSP spike in our production logs was directly caused by an optimization heuristic within the HotSpot C2 JIT compiler: **counted loop safepoint elision** [Source: OpenJDK HotSpot Source Code — safepointMechanism.cpp](https://github.com/openjdk/jdk/blob/master/src/hotspot/share/runtime/safepointMechanism.cpp).
 
-When the C2 compiler compiles Java loops, it analyzes loop control structures. A loop bounded by a standard 32-bit signed integer `for (int i = 0; i < limit; i++)` is categorized as a "counted loop":
+In HotSpot C2, loops are classified into two categories:
+* **Uncounted Loops**: Loops governed by non-canonical exit predicates, pointer dereferences, or unbounded iterators (e.g., `while (node != null)`). Because the execution duration cannot be mathematically proven at compile time, C2 unconditionally emits a safepoint polling instruction on the loop back-edge.
+* **Counted Loops**: Loops bounded by a standard 32-bit signed integer stride `for (int i = 0; i < limit; i++)` with invariant step and bound conditions.
 
 ```java
 // Vulnerable HotSpot Execution Path in Ledger Processing
 public byte[] computeLedgerRollingHash(byte[][] transactionPayloads, int batchCount) {
     byte[] rollingHash = new byte[32];
-    // Counted loop over primitive int: C2 strips safepoint poll by default!
+    // Counted loop over primitive int: C2 strips safepoint poll on back-edges by default!
     for (int i = 0; i < batchCount; i++) {
         byte[] payload = transactionPayloads[i];
         for (int j = 0; j < payload.length; j++) {
@@ -134,9 +137,13 @@ public byte[] computeLedgerRollingHash(byte[][] transactionPayloads, int batchCo
 }
 ```
 
-Under default compiler settings, C2 assumes that bounded `int` loops execute in short time slices. To maximize CPU throughput and avoid pipeline stalls caused by branch evaluations, C2 intentionally **elides (omits) the safepoint polling instruction on loop back-edges**.
+Under default historical optimization rules, C2 assumes that bounded `int` loops execute in short time slices. To maximize CPU throughput, preserve instruction pipelining, and eliminate branch-prediction stalls caused by safepoint checks, C2 intentionally **elides (omits) safepoint polling instructions on counted loop back-edges**.
 
-In this financial service, settlement batches contain arrays of nested transaction hashes. When a burst of 42,000 transactions arrived, `batchCount` reached 2,400,000 iterations. Thread `OrderExecutionWorker-84` entered this compute-intensive loop:
+To address this latency hazard without destroying loop optimization throughput, OpenJDK introduced **Loop Strip Mining** (JDK-8189761). Strip mining mathematically transforms a large counted loop into a nested two-tier loop structure:
+1. **Inner Loop**: Executes in tight chunks (governed by `-XX:LoopStripMiningIter=1000`) completely free of safepoint polls, enabling full SIMD vectorization and unrolling.
+2. **Outer Loop**: Steps through chunks and executes a safepoint check (`SafepointMechanism::poll()`) every 1,000 iterations.
+
+In our production financial service, settlement batches contained arrays of nested transaction hashes. When a burst of 42,000 transactions arrived, `batchCount` reached 2,400,000 iterations across nested arrays. Because loop strip mining had not been explicitly enabled in combination with counted loop safepoints, thread `OrderExecutionWorker-84` entered this compute-intensive loop:
 1. At $t = 0\text{ms}$, the VM thread armed the safepoint poll to trigger garbage collection.
 2. 63 application worker threads hit safepoint polls on method entries or returns and immediately parked themselves.
 3. Thread 84 was executing the tight `int` loop without a single safepoint check. Because safepoints are cooperative, the JVM cannot forcibly interrupt a thread in user-space execution.
@@ -266,46 +273,68 @@ Introduced in OpenJDK 21 via **JEP 439**, **Generational ZGC** evolves the origi
                                                                      └─────────────────────────────┘
 ```
 
-### 1. Colored Pointers with Explicit Software Masking
+### 1. Colored Pointers with Low-Order Metadata Bits and Shift-Based Stripping
 
-In non-generational ZGC, the collector utilized OS virtual memory multi-mapping, where physical pages were mapped into three distinct virtual memory address spaces (Marked0, Marked1, Remapped).
+In original non-generational ZGC, the collector stored GC metadata inside the high-order bits of 64-bit addresses (bits 42 to 45) and relied on OS virtual memory multi-mapping, where the exact same physical memory page was mapped into three separate virtual address aliases (`Marked0`, `Marked1`, and `Remapped`). While this allowed dereferences without explicit software unmasking on early hardware, it limited maximum addressable heap to 16 TiB, distorted OS-level telemetry (inflating Virtual Memory Size in `top` and `/proc/self/smaps`), and precluded generational metadata isolation.
 
-Generational ZGC (JEP 439) in OpenJDK 21 eliminated virtual memory multi-mapping in favor of **explicit software color masking** [Source: JEP 439 Generational ZGC](https://openjdk.org/jeps/439). Reference pointers embed metadata directly inside the unused high-order bits of 64-bit addresses:
+Generational ZGC (JEP 439) in OpenJDK 21 completely eliminated virtual memory multi-mapping and fundamentally restructured the colored pointer layout [Source: JEP 439 Generational ZGC](https://openjdk.org/jeps/439):
 
 ```text
- 63      48 47   46   45     44   43       0
-+----------+----+----+------+----+----------+
-| Reserved | M0 | M1 | Remp | Fin| Address  |
-+----------+----+----+------+----+----------+
+Non-Generational ZGC (Legacy High-Order Bits):
+ 63      48 47   46   45     44   43                         0
++----------+----+----+------+----+----------------------------+
+| Reserved | M0 | M1 | Remp | Fin| Heap Object Address (42b)  |
++----------+----+----+------+----+----------------------------+
+
+Generational ZGC (JEP 439 - High-Order Address, Low-Order Metadata):
+ 63                                              16 15       0
++--------------------------------------------------+----------+
+|          Heap Object Address Bits (48b)          | Metadata |
++--------------------------------------------------+----------+
+                                                    │
+                   ┌────────────────────────────────┴───────────────┐
+                   │ YoungMark │ OldMark │ Remapped │ Remembered... │
+                   └────────────────────────────────────────────────┘
 ```
 
-* **Marked0 / Marked1**: Track object liveness across alternating GC cycles.
-* **Remapped**: Indicates that the pointer has been updated to point to the relocated target object.
-* **Finalizable**: Indicates reachability through finalizers.
+By placing the object memory address in the **high-order bits** and the garbage collection metadata in the **low-order bits**, OpenJDK achieves a critical hardware optimization:
+* **Single-Instruction Check & Strip on x86_64**: A single logical right shift instruction (`shr`) simultaneously checks whether any metadata bits require GC slow-path handling (via CPU zero/carry condition flags) and strips away the color bits to recover the canonical colorless pointer for immediate CPU dereferencing, completely eliminating multi-instruction bitwise `and` operations.
+* **Distinct Young and Old Metadata Spaces**: Generational ZGC allocates separate marking and relocation metadata bits for Young and Old generations (`is_young_load_good`, `is_old_load_good`, `is_young_mark`, `is_old_mark`). This permits young generation collections to cycle through concurrent mark and relocate phases independently without synchronizing with long-running old generation passes.
 
-### 2. Load Barriers and On-the-Fly Pointer Healing
+### 2. Streamlined Load Barriers and Relocation Self-Healing
 
-When application code dereferences an object field, the JIT compiler inserts an inline **Load Barrier** [Source: OpenJDK HotSpot Source Code — zBarrier.inline.hpp](https://github.com/openjdk/jdk/blob/master/src/hotspot/share/gc/z/zBarrier.inline.hpp):
+In non-generational ZGC, the load barrier was burdened with two distinct duties: checking if an object was marked alive, and checking if an object had been relocated.
+
+In Generational ZGC (JEP 439), **marking of reachable objects was moved out of load barriers and transferred into store barriers and root scanning** [Source: JEP 439 Generational ZGC](https://openjdk.org/jeps/439). Because application threads execute read operations far more frequently than writes (often by an order of magnitude, 8:1 to 10:1), stripping marking out of the load path yields substantial throughput gains.
+
+Under Generational ZGC, the load barrier is streamlined strictly to handle concurrent relocation and on-the-fly pointer self-healing [Source: OpenJDK HotSpot Source Code — zBarrier.inline.hpp](https://github.com/openjdk/jdk/blob/master/src/hotspot/share/gc/z/zBarrier.inline.hpp):
 
 ```cpp
 // Source: OpenJDK HotSpot share/gc/z/zBarrier.inline.hpp
 inline oop ZBarrier::load_barrier_on_oop_field(volatile oop* p) {
-  oop o = *p;
-  if (ZAddress::is_bad(o)) {
-    return load_barrier_on_oop_field_slow_path(p);
+  const oop o = Atomic::load(p);
+  return load_barrier_on_oop_field_preloaded(p, o);
+}
+
+inline oop ZBarrier::load_barrier_on_oop_field_preloaded(volatile oop* p, oop o) {
+  // Fast Path (99.9% of executions): Bitwise test against active load-good mask
+  if (ZPointer::is_load_good(p, o)) {
+    return o;
   }
-  return o;
+  // Slow Path: Relocate from forwarding table, CAS self-heal, return new oop
+  return load_barrier_on_oop_slow_path(p, o);
 }
 ```
 
-* **Fast Path (99.9% of loads)**: A single bitwise `test` instruction checks whether the pointer matches the current "good" color mask. If valid, execution continues with an overhead of ~1.8 nanoseconds.
-* **Slow Path (During active relocation)**: If the pointer has a "bad" color, the load barrier triggers the slow path. It queries the ZGC forwarding table, retrieves the object's new address in the evacuated compaction page, atomically writes the updated address back to the reference field (`self-healing`), and returns the new pointer. Subsequent dereferences take the fast path immediately.
+* **Fast Path (<2ns)**: The mutator evaluates whether the pointer matches the active phase's load-good mask (`ZPointer::is_load_good`). If valid, execution continues without branching.
+* **Slow Path & CAS Self-Healing**: If the pointer is "bad" (i.e., points to an object inside an evacuation candidate page), the thread enters the slow path. It queries the lock-free ZGC forwarding table to locate the object's newly compacted address, atomically updates the reference field in place via `Atomic::cmpxchg(p, o, new_o)`, and returns `new_o`. All subsequent field accesses by any mutator thread will hit the fast path.
 
-### 3. Store Barriers in Generational ZGC
+### 3. Dual-Role Store Barriers and Remembered Sets in Generational ZGC
 
-While non-generational ZGC operated without store barriers, Generational ZGC introduced **Store Barriers** to facilitate independent collection of the young generation [Source: JEP 439 Generational ZGC](https://openjdk.org/jeps/439).
+While non-generational ZGC operated without store barriers, Generational ZGC introduced **Store Barriers** to serve two vital functions [Source: JEP 439 Generational ZGC](https://openjdk.org/jeps/439):
 
-To collect young-generation objects without scanning the entire old generation, the collector must track all old-to-young pointer references. When mutator code executes `obj.field = newRef`, the store barrier intercepts the assignment and records the modified memory location into a remembered set buffer. This allows young collections to proceed independently with zero full-heap scanning overhead.
+1. **Card-Free Remembered Set Maintenance**: To collect the young generation independently without scanning tens of gigabytes of old generation heap, the collector must track old-to-young pointers. When application mutators execute `obj.field = newRef`, the store barrier intercepts the assignment. By evaluating the generational metadata bits of `obj` and `newRef`, the barrier detects if an old-generation field is receiving a young-generation object and records the exact reference location into a thread-local remembered set buffer, avoiding the heavy memory overhead of traditional G1 card tables.
+2. **Concurrent Marking Offloading**: When an application thread overwrites a field reference, the store barrier inspects the overwritten pointer's color bits. If the previously referenced object requires marking, the store barrier enqueues it, ensuring that live objects are preserved during concurrent mark phases without burdening the hot read path.
 
 ### 4. Concurrent Thread-Stack Processing (JEP 376)
 
@@ -459,6 +488,7 @@ When designing or tuning high-throughput JVM services with sub-5ms SLA requireme
 * [OpenJDK JEP 439: Generational ZGC](https://openjdk.org/jeps/439)
 * [OpenJDK JEP 376: ZGC: Concurrent Thread-Stack Processing](https://openjdk.org/jeps/376)
 * [OpenJDK JEP 312: Thread-Local Handshakes](https://openjdk.org/jeps/312)
+* [OpenJDK Bug System JDK-8189761: Loop Strip Mining in C2](https://bugs.openjdk.org/browse/JDK-8189761)
 * [Oracle HotSpot Virtual Machine Garbage Collection Tuning Guide (Java SE 21)](https://docs.oracle.com/en/java/javase/21/gctuning/)
 * [OpenJDK HotSpot Source: safepoint.cpp](https://github.com/openjdk/jdk/blob/master/src/hotspot/share/runtime/safepoint.cpp)
 * [OpenJDK HotSpot Source: safepointMechanism.cpp](https://github.com/openjdk/jdk/blob/master/src/hotspot/share/runtime/safepointMechanism.cpp)
