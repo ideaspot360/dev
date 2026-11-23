@@ -24,17 +24,19 @@ fact_check_sources:
 During peak data ingestion hours, a high-throughput write-heavy PostgreSQL 16 cluster abruptly locked down and rejected all write transactions across all client application services [Source: PostgreSQL Documentation - Routine Vacuuming](https://www.postgresql.org/docs/16/routine-vacuuming.html). The database engine initiated an emergency protective shutdown to prevent silent, irrecoverable data loss caused by 32-bit transaction ID (XID) wraparound.
 
 ```text
-2026-11-17 01:42:19.412 UTC [31842] LOG:  database "analytics_events" must be vacuumed within 40000000 transactions
-2026-11-17 01:52:04.108 UTC [31842] WARNING:  database "analytics_events" must be vacuumed within 10000000 transactions
-2026-11-17 02:04:12.891 UTC [1082] FATAL:  database is not accepting commands to avoid wraparound data loss in database "analytics_events"
+2026-11-17 01:42:19.412 UTC [31842] WARNING:  database "analytics_events" must be vacuumed within 100000000 transactions
+2026-11-17 01:42:19.412 UTC [31842] DETAIL:  Approximately 4.66% of transaction ID space remains before wraparound.
+2026-11-17 01:52:04.108 UTC [31842] WARNING:  database "analytics_events" must be vacuumed within 40000000 transactions
+2026-11-17 01:52:04.108 UTC [31842] DETAIL:  Approximately 1.86% of transaction ID space remains before wraparound.
+2026-11-17 02:04:12.891 UTC [1082] ERROR:  database is not accepting commands that assign new transaction IDs to avoid wraparound data loss in database "analytics_events"
 2026-11-17 02:04:12.891 UTC [1082] HINT:  Stop the postmaster and vacuum that database in single-user mode.
 You might also need to commit or roll back old prepared transactions, or drop stale replication slots.
 ```
 
-Downstream microservices immediately began logging transaction failures as PgBouncer pooled connections received fatal server errors:
+Downstream microservices immediately began logging transaction failures as PgBouncer pooled connections received server errors:
 
 ```text
-2026-11-17T02:04:13.014Z [ingest-worker,7b2a9e1c,4f8e2d1a] ERROR 40182 --- [nio-8080-exec-9] c.e.events.service.IngestService : Failed to persist raw event batch: org.postgresql.util.PSQLException: FATAL: database is not accepting commands to avoid wraparound data loss in database "analytics_events"
+2026-11-17T02:04:13.014Z [ingest-worker,7b2a9e1c,4f8e2d1a] ERROR 40182 --- [nio-8080-exec-9] c.e.events.service.IngestService : Failed to persist raw event batch: org.postgresql.util.PSQLException: ERROR: database is not accepting commands that assign new transaction IDs to avoid wraparound data loss in database "analytics_events"
 ```
 
 Manual query execution via `psql` confirmed an immediate write rejection across all mutating DML and DDL commands, while read-only queries (`SELECT`) remained accessible:
@@ -43,7 +45,7 @@ Manual query execution via `psql` confirmed an immediate write rejection across 
 psql -h 127.0.0.1 -p 5432 -U postgres -d analytics_events -c "INSERT INTO raw_events (event_id, payload) VALUES ('evt-99120', '{\"status\":\"test\"}');"
 ```
 ```text
-FATAL:  database is not accepting commands to avoid wraparound data loss in database "analytics_events"
+ERROR:  database is not accepting commands that assign new transaction IDs to avoid wraparound data loss in database "analytics_events"
 HINT:  Stop the postmaster and vacuum that database in single-user mode.
 You might also need to commit or roll back old prepared transactions, or drop stale replication slots.
 ```
@@ -82,9 +84,24 @@ PostgreSQL evaluates transaction age order using signed 32-bit modular arithmeti
 
 ```c
 /* Defined in src/include/access/transam.h */
-#define TransactionIdPrecedes(id1, id2) \
-    ((int32) ((id1) - (id2)) < 0)
+static inline bool
+TransactionIdPrecedes(TransactionId id1, TransactionId id2)
+{
+    /*
+     * If either ID is a permanent XID then we can just do unsigned
+     * comparison. If both are normal, do a modulo-2^32 comparison.
+     */
+    int32       diff;
+
+    if (!TransactionIdIsNormal(id1) || !TransactionIdIsNormal(id2))
+        return (id1 < id2);
+
+    diff = (int32) (id1 - id2);
+    return (diff < 0);
+}
 ```
+
+The helper macro `TransactionIdIsNormal(xid)` checks whether `xid >= FirstNormalTransactionId` (`3`). Permanent transaction IDs (`InvalidTransactionId = 0`, `BootstrapTransactionId = 1`, `FrozenTransactionId = 2`) do not participate in cyclic modulo-$2^{32}$ wraparound and are handled via simple unsigned comparison.
 
 ```
        [Past: 2^31 Transactions]            [Current XID]            [Future: 2^31 Transactions]
@@ -101,9 +118,14 @@ $$\text{diff} = (int32)(X_{\text{current}} - t_{\text{xmin}}) < 0$$
 
 The engine interprets the historical tuple as having been created *in the future*, causing all subsequent `SELECT` queries to treat the row as uncommitted and invisible [Source: PostgreSQL Documentation - Routine Vacuuming](https://www.postgresql.org/docs/16/routine-vacuuming.html).
 
-To permanently secure tuple visibility, `VACUUM` freezes tuples by setting infomask bit flags in the tuple header:
-* `HEAP_XMIN_FROZEN` (defined as `HEAP_XMIN_COMMITTED | HEAP_XMIN_INVALID`)
-* In modern PostgreSQL storage formats, freezing sets this hint bit rather than rewriting the physical `t_xmin` to `FrozenTransactionId` (2), eliminating write churn on heap pages while guaranteeing that all future transactions consider the tuple universally visible.
+To permanently secure tuple visibility, `VACUUM` freezes tuples by setting infomask bit flags in the tuple header (`src/include/access/htup_details.h`):
+```c
+#define HEAP_XMIN_COMMITTED 0x0100 /* t_xmin committed */
+#define HEAP_XMIN_INVALID   0x0200 /* t_xmin invalid/aborted */
+#define HEAP_XMIN_FROZEN    (HEAP_XMIN_COMMITTED|HEAP_XMIN_INVALID) /* 0x0300 */
+```
+* **The Logically Contradictory Bit Trick**: In standard MVCC, a transaction cannot be simultaneously committed and invalid. PostgreSQL repurposes this logically impossible combination (`0x0300`) as `HEAP_XMIN_FROZEN`.
+* In modern PostgreSQL storage formats (since PostgreSQL 9.4), page freezing sets this `HEAP_XMIN_FROZEN` infomask hint bit rather than physically rewriting `t_xmin` to `FrozenTransactionId` (2), eliminating unnecessary WAL writes while ensuring that `HeapTupleHeaderGetXmin()` returns `FrozenTransactionId` and all future transactions treat the tuple as unconditionally committed in the deep past.
 
 ### 1.2 Autovacuum Cost Throttling Equations and Worker Starvation
 
@@ -144,18 +166,25 @@ PostgreSQL governs proactive and forced table-level vacuuming through four confi
 4. **`vacuum_failsafe_age`** (Default: 1,600,000,000 transactions, introduced in PostgreSQL 14): When `age(relfrozenxid)` reaches this boundary, `VACUUM` bypasses cost-based delays, drops buffer access strategy constraints, and skips index vacuuming to prioritize heap freezing [Source: PostgreSQL Documentation - Routine Vacuuming](https://www.postgresql.org/docs/16/routine-vacuuming.html).
 
 ```
-   0 TXIDs            150M TXIDs              200M TXIDs               1.6B TXIDs             2.09B TXIDs      2.14B TXIDs
-┌──────────────┬───────────────────────┬───────────────────────┬────────────────────────┬─────────────┬───────────┐
-│ Normal       │ Aggressive Vacuum     │ Forced Anti-Wraparound│ Vacuum Failsafe        │ Warning     │ Emergency │
-│ Autovacuum   │ (Scans All Pages)     │ Autovacuum Worker     │ (Bypasses Cost Delays) │ Thresholds  │ Lockdown  │
-│ (Dead Tuples)│ relfrozenxid > 150M   │ relfrozenxid > 200M   │ relfrozenxid > 1.6B    │ 40M/10M left│ 1M left   │
-└──────────────┴───────────────────────┴───────────────────────┴────────────────────────┴─────────────┴───────────┘
+   0 TXIDs            150M TXIDs              200M TXIDs               1.6B TXIDs            2.047B TXIDs      2.144B TXIDs     2.147B TXIDs
+┌──────────────┬───────────────────────┬───────────────────────┬────────────────────────┬────────────────────┬───────────────┬───────────┐
+│ Normal       │ Aggressive Vacuum     │ Forced Anti-Wraparound│ Vacuum Failsafe        │ Warning Threshold  │ Stop Limit    │ Wraparound│
+│ Autovacuum   │ (Scans All Pages)     │ Autovacuum Worker     │ (Bypasses Cost Delays) │ xidWarnLimit       │ xidStopLimit  │ Limit     │
+│ (Dead Tuples)│ relfrozenxid > 150M   │ relfrozenxid > 200M   │ relfrozenxid > 1.6B    │ (100M XIDs left)   │ (3M XIDs left)│ (0 left)  │
+└──────────────┴───────────────────────┴───────────────────────┴────────────────────────┴────────────────────┴───────────────┴───────────┘
 ```
 
-The postmaster enforces escalating warning thresholds as the oldest unfrozen XID approaches $2^{31} - 1$:
-* **40,000,000 transactions remaining**: `LOG: database "%s" must be vacuumed within 40000000 transactions`
-* **10,000,000 transactions remaining**: `WARNING: database "%s" must be vacuumed within 10000000 transactions`
-* **1,000,000 transactions remaining**: `FATAL: database is not accepting commands to avoid wraparound data loss in database "%s"` [Source: PostgreSQL Source Code - varsup.c](https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/access/transam/varsup.c)
+The backend enforces escalating safety thresholds defined in `src/backend/access/transam/varsup.c` as the oldest unfrozen XID approaches $2^{31} - 1$ (`xidWrapLimit = oldest_datfrozenxid + (MaxTransactionId >> 1)`):
+* **100,000,000 transactions remaining** (`xidWarnLimit = xidWrapLimit - 100000000`):
+  `WARNING: database "%s" must be vacuumed within %u transactions`
+  `DETAIL: Approximately %.2f%% of transaction ID space remains before wraparound.`
+  `HINT: To avoid a shutdown, execute a database-wide VACUUM in that database.`
+* **3,000,000 transactions remaining** (`xidStopLimit = xidWrapLimit - 3000000`):
+  `ERROR: database is not accepting commands that assign new transaction IDs to avoid wraparound data loss in database "%s"`
+  `HINT: Stop the postmaster and vacuum that database in single-user mode.`
+  `You might also need to commit or roll back old prepared transactions, or drop stale replication slots.` [Source: PostgreSQL Source Code - varsup.c](https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/access/transam/varsup.c)
+
+*(Note: In PostgreSQL 14+, `xidStopLimit` was deliberately increased from the legacy 1-million margin to 3 million transactions. This 3,000,000 XID headroom provides administrators with ample transaction capacity to run single-user emergency maintenance—such as database-wide `VACUUM` commands that consume transaction IDs when truncating relations at `wal_level != minimal`—without risking mid-recovery failure.)*
 
 In this incident, despite `vacuum_failsafe_age` engaging, the autovacuum process was unable to complete relation freezing due to external blocking factors pinning the cluster-wide transaction horizon.
 
@@ -190,7 +219,7 @@ Inspection of system catalogs revealed three distinct horizon blockers:
 3. **Lock Contention from Long-Running Reporting Queries**:
    Nightly analytical aggregations executed queries holding `ACCESS SHARE` locks for 3.5 hours on `raw_events`, while maintenance scripts attempted `LOCK TABLE raw_events IN SHARE UPDATE EXCLUSIVE MODE`. PostgreSQL's `deadlock_timeout` (1 second) triggered autovacuum worker cancellation whenever application queries queued for relation locks.
 
-Because the oldest active `xmin` was pinned at `1,842,109,230`, every autovacuum pass on `raw_events` was forced to skip freezing tuples newer than that horizon. As write ingestion consumed millions of new XIDs per hour, the distance between current XID and `datfrozenxid` crossed the 1-million boundary, triggering the hard postmaster safety shutdown [Source: PostgreSQL Source Code - varsup.c](https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/access/transam/varsup.c).
+Because the oldest active `xmin` was pinned at `1,842,109,230`, every autovacuum pass on `raw_events` was forced to skip freezing tuples newer than that horizon. As write ingestion consumed millions of new XIDs per hour, the distance between current XID and `datfrozenxid` crossed the 3-million `xidStopLimit` boundary, triggering the emergency write-lockout shutdown [Source: PostgreSQL Source Code - varsup.c](https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/access/transam/varsup.c).
 
 ### 1.5 MultiXact ID Wraparound Dynamics (`datminmxid`)
 
@@ -368,6 +397,13 @@ To ensure autovacuum processes keep pace with 45,000 writes/sec on NVMe storage 
 +statement_timeout = 300000ms
 ```
 
+### Key Architectural Mechanics of the Hardened Configuration:
+* **The 1GB Dead Tuple Tracking Ceiling (`autovacuum_work_mem`)**: In PostgreSQL, even if `maintenance_work_mem` or `autovacuum_work_mem` is configured to 2GB or 4GB, PostgreSQL's vacuum subsystem hard-caps the memory used for collecting dead tuple identifiers (`ItemPointerData` / TIDs) to exactly **1 GB** [Source: PostgreSQL Documentation - Resource Consumption](https://www.postgresql.org/docs/16/runtime-config-resource.html). Because each TID consumes 6 bytes (4-byte `BlockIdData` + 2-byte `OffsetNumber`), a 1 GB buffer stores at most:
+  $$\text{Max Single-Pass TIDs} = \frac{1 \times 1024^3\text{ bytes}}{6\text{ bytes}} \approx 178,956,970\text{ dead tuples}$$
+  Allocating `autovacuum_work_mem = 2GB` guarantees each worker achieves this maximum 1 GB allocation without memory starvation, while `maintenance_work_mem = 4GB` accelerates standalone parallel index operations (`CREATE INDEX`, `REINDEX`). If a relation accumulates more than 178.9 million dead tuples, `VACUUM` executes multiple index scan cycles.
+* **Unthrottled NVMe Cost Delay (`autovacuum_vacuum_cost_delay = 0ms`)**: Setting cost delay to `0ms` (or `0`) instructs the vacuum engine to bypass token-bucket sleep intervals entirely, unleashing the full hardware throughput of NVMe storage (up to several GB/s) rather than artificially capping workers at 39 MB/s.
+* **Worker Allocation Scalability (`autovacuum_max_workers = 6`)**: Raising worker count from 3 to 6 ensures multiple relations can be aggressively frozen in parallel across independent CPU cores and NVMe channels without starving normal dead-tuple cleanup on lighter OLTP tables.
+
 In addition, storage parameter overrides were applied directly to high-churn tables to prevent massive write bursts from accumulating unfrozen pages:
 
 ```sql
@@ -515,13 +551,13 @@ groups:
 
       - alert: PostgreSQLOrphanedPreparedTransaction
         expr: |
-          pg_prepared_statement_age_seconds > 3600
+          (time() - pg_prepared_xacts_oldest_timestamp_seconds) > 3600
         for: 5m
         labels:
           severity: critical
         annotations:
-          summary: "Orphaned 2PC prepared transaction detected"
-          description: "A prepared transaction has remained open for over 1 hour, pinning xmin horizon."
+          summary: "Orphaned 2PC prepared transaction detected in pg_prepared_xacts"
+          description: "A two-phase commit prepared transaction has remained open for over 1 hour, pinning cluster xmin horizon."
 ```
 
 ### Production Incident Verification Runbook Checklist
