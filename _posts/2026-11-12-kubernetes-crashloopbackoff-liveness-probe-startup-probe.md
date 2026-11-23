@@ -5,14 +5,17 @@ date: 2026-11-12 10:46:38 +0900
 category: "Cloud & DevOps"
 tags: [kubernetes, crashloopbackoff, liveness-probe, startup-probe, spring-boot, devops, microservices]
 author: "IdeaSpot360 Engineering Notes"
-excerpt: "When heavy Spring Boot microservices enter Kubernetes CrashLoopBackOff during cold starts, aggressive liveness probes repeatedly kill initializing containers. Here is how Kubelet probe workers evaluate health in pkg/kubelet/prober/worker.go, the mathematics of CrashLoopBackOff exponential backoff, why pointing liveness to deep dependencies causes cluster restart storms, and how to configure dedicated startupProbes for zero-downtime rollouts."
+excerpt: "When heavy Spring Boot and gRPC microservices enter Kubernetes CrashLoopBackOff during cold starts, aggressive liveness probes repeatedly kill initializing containers. Here is how Kubelet probe workers evaluate health in pkg/kubelet/prober/worker.go, the mathematics of CrashLoopBackOff exponential backoff, native gRPC vs HTTP probe execution in pkg/probe/grpc/grpc.go, why pointing liveness to deep dependencies causes cluster restart storms, and how to configure dedicated startupProbes for zero-downtime rollouts."
 verification_date: "2026-11-23"
 fact_check_sources:
   - "https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/"
+  - "https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/#define-a-grpc-liveness-probe"
   - "https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/"
   - "https://docs.spring.io/spring-boot/reference/actuator/endpoints.html#actuator.endpoints.kubernetes-probes"
   - "https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/prober/worker.go"
   - "https://github.com/kubernetes/kubernetes/blob/master/pkg/probe/http/http.go"
+  - "https://github.com/kubernetes/kubernetes/blob/master/pkg/probe/grpc/grpc.go"
+  - "https://github.com/grpc/grpc/blob/master/doc/health-checking.md"
 ---
 
 During a continuous deployment rollout on a production Kubernetes cluster, newly scheduled pods repeatedly fail to reach steady state, cycling through `ContainerCreating`, running for several seconds, and then crashing into `CrashLoopBackOff`:
@@ -111,9 +114,11 @@ Each worker runs a continuous ticker loop:
 1. The worker sleeps for `initialDelaySeconds`.
 2. Every `periodSeconds`, the worker calls `doProbe(ctx)`.
 3. For HTTP health checks, `pkg/probe/http/http.go` executes an HTTP `GET` request against the target container port [Source: Kubernetes Source Code — pkg/probe/http/http.go](https://github.com/kubernetes/kubernetes/blob/master/pkg/probe/http/http.go).
-4. As defined in `DoHTTPProbe()`:
    * Status codes $200 \le \text{code} < 400$ return `probe.Success`.
    * Status codes $\ge 400$ or TCP socket connection timeouts/refusals return `probe.Failure`.
+4. For native gRPC health checks, `pkg/probe/grpc/grpc.go` establishes an RPC connection and executes `grpc.health.v1.Health/Check` against the numeric port [Source: Kubernetes Source Code — pkg/probe/grpc/grpc.go](https://github.com/kubernetes/kubernetes/blob/master/pkg/probe/grpc/grpc.go):
+   * An RPC response of `HealthCheckResponse_SERVING` returns `probe.Success`.
+   * An RPC response of `NOT_SERVING`, non-OK gRPC status codes, or connection timeouts return `probe.Failure`.
 5. If the probe yields `probe.Failure` consecutively for `failureThreshold` times, the worker invokes `w.onProbeFailure()`. For a `livenessProbe`, this triggers container termination and schedules a restart according to the pod's `restartPolicy`.
 
 ### 1.2 Spring Boot Actuator Probe Lifecycle
@@ -313,6 +318,91 @@ management:
 * `/actuator/health/liveness` validates only `LivenessState` (internal JVM/thread integrity).
 * `/actuator/health/readiness` validates `ReadinessState` and critical network dependencies (`db`). If the database is unreachable, the pod is removed from Kubernetes Service Endpoints but **is not killed or restarted**.
 
+### 4.3 gRPC Microservices: Native gRPC Probes & Architecture (`pkg/probe/grpc/grpc.go`)
+
+In microservices architectures built on gRPC (e.g., Spring Boot with `grpc-spring-boot-starter`, Go `google.golang.org/grpc`, or Rust Tonic), health checks should utilize Kubernetes native gRPC probes rather than external CLI binaries such as `grpc-health-probe` [Source: Kubernetes Documentation: Configure gRPC Probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/#define-a-grpc-liveness-probe).
+
+#### Standard Protocol Implementation
+Native gRPC probes communicate using the official gRPC Health Checking Protocol (`grpc.health.v1.Health`) [Source: gRPC Health Checking Protocol Specification](https://github.com/grpc/grpc/blob/master/doc/health-checking.md):
+
+```protobuf
+syntax = "proto3";
+
+package grpc.health.v1;
+
+message HealthCheckRequest {
+  string service = 1;
+}
+
+message HealthCheckResponse {
+  enum ServingStatus {
+    UNKNOWN = 0;
+    SERVING = 1;
+    NOT_SERVING = 2;
+    SERVICE_UNKNOWN = 3;
+  }
+  ServingStatus status = 1;
+}
+
+service Health {
+  rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc Watch(HealthCheckRequest) returns (stream HealthCheckResponse);
+}
+```
+
+Inside `pkg/probe/grpc/grpc.go`, the kubelet dials the container endpoint using insecure transport credentials (`insecure.NewCredentials()`) and invokes the `Check()` RPC [Source: Kubernetes Source Code — pkg/probe/grpc/grpc.go](https://github.com/kubernetes/kubernetes/blob/master/pkg/probe/grpc/grpc.go):
+* If `status == HealthCheckResponse_SERVING`, Kubelet records `probe.Success`.
+* If `status == HealthCheckResponse_NOT_SERVING` or an RPC error occurs (`status.Code(err) != codes.OK`), Kubelet records `probe.Failure`.
+
+#### Crucial Architectural Rules for Kubernetes gRPC Probes
+1. **Numeric Ports Only**: Unlike HTTP or TCP probes, **gRPC probes strictly require numeric port definitions** (e.g., `port: 9090`). Specifying a named port (e.g., `port: grpc-server`) triggers immediate API validation schema rejection.
+2. **Decoupled Service Scope**: An empty service parameter (`service: ""`) evaluates overall server availability. Setting `service: "liveness"` vs `service: "readiness"` cleanly decouples internal process integrity from upstream dependency connectivity.
+3. **Dedicated gRPC Startup Probe**: Complex gRPC servers that load heavy protobuf descriptors, warm reflection caches, or establish gRPC client channels during cold boot must declare a dedicated `startupProbe.grpc` to absorb initialization delays.
+
+#### Production Kubernetes Deployment with Native gRPC Probes:
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-grpc-service
+  namespace: production
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+      - name: payment-service
+        image: registry.internal/payment-service:v3.2
+        ports:
+        - containerPort: 9090
+          name: grpc-web
+        # 1. Dedicated gRPC Startup Probe: Absorbs protobuf and channel init latency
+        startupProbe:
+          grpc:
+            port: 9090
+            service: "liveness"
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 30       # Total budget: 10s + (30 * 5s) = 160 seconds
+          timeoutSeconds: 3
+        # 2. Steady-State gRPC Liveness Probe: Fast deadlock detection
+        livenessProbe:
+          grpc:
+            port: 9090
+            service: "liveness"
+          periodSeconds: 10
+          failureThreshold: 3        # Fast reaction: kills deadlock after 30 seconds
+          timeoutSeconds: 3
+        # 3. gRPC Readiness Probe: Traffic routing control
+        readinessProbe:
+          grpc:
+            port: 9090
+            service: "readiness"
+          periodSeconds: 5
+          failureThreshold: 2        # Fast ejection: removes from service in 10 seconds
+          timeoutSeconds: 3
+```
+
 ---
 
 ## 5. Architectural Deep Dive: Kubelet Startup Gate in `worker.go`
@@ -320,35 +410,40 @@ management:
 To understand why this solution eliminates cold-start latency while maintaining fast deadlock recovery, examine the probe execution logic inside `pkg/kubelet/prober/worker.go` [Source: Kubernetes Source Code — pkg/kubelet/prober/worker.go](https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/prober/worker.go):
 
 ```go
-// Inside pkg/kubelet/prober/worker.go
+// Inside pkg/kubelet/prober/worker.go (Kubernetes Kubelet Prober Subsystem)
 func (w *worker) doProbe(ctx context.Context) bool {
-    // If a startup probe is defined and has not yet completed successfully,
-    // liveness and readiness probe workers must yield immediately.
+    // 1. Guard against non-started containers:
+    // If a startup probe is defined and has not yet succeeded,
+    // liveness and readiness probe workers defer execution immediately.
     if w.probeType != startup {
-        if !w.containerStarted() {
+        if c := w.getContainerStatus(); c != nil && c.Started != nil && !*c.Started {
             return true
         }
     }
 
+    // 2. Execute the concrete probe action (HTTP, TCP, Exec, or gRPC)
     result, err := w.probeManager.runProbe(ctx, w.probeType, w.pod, w.status, w.container, w.containerID)
     if err != nil {
         return true
     }
 
+    // 3. Process probe results and manage status transitions
     if w.probeType == startup {
         if result == probe.Success {
-            // Container startup completed!
-            w.setContainerStarted()
-            // Terminate startup worker routine; hand over control to liveness/readiness
+            // Container initialization succeeded:
+            // Update the resultsManager cache, setting *c.Started = true in pod status
+            w.resultsManager.Set(w.containerID, results.Success, w.pod)
+            // Terminate startup worker routine; unblock liveness and readiness tickers
             return false
         }
         if w.resultRun >= w.spec.FailureThreshold {
-            // Exceeded startup budget -> signal kubelet to restart container
+            // Exceeded startup budget -> signal kubelet to terminate and restart container
+            w.resultsManager.Set(w.containerID, results.Failure, w.pod)
             w.onProbeFailure()
             return false
         }
     }
-    // ...
+    // Steady-state liveness and readiness handling continues...
     return true
 }
 ```
@@ -417,15 +512,19 @@ Zero container kills occurred during the cold-start phase. The pod transitioned 
    $$T_{\text{startup\_budget}} \ge 1.5 \times \text{P99.9 Cold-Start Duration}$$
 2. **Keep Liveness Probes Lightweight**: A liveness check must only verify that the container process and internal thread pool are responsive. Never connect to external databases, message brokers, or remote microservices inside a liveness check.
 3. **Use Readiness Probes for External Dependencies**: If a required database connection pool drops, fail the `readinessProbe` to remove the container from Kubernetes Service endpoints. Keep the container alive so it can reconnect when the database recovers.
-4. **Configure Graceful Termination**: Ensure `terminationGracePeriodSeconds` (default: 30s) exceeds the application's internal shutdown timeout (e.g., `spring.lifecycle.timeout-per-shutdown-phase: 20s`) to allow in-flight HTTP requests to drain before the kubelet executes `SIGKILL`.
-5. **Monitor Kubelet Probe Metrics**: Alert on high values of `kubelet_container_probe_failures_total` in Prometheus to catch regressions in JVM initialization time before they breach production thresholds.
+4. **Adhere to gRPC Health Checking Protocol Standards**: When configuring native `grpc` probes, implement `grpc.health.v1.Health`, always specify numeric port values (`port: 9090` instead of named ports), and leverage decoupled service names (`service: "liveness"` vs `service: "readiness"`).
+5. **Configure Graceful Termination**: Ensure `terminationGracePeriodSeconds` (default: 30s) exceeds the application's internal shutdown timeout (e.g., `spring.lifecycle.timeout-per-shutdown-phase: 20s`) to allow in-flight HTTP and RPC requests to drain before the kubelet executes `SIGKILL`.
+6. **Monitor Kubelet Probe Metrics**: Alert on high values of `kubelet_container_probe_failures_total` in Prometheus to catch regressions in JVM initialization time before they breach production thresholds.
 
 ---
 
 ## References
 
 * [Kubernetes Documentation: Configure Liveness, Readiness and Startup Probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+* [Kubernetes Documentation: Define a gRPC Liveness Probe](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/#define-a-grpc-liveness-probe)
 * [Kubernetes Documentation: Pod Lifecycle & Container Restart Policies](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/)
 * [Spring Boot Reference Documentation: Actuator Kubernetes Probes](https://docs.spring.io/spring-boot/reference/actuator/endpoints.html#actuator.endpoints.kubernetes-probes)
+* [gRPC Health Checking Protocol Specification](https://github.com/grpc/grpc/blob/master/doc/health-checking.md)
 * [Kubernetes GitHub Source Code: pkg/kubelet/prober/worker.go](https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/prober/worker.go)
 * [Kubernetes GitHub Source Code: pkg/probe/http/http.go](https://github.com/kubernetes/kubernetes/blob/master/pkg/probe/http/http.go)
+* [Kubernetes GitHub Source Code: pkg/probe/grpc/grpc.go](https://github.com/kubernetes/kubernetes/blob/master/pkg/probe/grpc/grpc.go)
