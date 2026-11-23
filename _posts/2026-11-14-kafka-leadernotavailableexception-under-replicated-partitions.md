@@ -6,7 +6,7 @@ category: "Systems & Networking"
 categories: [Backend, Kafka]
 tags: [Kafka, EventDriven, DistributedSystems, LeaderElection, KRaft, FaultTolerance, Replication]
 author: "IdeaSpot360 Engineering Notes"
-excerpt: "During rolling broker restarts or transient network partitions, Kafka producers get hit with burst publish failures accompanied by LeaderNotAvailableException (error code 5) and NotEnoughReplicasException (error code 19) while UnderReplicatedPartitions spike. Here is an architectural deep dive into KRaft metadata replication, ISR shrinkage mechanics via replica.lag.time.max.ms, High Watermark calculations, why unclean leader election causes permanent event loss, and production runbooks for broker and producer resilience."
+excerpt: "During rolling broker restarts or transient network partitions, Kafka producers get hit with burst publish failures accompanied by LeaderNotAvailableException (error code 5) and NotEnoughReplicasException (error code 19) while UnderReplicatedPartitions spike. Here is an architectural analysis of KRaft metadata replication, ISR shrinkage mechanics via replica.lag.time.max.ms, Leader Epoch log recovery (KIP-101), High Watermark invariants, and production runbooks for broker and producer resilience."
 verification_date: "2026-11-23"
 fact_check_sources:
   - "https://kafka.apache.org/documentation/#brokerconfigs_replica.lag.time.max.ms"
@@ -20,32 +20,41 @@ fact_check_sources:
   - "https://kafka.apache.org/documentation/#monitoring"
   - "https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java"
   - "https://cwiki.apache.org/confluence/display/KAFKA/KIP-500%3A+Replace+ZooKeeper+with+a+Self-Managed+Metadata+Quorum"
+  - "https://cwiki.apache.org/confluence/display/KAFKA/KIP-101+-+Alter+Replication+Protocol+to+use+Leader+Epoch+rather+than+High+Watermark+for+Truncation"
 ---
 
 During rolling broker maintenance and OS patch deployments, mission-critical Kafka event producers often experience sudden batch dropoffs. Application error trackers light up with `LeaderNotAvailableException` and `NotEnoughReplicasException`, while cluster monitoring dashboards show immediate spikes in `UnderReplicatedPartitions`.
 
-The producer client log emits repeated batch delivery failures from the network sender thread:
+The producer network sender thread logs warning retries and eventual batch delivery expiration:
 
 ```text
-2026-11-14T11:02:41.109+09:00 ERROR 1 --- [kafka-producer-network-thread] o.a.k.clients.producer.internals.Sender : [Producer clientId=order-producer] Got error produce response with correlation id 84192 on topic-partition payment-events-2, retrying (9 attempts left). Error: LEADER_NOT_AVAILABLE
-org.apache.kafka.common.errors.LeaderNotAvailableException: There is no leader for this topic-partition as we are in the middle of a leadership election.
-    at org.apache.kafka.common.protocol.Errors.exception(Errors.java:319)
-    at org.apache.kafka.clients.producer.internals.TransactionManager.maybeAddPartition(TransactionManager.java:372)
-    at org.apache.kafka.clients.producer.internals.RecordAccumulator.abortBatches(RecordAccumulator.java:948)
+2026-11-14T11:02:41.109+09:00 WARN 1 --- [kafka-producer-network-thread] o.a.k.clients.producer.internals.Sender : [Producer clientId=order-producer] Got error produce response with correlation id 84192 on topic-partition payment-events-2, retrying (9 attempts left). Error: LEADER_NOT_AVAILABLE
+2026-11-14T11:02:44.204+09:00 WARN 1 --- [kafka-producer-network-thread] o.a.k.clients.producer.internals.Sender : [Producer clientId=order-producer] Got error produce response with correlation id 84210 on topic-partition payment-events-2, retrying (0 attempts left). Error: NOT_ENOUGH_REPLICAS
+2026-11-14T11:02:44.205+09:00 ERROR 1 --- [kafka-producer-network-thread] o.a.k.clients.producer.internals.Sender : [Producer clientId=order-producer] Aborting produce requests for partition payment-events-2 due to expiration
+org.apache.kafka.common.errors.TimeoutException: Expiring 16 record(s) for payment-events-2: 30000 ms has passed since batch creation
+```
 
-2026-11-14T11:02:44.204+09:00 ERROR 1 --- [kafka-producer-network-thread] o.a.k.clients.producer.internals.Sender : [Producer clientId=order-producer] Got error produce response with correlation id 84210 on topic-partition payment-events-2, retrying (8 attempts left). Error: NOT_ENOUGH_REPLICAS
-org.apache.kafka.common.errors.NotEnoughReplicasException: Messages are rejected since there are fewer in-sync replicas than required.
+At the application boundary, synchronous calls to `KafkaTemplate.send().get()` throw `KafkaProducerException`:
+
+```text
+2026-11-14T11:02:44.215+09:00 ERROR 1 --- [http-nio-8080-exec-4] c.e.p.service.PaymentProducerService    : Failed to send payment event [orderId=ord-849201, amount=129.00]
+org.springframework.kafka.core.KafkaProducerException: Failed to send; nested exception is org.apache.kafka.common.errors.NotEnoughReplicasException: Messages are rejected since there are fewer in-sync replicas than required.
+    at org.springframework.kafka.core.KafkaTemplate.buildExceptionFromBatchResult(KafkaTemplate.java:825)
+    at org.springframework.kafka.core.KafkaTemplate.send(KafkaTemplate.java:420)
+    at com.example.payment.producer.PaymentProducerService.publishPaymentSync(PaymentProducerService.java:54)
+Caused by: org.apache.kafka.common.errors.NotEnoughReplicasException: Messages are rejected since there are fewer in-sync replicas than required.
     at org.apache.kafka.common.protocol.Errors.exception(Errors.java:333)
     at org.apache.kafka.clients.producer.internals.Sender.handleProduceResponse(Sender.java:854)
     at org.apache.kafka.clients.producer.internals.Sender.runOnce(Sender.java:335)
 ```
 
-At the exact same timestamp, the broker logs at `/var/log/kafka/server.log` on Broker 1 (the partition leader) record rapid In-Sync Replicas (ISR) shrinkage and append rejections from `ReplicaManager`:
+At the exact same timestamp, the broker logs at `/var/log/kafka/server.log` on Broker 1 (the partition leader) record rapid In-Sync Replicas (ISR) shrinkage and append rejections from `kafka.cluster.Partition` and `kafka.server.KafkaApis`:
 
 ```text
-[2026-11-14T11:02:38,812] INFO [ReplicaManager broker=1] Shrinking ISR for partition payment-events-2 from [1,2,3] to [1,2] since follower 3 has not fetched within 10000ms (kafka.server.ReplicaManager)
-[2026-11-14T11:02:43,991] INFO [ReplicaManager broker=1] Shrinking ISR for partition payment-events-2 from [1,2] to [1] since follower 2 has not fetched within 10000ms (kafka.server.ReplicaManager)
-[2026-11-14T11:02:44,002] ERROR [ReplicaManager broker=1] Rejecting produce request on partition payment-events-2: required min.insync.replicas 2, but current in-sync replica count is 1. (kafka.server.ReplicaManager)
+[2026-11-14T11:02:38,812] INFO [Partition payment-events-2 broker=1] Shrinking ISR from 1,2,3 to 1,2. Leader: 1, LeaderEpoch: 4, PartitionEpoch: 12 (kafka.cluster.Partition)
+[2026-11-14T11:02:43,991] INFO [Partition payment-events-2 broker=1] Shrinking ISR from 1,2 to 1. Leader: 1, LeaderEpoch: 4, PartitionEpoch: 13 (kafka.cluster.Partition)
+[2026-11-14T11:02:44,002] ERROR [KafkaApis broker=1] Error processing append operation on partition payment-events-2: NOT_ENOUGH_REPLICAS (kafka.server.KafkaApis)
+org.apache.kafka.common.errors.NotEnoughReplicasException: Messages are rejected since there are fewer in-sync replicas than required.
 ```
 
 Simultaneously, cluster JMX metrics report severe replication degradation:
@@ -129,7 +138,7 @@ Because the producer specified `acks=all`, the broker immediately rejects all in
     ISR: [1, 2, 3] ---> ISR: [1, 2] ---> ISR: [1] (Broker 1 Only)
                                                  |
                                                  v
-                              Is Active ISR (1) < min.insync.replicas (2)?
+                               Is Active ISR (1) < min.insync.replicas (2)?
                                                  |
                                                 YES
                                                  |
@@ -137,6 +146,18 @@ Because the producer specified `acks=all`, the broker immediately rejects all in
                                    [NOT_ENOUGH_REPLICAS (Code 19)]
                                       All Producer Writes Blocked!
 ```
+
+### Leader Epoch & Recovery Mechanics (KIP-101)
+Historically, Kafka replicas used the High Watermark ($HW$) to truncate uncommitted logs upon rejoining the cluster. Under high concurrency or unclean restarts, this High-Watermark-based truncation protocol suffered from race conditions that resulted in either divergent logs or phantom message loss.
+
+To resolve this, KIP-101 introduced the **Leader Epoch** mechanism [Source: KIP-101 Specification](https://cwiki.apache.org/confluence/display/KAFKA/KIP-101+-+Alter+Replication+Protocol+to+use+Leader+Epoch+rather+than+High+Watermark+for+Truncation):
+1. **Epoch Counter**: Every partition leader is assigned a monotonically increasing integer (`LeaderEpoch`), recorded in every message batch header and checkpointed in `/var/lib/kafka/data/<topic>-<partition>/leader-epoch-checkpoint`.
+2. **Deterministic Reconciliation**: When Broker 2 recovers from its GC stall or restart, it does not truncate to its local $HW$. Instead, it transmits an `OffsetForLeaderEpochRequest` to the current leader.
+3. **Epoch End Offset**: The leader replies with the end offset for the follower's latest epoch. The follower truncates its log strictly to this epoch boundary:
+
+$$\text{TruncationPoint} = \text{LeaderEpochEndOffset}(e_{follower})$$
+
+This guarantees that valid, acknowledged messages are never deleted, and follower replicas catch up to the current leader deterministically before requesting re-entry into the ISR.
 
 ### The Leader Transition Window (`LEADER_NOT_AVAILABLE`)
 When Broker 1 itself undergoes restart, KRaft must elect a new partition leader from the remaining members of the ISR. During the leader election epoch change:
@@ -170,18 +191,20 @@ Reducing `min.insync.replicas` to `1` on a 3-replica topic allows writes to succ
 ## 3. Before vs. After Remediation
 
 ### Approach A: Cluster Broker & Replication Tuning (`server.properties`)
-Increase the lag threshold to prevent premature ISR eviction during routine GC pauses and transient network latency spikes, while enforcing zero unclean elections:
+Increase the lag threshold to prevent premature ISR eviction during routine GC pauses and transient network latency spikes.
+
+> ⚠️ **Important Specification Notice**: In Apache Kafka, `replica.lag.time.max.ms` has **`Update Mode: read-only`** [Source: Apache Kafka Documentation - Broker Configs](https://kafka.apache.org/documentation/#brokerconfigs_replica.lag.time.max.ms). Attempting to update it dynamically via `kafka-configs.sh` fails immediately with `InvalidConfigurationException: Cannot update read-only configuration: replica.lag.time.max.ms`. This property **must be modified in `server.properties` and applied via a sequential rolling broker restart**.
 
 ```diff
-# /etc/kafka/server.properties (or KRaft dynamic cluster config)
+# /etc/kafka/server.properties
 
 # Allow follower replicas sufficient time to absorb minor GC pauses and network blips
 - replica.lag.time.max.ms = 10000
 + replica.lag.time.max.ms = 30000
 
-# Keep follower fetch wait comfortably below replica.lag.time.max.ms
-- replica.fetch.wait.max.ms = 500
-+ replica.fetch.wait.max.ms = 500
+# Increase maximum bytes per fetch request so lagging replicas catch up rapidly
+- replica.fetch.max.bytes = 1048576
++ replica.fetch.max.bytes = 5242880
 
 # Protect data integrity: Never allow out-of-sync replicas to become partition leader
 - unclean.leader.election.enable = true
@@ -193,13 +216,13 @@ Increase the lag threshold to prevent premature ISR eviction during routine GC p
 + controlled.shutdown.retry.backoff.ms = 5000
 ```
 
-To update `replica.lag.time.max.ms` dynamically across the running KRaft cluster without requiring a full cluster restart, execute `kafka-configs.sh`:
+For dynamic topic configurations that do support runtime modification without restarting brokers (such as adjusting `min.insync.replicas` dynamically), use `kafka-configs.sh`:
 
 ```bash
-# Apply dynamic broker config update
+# Dynamically calibrate topic-level min.insync.replicas (supported at runtime)
 /opt/kafka/bin/kafka-configs.sh --bootstrap-server kafka-broker-1:9092 \
-  --entity-type brokers --entity-default \
-  --alter --add-config replica.lag.time.max.ms=30000
+  --entity-type topics --entity-name payment-events \
+  --alter --add-config min.insync.replicas=2
 ```
 
 ### Approach B: Resilient Client Producer Configuration (`application.yml`)
@@ -213,9 +236,12 @@ spring:
       bootstrap-servers: kafka-broker-1:9092,kafka-broker-2:9092,kafka-broker-3:9092
       acks: all                          # Enforce min.insync.replicas acknowledgment
 -     retries: 3                         # Inadequate retry budget
--     retry.backoff.ms: 100              # Flat, aggressive retry hammering
 +     retries: 2147483647                # Max retries (defer timeout control to delivery.timeout.ms)
-+     properties:
+      properties:
+-       delivery.timeout.ms: 30000       # Premature client timeout during leader election
+-       request.timeout.ms: 15000
+-       retry.backoff.ms: 100            # Aggressive, un-jittered retry hammering
+-       enable.idempotence: false
 +       enable.idempotence: true         # Prevent duplicate records across retries
 +       max.in.flight.requests.per.connection: 5 # Safe with idempotence enabled
 +       delivery.timeout.ms: 120000      # 2 minutes end-to-end delivery window
@@ -239,14 +265,17 @@ To ensure partition health and verify zero under-replicated partitions after rem
 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-broker-1:9092 \
   --describe --topic payment-events
 
-# 3. Verify running broker systemd service and network socket listeners
+# 3. Inspect Leader Epoch checkpoint file on local broker storage
+cat /var/lib/kafka/data/payment-events-2/leader-epoch-checkpoint
+
+# 4. Verify running broker systemd service and network socket listeners
 systemctl status kafka --no-pager
 ss -tulpn | grep 9092
 
-# 4. Check broker systemd journal for unclean leader election or partition errors
+# 5. Check broker systemd journal for unclean leader election or partition errors
 journalctl -u kafka -n 50 --no-pager | grep -E "ISR|Leader|election"
 
-# 5. Query local Prometheus JMX exporter endpoint for UnderReplicatedPartitions metric
+# 6. Query local Prometheus JMX exporter endpoint for UnderReplicatedPartitions metric
 curl -s http://localhost:9102/metrics | grep kafka_server_replicamanager_underreplicatedpartitions
 ```
 
@@ -290,3 +319,4 @@ Before restarting any Kafka broker node for maintenance or OS patching:
 * [Apache Kafka Documentation - Monitoring & JMX Metrics](https://kafka.apache.org/documentation/#monitoring)
 * [Apache Kafka Source Code - Errors.java Enumeration](https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java)
 * [Apache Kafka KIP-500: Replace ZooKeeper with a Self-Managed Metadata Quorum](https://cwiki.apache.org/confluence/display/KAFKA/KIP-500%3A+Replace+ZooKeeper+with+a+Self-Managed+Metadata+Quorum)
+* [Apache Kafka KIP-101: Alter Replication Protocol to use Leader Epoch rather than High Watermark for Truncation](https://cwiki.apache.org/confluence/display/KAFKA/KIP-101+-+Alter+Replication+Protocol+to+use+Leader+Epoch+rather+than+High+Watermark+for+Truncation)
