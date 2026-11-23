@@ -21,7 +21,7 @@ The application logs capture HikariCP throwing timeout exceptions when attemptin
 
 ```text
 2026-11-10T10:35:12.894+09:00 ERROR 1 --- [shop-service] [nio-8080-exec-42] o.h.engine.jdbc.spi.SqlExceptionHelper   : HikariPool-1 - Connection is not available, request timed out after 30000ms.
-2026-11-10T10:35:12.895+09:00 ERROR 1 --- [shop-service] [nio-8080-exec-42] c.s.o.controller.OrderController         : org.springframework.dao.CannotAcquireLockException: Could not open JPA EntityManager for transaction; nested exception is org.hibernate.exception.JDBCConnectionException: Unable to acquire JDBC Connection
+2026-11-10T10:35:12.895+09:00 ERROR 1 --- [shop-service] [nio-8080-exec-42] c.s.o.controller.OrderController         : org.springframework.transaction.CannotCreateTransactionException: Could not open JPA EntityManager for transaction; nested exception is org.hibernate.exception.JDBCConnectionException: Unable to acquire JDBC Connection
     at org.springframework.orm.jpa.vendor.HibernateJpaDialect.convertHibernateAccessException(HibernateJpaDialect.java:276)
     at org.springframework.orm.jpa.vendor.HibernateJpaDialect.translateExceptionIfPossible(HibernateJpaDialect.java:241)
     at org.springframework.orm.jpa.JpaTransactionManager.doBegin(JpaTransactionManager.java:464)
@@ -39,23 +39,29 @@ Caused by: org.hibernate.exception.JDBCConnectionException: Unable to acquire JD
     at com.zaxxer.hikari.pool.HikariPool.getConnection(HikariPool.java:217)
     at com.zaxxer.hikari.pool.HikariPool.getConnection(HikariPool.java:162)
     at com.zaxxer.hikari.HikariDataSource.getConnection(HikariDataSource.java:128)
+Caused by: java.sql.SQLTransientConnectionException: HikariPool-1 - Connection is not available, request timed out after 30000ms.
+    at com.zaxxer.hikari.pool.HikariPool.createTimeoutException(HikariPool.java:696)
+    at com.zaxxer.hikari.pool.HikariPool.getConnection(HikariPool.java:197)
+    at com.zaxxer.hikari.HikariDataSource.getConnection(HikariDataSource.java:128)
 ```
 
 Enabling connection leak detection produces diagnostic warnings indicating where the long-held connection originated [Source: HikariCP Configuration Documentation](https://github.com/brettwooldridge/HikariCP):
 
 ```text
-2026-11-10T10:35:14.102+09:00 WARN  1 --- [shop-service] [l-1 housekeeper] com.zaxxer.hikari.pool.ProxyLeakTask     : Apparent connection leak detected! Connection org.postgresql.jdbc.PgConnection@4b1f92c borrowed at:
-    at com.zaxxer.hikari.pool.ProxyLeakTask.schedule(ProxyLeakTask.java:65)
-    at com.zaxxer.hikari.pool.HikariPool.createPoolEntry(HikariPool.java:472)
-    at com.zaxxer.hikari.pool.HikariPool.getConnection(HikariPool.java:181)
+2026-11-10T10:35:14.102+09:00 WARN  1 --- [shop-service] [l-1 housekeeper] com.zaxxer.hikari.pool.ProxyLeakTask     : Connection leak detection triggered for org.postgresql.jdbc.PgConnection@4b1f92c on thread http-nio-8080-exec-42, stack trace follows
+
+java.lang.Exception: Apparent connection leak detected
     at com.zaxxer.hikari.HikariDataSource.getConnection(HikariDataSource.java:128)
-    at org.hibernate.engine.jdbc.internal.LogicalConnectionManagedImpl.acquireConnectionIfNeeded(LogicalConnectionManagedImpl.java:110)
+    at org.hibernate.engine.jdbc.internal.LogicalConnectionManagedImpl.acquireConnectionIfNeeded(LogicalConnectionManagedImpl.java:112)
     at org.hibernate.engine.jdbc.internal.LogicalConnectionManagedImpl.getPhysicalConnection(LogicalConnectionManagedImpl.java:139)
     at org.springframework.orm.jpa.JpaTransactionManager.doBegin(JpaTransactionManager.java:436)
     at org.springframework.transaction.support.AbstractPlatformTransactionManager.startTransaction(AbstractPlatformTransactionManager.java:400)
     at org.springframework.transaction.support.AbstractPlatformTransactionManager.getTransaction(AbstractPlatformTransactionManager.java:373)
-    at com.shop.order.service.ExternalPaymentClient.callPgGateway(ExternalPaymentClient.java:54)
-    at com.shop.order.service.OrderService.processPayment(OrderService.java:88)
+    at org.springframework.transaction.interceptor.TransactionAspectSupport.invokeWithinTransaction(TransactionAspectSupport.java:382)
+    at org.springframework.transaction.interceptor.TransactionInterceptor.invoke(TransactionInterceptor.java:119)
+    at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:186)
+    at com.shop.order.service.OrderService$$SpringCGLIB$$0.processPayment(<generated>)
+    at com.shop.order.controller.OrderController.processPayment(OrderController.java:45)
 ```
 
 Inspecting PostgreSQL server-side connection states via `pg_stat_activity` during the freeze reveals active sessions stuck in transaction while waiting on client responses [Source: PostgreSQL Official Documentation — pg_stat_activity](https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-ACTIVITY-VIEW):
@@ -222,16 +228,23 @@ Remove the external payment gateway HTTP call from the database transaction boun
 +        this.paymentGatewayClient = paymentGatewayClient;
 +    }
 +
-+    // NO @Transactional on the outer coordinator method
++    // NO @Transactional on the outer coordinator method: prevents holding DB connection during external HTTP I/O
 +    public OrderResponse processPayment(OrderRequest req) {
-+        // Phase 1: Fast transactional read (holds connection for < 3 ms)
-+        OrderView orderView = orderTxService.getOrderForPayment(req.getId());
++        // Phase 1: Fast transactional validation & transition to PAYMENT_IN_PROGRESS (< 3 ms)
++        OrderView orderView = orderTxService.preparePayment(req.getId());
 +
-+        // Phase 2: External HTTP call WITHOUT holding any database connection
-+        PaymentResult result = paymentGatewayClient.requestCharge(orderView.amount());
++        PaymentResult result;
++        try {
++            // Phase 2: External HTTP call WITHOUT holding any database connection
++            result = paymentGatewayClient.requestCharge(orderView.amount());
++        } catch (Exception ex) {
++            // Compensate state on network or gateway exception
++            orderTxService.failPayment(req.getId(), "NETWORK_ERROR: " + ex.getMessage());
++            throw new PaymentGatewayException("Payment gateway call failed", ex);
++        }
 +
-+        // Phase 3: Fast transactional update (holds connection for < 2 ms)
-+        return orderTxService.completePayment(req.getId(), result.isSuccess(), result.transactionId());
++        // Phase 3: Fast transactional finalization to PAID or FAILED (< 2 ms)
++        return orderTxService.finalizePayment(req.getId(), result.isSuccess(), result.transactionId());
 +    }
 +}
 +
@@ -243,19 +256,34 @@ Remove the external payment gateway HTTP call from the database transaction boun
 +        this.orderRepository = orderRepository;
 +    }
 +
-+    @Transactional(readOnly = true)
-+    public OrderView getOrderForPayment(Long orderId) {
-+        return orderRepository.findOrderViewById(orderId)
++    @Transactional
++    public OrderView preparePayment(Long orderId) {
++        Order order = orderRepository.findById(orderId)
 +            .orElseThrow(() -> new OrderNotFoundException(orderId));
++        if (order.getStatus() != OrderStatus.PENDING) {
++            throw new IllegalStateException("Order " + orderId + " not in PENDING state (current: " + order.getStatus() + ")");
++        }
++        order.setStatus(OrderStatus.PAYMENT_IN_PROGRESS);
++        orderRepository.save(order);
++        return new OrderView(order.getId(), order.getAmount());
 +    }
 +
 +    @Transactional
-+    public OrderResponse completePayment(Long orderId, boolean success, String txId) {
++    public OrderResponse finalizePayment(Long orderId, boolean success, String txId) {
 +        Order order = orderRepository.findById(orderId)
 +            .orElseThrow(() -> new OrderNotFoundException(orderId));
 +        order.setStatus(success ? OrderStatus.PAID : OrderStatus.FAILED);
 +        order.setPaymentTxId(txId);
 +        return new OrderResponse(orderRepository.save(order));
++    }
++
++    @Transactional
++    public void failPayment(Long orderId, String reason) {
++        orderRepository.findById(orderId).ifPresent(order -> {
++            order.setStatus(OrderStatus.FAILED);
++            order.setFailureReason(reason);
++            orderRepository.save(order);
++        });
 +    }
 +}
 ```
@@ -276,13 +304,13 @@ Disable `spring.jpa.open-in-view`, reduce `connection-timeout` to fail fast, ena
 -      leak-detection-threshold: 0
 -      max-lifetime: 1800000
 +      pool-name: ShopHikariPool
-+      maximum-pool-size: 15          # Sized based on DB core capacity formula: ((4 cores * 2) + 1)
++      maximum-pool-size: 15          # Sized to 15 per pod (~60 total across 4 pods, providing peak burst headroom without exceeding PostgreSQL core saturation)
 +      minimum-idle: 15              # Fixed pool size to eliminate connection creation latency
 +      connection-timeout: 3000      # Fail fast within 3 seconds instead of blocking worker threads for 30s
 +      validation-timeout: 1000      # Connection validation probe timeout
 +      leak-detection-threshold: 2000 # Print warning and stack trace if connection is held > 2,000 ms
 +      max-lifetime: 1800000         # 30 minutes (must be shorter than Aurora server idle connection timeout)
-+      idle-timeout: 600000          # 10 minutes
++      idle-timeout: 600000          # 10 minutes (active only when minimum-idle < maximum-pool-size; retained for dynamic scaling)
 ```
 
 ### 3.3 Database Server-Side Safeguard: `idle_in_transaction_session_timeout`
