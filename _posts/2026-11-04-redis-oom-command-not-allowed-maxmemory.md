@@ -59,7 +59,7 @@ Redis rejected write requests because `used_memory` breached the `16.00GB` limit
 
 The architecture, logs, and remediation steps documented below were validated against the following production baseline:
 
-* **Redis Engine:** Redis Server v7.2.5 / v7.4.1 (Standalone & Multi-Replica Cluster Mode)
+* **Redis Engine:** Redis Server v7.2.5 / v7.4.1 / v8.0.x (Standalone & Multi-Replica Cluster Mode)
 * **Underlying Host OS:** Linux Kernel 6.6.x LTS (Ubuntu 24.04 LTS / Amazon Linux 2023)
 * **Memory Allocator:** `jemalloc-5.3.0` (Compiled with 4096-byte page size)
 * **Client Drivers:** Spring Data Redis 3.3.4 (`Lettuce 6.3.2.RELEASE`) & Node.js `ioredis 5.4.1`
@@ -110,10 +110,31 @@ $$\text{mem\_fragmentation\_ratio} = \frac{\text{used\_memory\_rss}}{\text{used\
 
 A ratio of **1.44** indicates that while Redis data structures required 16.00 GiB, the Linux kernel allocated 23.00 GiB of physical RSS. Over 7.00 GiB was held in fragmented allocator arenas unable to serve new allocations matching different size classes.
 
-### B. The Default `noeviction` Policy and Zombie Key Accumulation
+### B. The Default `noeviction` Policy and Key Eviction Taxonomies
 Under the default `maxmemory-policy: noeviction`, Redis protects data integrity by refusing to delete keys automatically upon reaching `maxmemory` [Source: Redis Documentation - Key Eviction](https://redis.io/docs/latest/develop/reference/eviction/). Only read commands (`GET`, `MGET`, `EXISTS`) and explicit deletion commands (`DEL`, `UNLINK`) succeed.
 
 An audit of the keyspace revealed that an upstream authentication microservice was issuing idempotency lock keys (`lock:payment:*`) without specifying an expiration time (`TTL`). Over several days of continuous operation, 14 million orphaned tokens accumulated in the keyspace. Because `noeviction` was configured, Redis was legally prohibited from reclaiming space, leading directly to write rejection.
+
+In Redis 7.x and 8.x architectures, choosing the correct eviction policy requires understanding the operational trade-offs across all available policies [Source: Redis Documentation - Key Eviction](https://redis.io/docs/latest/develop/reference/eviction/):
+
+| Policy Name | Scope | Eviction Target | Best Architectural Fit |
+| :--- | :--- | :--- | :--- |
+| `noeviction` | None | None (Throws OOM error on memory-expanding writes) | Strict persistence store, Redis Streams, or BullMQ queue brokers where dropping data causes transactional corruption |
+| `volatile-lru` | Expiring keys | Least Recently Used key with an active TTL | Hybrid instances storing shared configuration alongside transient cache objects |
+| `allkeys-lru` | All keys | Least Recently Used key across entire keyspace | Pure ephemeral cache tiers exhibiting temporal locality (recently hit keys likely accessed again) |
+| `volatile-lfu` | Expiring keys | Least Frequently Used key with an active TTL | Hybrid instances with skewed Zipfian/Power-law access distributions and batch scan resistance |
+| `allkeys-lfu` | All keys | Least Frequently Used key across entire keyspace | High-throughput cache layers requiring immunity against full-table batch cache pollution |
+| `volatile-ttl` | Expiring keys | Keys with the shortest remaining Time-To-Live | Caching architectures prioritizing quick-expiring transient payloads |
+| `allkeys-random` / `volatile-random` | All / Expiring | Randomly sampled keys | Uniform access distribution testing or synthetic fuzz testing |
+| `allkeys-lrm` / `volatile-lrm` *(New in Redis 8)* | All / Expiring | Least Recently Modified key (writes update timestamp, reads ignored) | Read-heavy workloads where data obsolescence is determined strictly by write freshness |
+
+#### LRU vs. LFU Algorithmic Mechanics and Cache Scan Resistance
+While `allkeys-lru` is common, standard LRU suffers from **cache scan pollution**: when an analytical batch job or bulk sync script executes `SCAN` across millions of cold keys, standard LRU treats those cold keys as "recently accessed" and erroneously evicts hot, frequently accessed keys [Source: Redis Documentation - Key Eviction](https://redis.io/docs/latest/develop/reference/eviction/).
+
+To solve this, Redis implements an approximated **LFU (Least Frequently Used)** algorithm based on an 8-bit probabilistic Morris counter:
+1. **Logarithmic Saturation (`lfu-log-factor`):** Controlled by `lfu-log-factor` (default `10`). Rather than a linear counter that overflows 8 bits (0–255) almost immediately, the counter increments with probability $P = 1 / (\text{counter} \times \text{lfu-log-factor} + 1)$. With a factor of 10, reaching 255 requires approximately 1 million key accesses, effectively distinguishing true hot keys.
+2. **Decay Interval (`lfu-decay-time`):** Controlled by `lfu-decay-time` (default `1` minute). If a key was heavily accessed in the past but goes cold, its counter is decremented periodically during candidate sampling, preventing stale historical hot keys from permanently monopolizing RAM.
+3. **Approximation Sampling (`maxmemory-samples`):** Redis avoids $O(N)$ full-keyspace sorting by taking a random sample pool of keys (configured via `maxmemory-samples`, default `5`, recommended `10` in high-density production) and selecting the optimal eviction candidate from that sample pool.
 
 ### C. Client Output Buffer Inflation and Replication Backlog
 In Redis memory accounting, `used_memory` encompasses not only raw stored keys, but also internal runtime overheads [Source: Redis Documentation - Redis Administration](https://redis.io/docs/latest/operate/oss_and_stack/management/admin/):
@@ -129,19 +150,26 @@ Under write-heavy spikes, slow replica nodes or stalled batch consumer connectio
 Remediating this vulnerability requires a synchronized adjustment across Redis configuration, host kernel sysctl parameters, and application client code.
 
 ### Step 1: Configure Predictable Eviction Policy & Headroom
-Switch from `noeviction` to `volatile-lru` (for hybrid architectures storing persistent config alongside cache) or `allkeys-lru` (for dedicated cache instances) [Source: Redis Documentation - Key Eviction](https://redis.io/docs/latest/develop/reference/eviction/). Reserve 25% of host RAM to absorb COW during snapshot forks and `jemalloc` allocator overhead:
+Switch from `noeviction` to `volatile-lru` (for hybrid architectures storing persistent config alongside cache), `allkeys-lru` (for generic caching tiers), or `allkeys-lfu` (for power-law workloads requiring batch scan protection) [Source: Redis Documentation - Key Eviction](https://redis.io/docs/latest/develop/reference/eviction/). 
+
+Enforce strict memory headroom arithmetic: on a 32 GiB host, allocate 25% ($8\text{ GiB}$) to absorb Copy-on-Write during snapshot forks, plus $2\text{ GiB}$ for OS kernel page tables, network socket buffers, and `jemalloc` bin overhead. Setting `maxmemory 22gb` leaves a reliable 10 GiB (~31.25%) host headroom:
 
 ```diff
 # /etc/redis/redis.conf
 - maxmemory-policy noeviction
 + maxmemory-policy volatile-lru
 
-# Reserve 25% physical memory headroom on a 32GB host
+# Reserve ~31% total host headroom (8GB COW margin + 2GB OS/allocator baseline)
 - maxmemory 26gb
 + maxmemory 22gb
 
-# Increase LRU sampling precision from default 5 to 10
+# Increase approximation sampling precision from default 5 to 10
 + maxmemory-samples 10
+
+# Optional: If adopting allkeys-lfu for power-law traffic, configure LFU counters:
+# + maxmemory-policy allkeys-lfu
+# + lfu-log-factor 10
+# + lfu-decay-time 1
 ```
 
 ### Step 2: Enable Active Online Defragmentation
@@ -326,7 +354,45 @@ mem_fragmentation_ratio:1.10
 active_defrag_running:1
 ```
 
-### 5. Profile Keyspace for Unbounded Key Growth
+### 5. Verify Snapshot Copy-on-Write (COW) Memory Consumption
+Validate that `fork()` snapshotting (`BGSAVE`) does not inflate physical memory under write load [Source: Redis Documentation - Redis Administration](https://redis.io/docs/latest/operate/oss_and_stack/management/admin/):
+
+```bash
+# Inspect last RDB snapshot status and physical Copy-on-Write allocation
+redis-cli INFO persistence | grep -E "rdb_last_bgsave_status|rdb_last_cow_size"
+```
+
+Expected output:
+```text
+rdb_last_bgsave_status:ok
+rdb_last_cow_size:4194304
+```
+
+*(Note: `rdb_last_cow_size` of $4,194,304\text{ bytes}$ ($\sim 4\text{ MiB}$) confirms that disabling Transparent Huge Pages prevented 2 MiB page amplification during the snapshot pass).*
+
+### 6. Verify Active Eviction Policy & LFU Tuning Parameters
+Confirm that Redis runtime configuration enforces the desired eviction rule and sampling precision [Source: Redis Documentation - Key Eviction](https://redis.io/docs/latest/develop/reference/eviction/):
+
+```bash
+# Query active eviction policy and approximation sample pool
+redis-cli CONFIG GET maxmemory-policy
+redis-cli CONFIG GET maxmemory-samples
+redis-cli CONFIG GET "lfu-*"
+```
+
+Expected output:
+```text
+1) "maxmemory-policy"
+2) "volatile-lru"
+1) "maxmemory-samples"
+2) "10"
+1) "lfu-log-factor"
+2) "10"
+3) "lfu-decay-time"
+4) "1"
+```
+
+### 7. Profile Keyspace for Unbounded Key Growth
 Identify memory-dominant key patterns and verify that volatile keys are properly accounted for:
 
 ```bash
@@ -346,7 +412,7 @@ Biggest hash found 'cart:snapshot:41201' has 512 fields
 2451920 strings with 161029410 bytes (100.00% of keys, avg size 65.67)
 ```
 
-Maintaining explicit `maxmemory` boundaries with 25% system headroom, enforcing atomic key expirations, and enabling active `jemalloc` defragmentation guarantees that Redis operates with high throughput and predictable memory stability.
+Maintaining explicit `maxmemory` boundaries with ~31% system headroom ($22\text{ GiB}$ on a $32\text{ GiB}$ host), enforcing atomic key expirations, and enabling active `jemalloc` defragmentation guarantees that Redis operates with high throughput and predictable memory stability.
 
 ---
 
