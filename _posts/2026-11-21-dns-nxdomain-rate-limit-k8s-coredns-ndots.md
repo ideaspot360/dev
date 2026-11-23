@@ -23,7 +23,7 @@ During peak transaction processing on an AWS EKS production cluster, automated p
 
 ```text
 2026-11-21T02:14:05.001923Z [error] 1842#0: dial tcp: lookup api.stripe.com on 10.96.0.10:53: read udp 10.244.12.8:49182->10.96.0.10:53: i/o timeout
-2026-11-21T02:14:10.002814Z [warn ] CoreDNS-metrics: [WARNING] plugin/loop: Seen "api.stripe.com.production.svc.cluster.local." 5 times, forwarding loop or NXDOMAIN deluge!
+2026-11-21T02:14:05.002410Z [INFO ] 10.244.12.8:49182 - 38412 "A IN api.stripe.com.production.svc.cluster.local. udp 67 false 512" NXDOMAIN qr,aa,rd 160 0.000182741s
 2026-11-21T02:14:10.003942Z [error] worker-payment: HTTP POST https://api.stripe.com/v1/charges failed after 5003.82ms.
 ```
 
@@ -82,16 +82,17 @@ The failure mode emerges from the intersection of three technical mechanisms ope
                                                     | (Parallel UDP packets)
                                                     v
 +---------------------------------------------------------------------------------------------------+
-| Host Kernel: Netfilter conntrack (__nf_conntrack_confirm)                                         |
-|   - Packet 1 (IPv4 'A'): Enters NAT, confirmed into conntrack hash table -> SUCCESS               |
-|   - Packet 2 (IPv6 'AAAA'): Same 5-tuple race -> nf_ct_resolve_clash fails -> INSERT_FAILED DROP   |
+| Host Kernel: Netfilter conntrack & iptables DNAT                                                  |
+|   - Packet 1 (IPv4 'A'): DNAT to CoreDNS Replica A (10.244.3.15) -> Confirmed into conntrack      |
+|   - Packet 2 (IPv6 'AAAA'): DNAT to CoreDNS Replica B (10.244.5.22) -> Reply tuple mismatch        |
+|     nf_ct_can_merge() == false -> __nf_ct_resolve_clash() returns NF_DROP -> INSERT_FAILED DROP   |
 +---------------------------------------------------+-----------------------------------------------+
-                                                    | (Packet 1 passes, Packet 2 silently dropped)
+                                                    | (Packet 1 delivered, Packet 2 silently dropped)
                                                     v
 +---------------------------------------------------------------------------------------------------+
 | CoreDNS Pod (ClusterIP 10.96.0.10)                                                                |
-|   - Receives Packet 1 only -> Responds NXDOMAIN                                                   |
-|   - Packet 2 never arrived -> Client waits glibc RES_TIMEOUT (exact 5.000s) before retransmission |
+|   - Replica A receives Packet 1 -> Responds NXDOMAIN for search domain                            |
+|   - Replica B never received Packet 2 -> Client resolver blocks on RES_TIMEOUT (exact 5.000s)     |
 +---------------------------------------------------------------------------------------------------+
 ```
 
@@ -130,8 +131,8 @@ In standard `glibc` (prior to explicit serial options), `res_send` executes para
 $$\text{Tuple} = \{\text{saddr: 10.244.12.8}, \text{daddr: 10.96.0.10}, \text{sport: 49182}, \text{dport: 53}, \text{proto: UDP}\}$$
 
 When these packets traverse the host networking stack:
-1. Both packets hit `nf_conntrack_in()`, where unconfirmed conntrack table entries are initialized.
-2. Both packets traverse iptables `PREROUTING` / `OUTPUT` chains, where Destination NAT (DNAT) translates the ClusterIP `10.96.0.10:53` to one of the CoreDNS backend endpoint IPs (`10.244.3.15:53`).
+1. Both packets hit `nf_conntrack_in()`, where unconfirmed conntrack table entries (`struct nf_conn`) are allocated.
+2. Both packets traverse iptables `PREROUTING` / `OUTPUT` chains. Kubernetes `kube-proxy` (iptables mode) implements randomized load balancing across CoreDNS backend pods using statistical probability (`-m statistic --mode random --probability 0.5000000000`). Consequently, Packet 1 is DNAT'd to CoreDNS Endpoint A (`10.244.3.15:53`), whereas Packet 2 is frequently DNAT'd to CoreDNS Endpoint B (`10.244.5.22:53`).
 3. Both packets reach `__nf_conntrack_confirm()` in `net/netfilter/nf_conntrack_core.c` [Source: Linux Kernel Source — nf_conntrack_core.c](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/netfilter/nf_conntrack_core.c):
 
 ```c
@@ -140,17 +141,22 @@ static int
 __nf_conntrack_confirm(struct sk_buff *skb)
 {
     struct nf_conn *ct;
-    struct nf_conntrack_tuple hash;
+    struct nf_conntrack_tuple_hash *h;
     ...
-    /* If an entry with identical tuple is already confirmed */
+    /* Fast path: already confirmed */
     if (unlikely(nf_ct_is_confirmed(ct)))
         return NF_ACCEPT;
 
-    spin_lock_bh(&nf_conntrack_expect_lock);
-    if (!nf_ct_tuple_equal(&ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple,
-                           &hash)) {
-        /* Tuple collision detected */
-        ret = nf_ct_resolve_clash(net, skb, ct_hash);
+    /* Acquire bucket locks for both original and reply tuple hashes */
+    nf_conntrack_double_lock(net, hash, reply_hash, sequence);
+
+    /* Lookup existing confirmed entry with identical tuple */
+    h = nf_conntrack_find_get(&net->ct.hash[hash],
+                              &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple,
+                              zone);
+    if (h) {
+        /* Clash detected: concurrent packet won table insertion race */
+        ret = nf_ct_resolve_clash(skb, h);
         if (ret == NF_DROP) {
             NF_CT_STAT_INC(net, insert_failed);
             NF_CT_STAT_INC(net, drop);
@@ -161,7 +167,32 @@ __nf_conntrack_confirm(struct sk_buff *skb)
 }
 ```
 
-When packet 1 acquires the spinlock and inserts its tuple into the conntrack hash table, packet 2 arrives on another CPU core with the exact same tuple. Because UDP is stateless, NAT clash resolution (`nf_ct_resolve_clash`) frequently fails when both packets race before confirmation. The kernel silently drops the clashing packet and increments the `insert_failed` and `drop` counters.
+When Packet 1 confirms its entry, it occupies the conntrack hash bucket with original tuple `{10.244.12.8:49182 -> 10.96.0.10:53}` and reply tuple `{10.244.3.15:53 -> 10.244.12.8:49182}`.
+
+When Packet 2 enters `__nf_conntrack_confirm()`, the kernel detects that Packet 1 already won the insertion race. It invokes `nf_ct_resolve_clash()`:
+
+```c
+/* Source: Linux net/netfilter/nf_conntrack_core.c */
+static int __nf_ct_resolve_clash(struct sk_buff *skb,
+                                 struct nf_conntrack_tuple_hash *h)
+{
+    /* This is the conntrack entry already in hashes that won race */
+    struct nf_conn *ct = nf_ct_tuplehash_to_ctrack(h);
+    enum ip_conntrack_info ctinfo;
+    struct nf_conn *loser_ct = nf_ct_get(skb, &ctinfo);
+
+    if (nf_ct_can_merge(ct, loser_ct)) {
+        nf_conntrack_get(&ct->ct_general);
+        nf_ct_acct_merge(ct, ctinfo, loser_ct);
+        nf_reset_ct(skb);
+        nf_ct_set(skb, ct, ctinfo);
+        return NF_ACCEPT;
+    }
+    return NF_DROP;
+}
+```
+
+The kernel's `nf_ct_can_merge()` function checks whether both the `ORIGINAL` and `REPLY` tuples are identical between the winner (`ct`) and loser (`loser_ct`). Because DNAT selected CoreDNS Replica A (`10.244.3.15`) for Packet 1 and CoreDNS Replica B (`10.244.5.22`) for Packet 2, the reply tuples diverge (`10.244.3.15 != 10.244.5.22`). `nf_ct_can_merge()` returns `false`, causing `__nf_ct_resolve_clash()` to return `NF_DROP`. The kernel silently drops Packet 2 and increments both `insert_failed` and `drop` statistics counters.
 
 Because UDP is an unreliable transport protocol, no TCP RST or ICMP error is returned to the client. In `glibc`, the default timeout constant is defined as:
 
@@ -259,7 +290,7 @@ For dynamic workloads querying diverse external endpoints, configure `ndots: 2` 
 ```diff
 --- deploy/payment-worker-deployment.yaml.orig
 +++ deploy/payment-worker-deployment.yaml
-@@ -24,6 +24,14 @@
+@@ -24,6 +24,13 @@
      spec:
 +      dnsPolicy: "ClusterFirst"
 +      dnsConfig:
@@ -267,13 +298,15 @@ For dynamic workloads querying diverse external endpoints, configure `ndots: 2` 
 +          - name: ndots
 +            value: "2"
 +          - name: single-request-reopen
-+            value: ""
 +          - name: timeout
 +            value: "2"
        containers:
          - name: worker
            image: 123456789012.dkr.ecr.us-west-2.amazonaws.com/payment-worker:v2.4.1
 ```
+
+> **Important Operational Caveat (Alpine Linux & musl libc)**:
+> Note that `single-request-reopen` is an option implemented specifically by `glibc`. Alpine Linux-based container images (`alpine:latest`, `python:alpine`) use `musl libc`, which implements a completely different, lightweight parallel stub resolver that silently ignores `single-request-reopen`. For Alpine-based containers, `single-request-reopen` will not prevent conntrack race conditions; these workloads must rely on NodeLocal DNSCache, trailing dot absolute FQDNs, or base image migration to glibc-based distributions (`debian:bookworm-slim`).
 
 ### Fix 3: Deploying NodeLocal DNSCache DaemonSet
 
@@ -287,7 +320,7 @@ NodeLocal DNSCache runs a specialized CoreDNS instance on every node, listening 
 ```diff
 --- deploy/nodelocaldns-corefile.yaml.orig
 +++ deploy/nodelocaldns-corefile.yaml
-@@ -10,8 +10,12 @@
+@@ -10,8 +10,14 @@
      cache 30
      reload
      loop
@@ -295,7 +328,10 @@ NodeLocal DNSCache runs a specialized CoreDNS instance on every node, listening 
 +    bind 169.254.20.10
 +    forward . 10.96.0.10 {
 +        force_tcp
-+        prefer_udp false
++    }
++    cache {
++        success 9984 30
++        denial 9984 5
 +    }
      prometheus :9253
 ```
