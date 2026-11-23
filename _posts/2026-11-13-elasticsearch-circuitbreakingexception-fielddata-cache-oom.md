@@ -12,6 +12,7 @@ fact_check_sources:
   - "https://www.elastic.co/guide/en/elasticsearch/reference/current/circuit-breaker-errors.html"
   - "https://www.elastic.co/guide/en/elasticsearch/reference/current/doc-values.html"
   - "https://www.elastic.co/guide/en/elasticsearch/reference/current/text.html#fielddata-mapping-param"
+  - "https://www.elastic.co/guide/en/elasticsearch/reference/current/field-data-cache-settings.html"
   - "https://www.elastic.co/guide/en/elasticsearch/reference/current/indices-clearcache.html"
   - "https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/indices/breaker/HierarchyCircuitBreakerService.java"
 ---
@@ -24,14 +25,14 @@ During heavy aggregation or sorting queries on production Elasticsearch data nod
     "root_cause": [
       {
         "type": "circuit_breaking_exception",
-        "reason": "[parent] Data too large, data for [<transport_request>] would be [31849102432/29.6gb], which is larger than the limit of [30601641984/28.5gb], real usage: [31849098128/29.6gb], new bytes reserved: [4304/4.2kb]",
+        "reason": "[parent] Data too large, data for [<transport_request>] would be [31849102432/29.6gb], which is larger than the limit of [30601641984/28.5gb], real usage: [31849098128/29.6gb], new bytes reserved: [4304/4.2kb], usages [request=0/0b, fielddata=18038862848/16.8gb, in_flight_requests=4304/4.2kb, accounting=4124987392/3.8gb]",
         "bytes_wanted": 31849102432,
         "bytes_limit": 30601641984,
         "durability": "TRANSIENT"
       }
     ],
     "type": "circuit_breaking_exception",
-    "reason": "[parent] Data too large, data for [<transport_request>] would be [31849102432/29.6gb], which is larger than the limit of [30601641984/28.5gb], real usage: [31849098128/29.6gb], new bytes reserved: [4304/4.2kb]",
+    "reason": "[parent] Data too large, data for [<transport_request>] would be [31849102432/29.6gb], which is larger than the limit of [30601641984/28.5gb], real usage: [31849098128/29.6gb], new bytes reserved: [4304/4.2kb], usages [request=0/0b, fielddata=18038862848/16.8gb, in_flight_requests=4304/4.2kb, accounting=4124987392/3.8gb]",
     "status": 429
   }
 }
@@ -40,8 +41,8 @@ During heavy aggregation or sorting queries on production Elasticsearch data nod
 Simultaneously, the Elasticsearch server daemon logs at `/var/log/elasticsearch/elasticsearch.log` emit a fatal stacktrace from `HierarchyCircuitBreakerService`:
 
 ```text
-[2026-11-13T10:29:12,418][WARN ][o.e.i.b.HierarchyCircuitBreakerService] [data-node-04] [parent] Data too large, data for [<transport_request>] would be [31849102432/29.6gb], which is larger than the limit of [30601641984/28.5gb], real usage: [31849098128/29.6gb], new bytes reserved: [4304/4.2kb]
-org.elasticsearch.common.breaker.CircuitBreakingException: [parent] Data too large, data for [<transport_request>] would be [31849102432/29.6gb], which is larger than the limit of [30601641984/28.5gb], real usage: [31849098128/29.6gb], new bytes reserved: [4304/4.2kb]
+[2026-11-13T10:29:12,418][WARN ][o.e.i.b.HierarchyCircuitBreakerService] [data-node-04] [parent] Data too large, data for [<transport_request>] would be [31849102432/29.6gb], which is larger than the limit of [30601641984/28.5gb], real usage: [31849098128/29.6gb], new bytes reserved: [4304/4.2kb], usages [request=0/0b, fielddata=18038862848/16.8gb, in_flight_requests=4304/4.2kb, accounting=4124987392/3.8gb]
+org.elasticsearch.common.breaker.CircuitBreakingException: [parent] Data too large, data for [<transport_request>] would be [31849102432/29.6gb], which is larger than the limit of [30601641984/28.5gb], real usage: [31849098128/29.6gb], new bytes reserved: [4304/4.2kb], usages [request=0/0b, fielddata=18038862848/16.8gb, in_flight_requests=4304/4.2kb, accounting=4124987392/3.8gb]
 	at org.elasticsearch.indices.breaker.HierarchyCircuitBreakerService.checkParentLimit(HierarchyCircuitBreakerService.java:389)
 	at org.elasticsearch.common.breaker.ChildMemoryCircuitBreaker.addEstimateBytesAndMaybeBreak(ChildMemoryCircuitBreaker.java:128)
 	at org.elasticsearch.transport.InboundHandler.handleRequest(InboundHandler.java:242)
@@ -83,7 +84,7 @@ Analyzed `text` fields do not support `doc_values` by default because tokenizati
 
 1. **Uninverting Lucene Segments**: The data node reads every segment's inverted index from disk, un-inverts the posting lists in real time, and builds an in-memory term dictionary.
 2. **Global Ordinals Computation**: Elasticsearch maps every unique term across all segment dictionaries to a 32-bit dense integer ordinal array (`global_ordinals`). For fields with millions of distinct strings (such as customer comments, raw URL paths, or full error logs), building and holding global ordinals requires gigabytes of contiguous heap memory.
-3. **Cache Persistence**: Unlike per-query execution buffers, Fielddata is loaded into the node-level `indices.fielddata.cache`. Once loaded, it remains resident on the JVM heap indefinitely. By default, `indices.fielddata.cache.size` is `unbounded` [Source: Elastic Docs - Fielddata cache](https://www.elastic.co/guide/en/elasticsearch/reference/current/indices-clearcache.html). The cache never evicts entries unless forced by memory pressure or manual API intervention.
+3. **Cache Persistence**: Unlike per-query execution buffers, Fielddata is loaded into the node-level `indices.fielddata.cache`. Once loaded, it remains resident on the JVM heap indefinitely. By default, `indices.fielddata.cache.size` is `unbounded` [Source: Elastic Reference - Field data cache settings](https://www.elastic.co/guide/en/elasticsearch/reference/current/field-data-cache-settings.html). The cache never evicts entries unless forced by memory pressure or manual API intervention.
 
 ### Circuit Breaker Mathematics
 Elasticsearch implements a hierarchy of circuit breakers in `HierarchyCircuitBreakerService.java` [Source: Elasticsearch Source - HierarchyCircuitBreakerService](https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/indices/breaker/HierarchyCircuitBreakerService.java):
@@ -116,7 +117,7 @@ Another misstep is leaving `fielddata: true` enabled on the text field and perio
 
 ### Misstep 3: Expanding JVM Heap Beyond 32 GB (`-Xmx64g`)
 Teams sometimes scale the JVM heap from 30GB to 64GB on large instances assuming more memory resolves Fielddata bloat.
-* **Why It Backfires**: In modern 64-bit JVMs, Compressed Ordinary Object Pointers (Compressed OOPs) operate only when the heap remains strictly below 32 GB. When heap size exceeds 32 GB, the JVM disables compressed references (`-XX:-UseCompressedOops`), expanding all object pointers from 32-bit (4 bytes) to 64-bit (8 bytes). This pointer expansion immediately wastes 40% to 50% of the additional memory space. Furthermore, managing a 64 GB heap exponentially increases G1GC marking times and remark pause latencies without solving the underlying architectural data duplication.
+* **Why It Backfires**: In modern 64-bit JVMs, Compressed Ordinary Object Pointers (Compressed OOPs) operate only when the heap remains strictly below 32 GB ($2^{32} \times 8\text{ bytes} = 32\text{ GB}$). In practice, due to OS virtual address layout and JVM class metadata space, Elasticsearch strongly recommends maintaining heap at or below 30.5 GB (`-Xmx30500m` or `-Xmx30g`) to guarantee Zero-based Compressed OOPs (`Compressed Oops mode: Zero based`). When heap size exceeds 32 GB, the JVM disables compressed references (`-XX:-UseCompressedOops`), expanding all object pointers from 32-bit (4 bytes) to 64-bit (8 bytes). This pointer expansion immediately wastes 40% to 50% of the additional memory space. Furthermore, managing a 64 GB heap exponentially increases G1GC marking times and remark pause latencies without solving the underlying architectural data duplication.
 
 ---
 
@@ -166,24 +167,24 @@ Update all aggregation, terms, and sort queries across application services to r
  }
 ```
 
-#### Step 3: Cluster-Wide Circuit Breaker & Cache Bound Configuration
-Configure dynamic breaker safety buffers via the cluster settings API, and bind `indices.fielddata.cache.size` in `elasticsearch.yml` so any remaining legacy Fielddata undergoes LRU eviction before reaching breaker limits [Source: Elastic Reference - Circuit breaker settings](https://www.elastic.co/guide/en/elasticsearch/reference/current/circuit-breaker.html):
+#### Step 3: Dynamic Cluster Circuit Breakers vs. Static Node Configuration
+Circuit breaker thresholds must be split between dynamic cluster-wide limits and static node-level configuration files [Source: Elastic Reference - Circuit breaker settings](https://www.elastic.co/guide/en/elasticsearch/reference/current/circuit-breaker.html). Note that `indices.breaker.total.use_real_memory` is a **static setting**; attempting to submit it via `PUT /_cluster/settings` results in `illegal_argument_exception: persistent setting [indices.breaker.total.use_real_memory], not dynamically updateable`.
 
 ```diff
-# Cluster Settings Update (Dynamic API)
+# Cluster Settings Update (Dynamic API - Runtime Safe)
  PUT /_cluster/settings
  {
    "persistent": {
 -    "indices.breaker.fielddata.limit": "40%",
 +    "indices.breaker.fielddata.limit": "20%",
-+    "indices.breaker.total.use_real_memory": true,
 +    "indices.breaker.total.limit": "85%"
    }
  }
 ```
 
 ```diff
-# /etc/elasticsearch/elasticsearch.yml (Static node configuration)
+# /etc/elasticsearch/elasticsearch.yml (Static node configuration - requires rolling restart)
++ indices.breaker.total.use_real_memory: true
 - # indices.fielddata.cache.size: unbounded (default)
 + indices.fielddata.cache.size: 15%
 ```
@@ -237,6 +238,18 @@ TASK_ID=$(curl -s -XPOST "http://localhost:9200/_reindex?wait_for_completion=fal
 curl -s -XGET "http://localhost:9200/_tasks/${TASK_ID}" | jq '.completed, .task.status'
 ```
 
+### 5. Verify Zero-Based Compressed OOPs on Data Nodes
+Ensure that the JVM process maintains 32-bit compressed ordinary object pointers and operates in zero-based mode under the 30.5 GB ceiling:
+
+```bash
+# Verify Compressed OOPs status and mode on the running JVM
+java -XX:+UnlockDiagnosticVMOptions -XX:+PrintFlagsFinal -version 2>&1 | \
+  grep -E "UseCompressedOops|UseCompressedClassPointers"
+
+# Confirm Compressed OOPs mode in Elasticsearch startup log
+grep -i "compressed ordinary object pointers" /var/log/elasticsearch/elasticsearch.log
+```
+
 ---
 
 ## 5. Verification Metrics: Production Cluster Recovery
@@ -259,7 +272,7 @@ Following the migration from in-memory Fielddata to column-oriented `doc_values`
 To prevent recurrent circuit breaker incidents across multi-tenant clusters, enforce the following configuration standards:
 
 * **Strict Schema Governance (`dynamic: strict`)**: Set `dynamic: strict` on all production index mappings. This prevents client services from dynamically indexing arbitrary unstructured string payloads as raw `text` fields.
-* **Heap Sizing Rules**: Maintain JVM heap sizes at or below 30 GB (`-Xms30g -Xmx30g`) to guarantee 32-bit Compressed Ordinary Object Pointers (Compressed OOPs). Allocate the remaining 50% of node host RAM to the Linux kernel page cache, which accelerates Lucene `doc_values` access.
+* **Heap Sizing Rules**: Maintain JVM heap sizes strictly at or below 30.5 GB (`-Xms30g -Xmx30g`) to guarantee 32-bit Zero-based Compressed Ordinary Object Pointers (Compressed OOPs). Allocate the remaining 50% of node host RAM to the Linux kernel page cache, which accelerates Lucene `doc_values` access.
 * **Bounded Fielddata Sizing**: Never leave `indices.fielddata.cache.size` unset. Specify `10%` to `15%` so that unexpected text field aggregations trigger LRU cache evictions rather than cascading parent breaker trips.
 * **Slowlog Thresholds**: Enable search query slowlogs (`index.search.slowlog.threshold.query.warn: 2s`) to capture expensive nested aggregations before they impact cluster-wide memory headroom.
 
@@ -270,5 +283,6 @@ To prevent recurrent circuit breaker incidents across multi-tenant clusters, enf
 * Elastic Reference: [Circuit breaker errors troubleshooting](https://www.elastic.co/guide/en/elasticsearch/reference/current/circuit-breaker-errors.html)
 * Elastic Reference: [Doc values mapping parameter](https://www.elastic.co/guide/en/elasticsearch/reference/current/doc-values.html)
 * Elastic Reference: [Fielddata mapping parameter](https://www.elastic.co/guide/en/elasticsearch/reference/current/text.html#fielddata-mapping-param)
+* Elastic Reference: [Field data cache settings](https://www.elastic.co/guide/en/elasticsearch/reference/current/field-data-cache-settings.html)
 * Elastic Reference: [Clear cache API](https://www.elastic.co/guide/en/elasticsearch/reference/current/indices-clearcache.html)
 * GitHub Repository: [Elasticsearch HierarchyCircuitBreakerService Source Code](https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/indices/breaker/HierarchyCircuitBreakerService.java)
