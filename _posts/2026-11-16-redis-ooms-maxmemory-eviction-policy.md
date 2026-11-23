@@ -154,9 +154,31 @@ $$\Phi_{\text{in}} = \lambda_{\text{write}} \times \overline{S}_{\text{write}}$$
 Where $\lambda_{\text{write}} \approx 40,000\text{ writes/sec}$ and average write payload $\overline{S}_{\text{write}} \approx 2.4\text{ KB}$, producing an incoming memory allocation pressure of:
 $$\Phi_{\text{in}} = 40,000 \times 2,457.6\text{ B} \approx 98.3\text{ MB/sec}$$
 
-The eviction loop is bounded by the configuration parameter `maxmemory-eviction-tenacity` (default value: `10`) [Source: Redis Configuration Specification](https://redis.io/docs/latest/operate/oss_and_stack/management/config-file/). At tenacity level 10, Redis restricts the main thread eviction loop duration to approximately $50\,\mu\text{s}$ per iteration to prevent client command latency from stalling.
+The eviction loop in `performEvictions()` is strictly throttled by `evictionTimeLimitUs()` defined in `src/evict.c` [Source: Redis Source Code - src/evict.c](https://github.com/redis/redis/blob/7.2/src/evict.c):
 
-If Redis cannot reclaim sufficient memory within this microsecond execution budget, `performEvictions()` returns `EVICT_FAIL`, instantly rejecting the client command with `(error) OOM command not allowed when used memory > 'maxmemory'`.
+```c
+/* Defined in src/evict.c */
+static unsigned long evictionTimeLimitUs(void) {
+    if (server.maxmemory_eviction_tenacity <= 10) {
+        return 50uL * server.maxmemory_eviction_tenacity; /* 0 - 500 us linear budget */
+    }
+    if (server.maxmemory_eviction_tenacity < 100) {
+        return (unsigned long)(500.0 * pow(1.15, server.maxmemory_eviction_tenacity - 10.0));
+    }
+    return ULONG_MAX; /* Tenacity 100: unbounded loop */
+}
+```
+
+At the default tenacity setting of `10`, the maximum time Redis permits for an eviction cycle is:
+$$T_{\text{budget}} = 50\,\mu\text{s} \times 10 = 500\,\mu\text{s}$$
+
+When `lazyfree-lazy-eviction no` is active, synchronous deallocation of complex data structures (e.g., Hashes with dozens of fields) requires an average deletion time $\tau_{\text{del}} \approx 15\,\mu\text{s}$ per key. The maximum number of keys reclaimed within a single cycle is constrained by:
+$$N_{\text{max\_keys}} = \left\lfloor \frac{T_{\text{budget}}}{\tau_{\text{del}}} \right\rfloor = \left\lfloor \frac{500\,\mu\text{s}}{15\,\mu\text{s}} \right\rfloor \approx 33\text{ keys/cycle}$$
+
+Yielding a maximum reclaimable volume per eviction pass of:
+$$\Delta M_{\text{reclaim}} = 33 \times 2,457.6\text{ B} \approx 81.1\text{ KB}$$
+
+Because the eviction loop yields control to service client commands, under a write flood of $98.3\text{ MB/sec}$ incoming memory pressure, the rate of memory consumption radically outstrips eviction throughput ($\Phi_{\text{in}} \gg \Phi_{\text{reclaim}}$). When `performEvictions()` exhausts its $500\,\mu\text{s}$ quota while uncollected memory remains above `maxmemory`, it returns `EVICT_FAIL`, instantly rejecting mutating commands with `(error) OOM command not allowed when used memory > 'maxmemory'`.
 
 ### 1.4 Synchronous Deallocation Stalls (`lazyfree-lazy-eviction no`)
 When Redis was configured with the default setting `lazyfree-lazy-eviction no`, any key chosen for eviction was destroyed synchronously via `dbSyncDelete()` on the main event thread [Source: Redis Documentation - Memory Optimization](https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/memory-optimization/).
@@ -358,9 +380,9 @@ package com.example.cart.config;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.data.redis.connection.RedisConnection;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
 import org.springframework.data.redis.serializer.StringRedisSerializer;
 import org.springframework.stereotype.Component;
 
@@ -379,29 +401,59 @@ public class SafeRedisCacheClient {
         this.redisTemplate = new RedisTemplate<>();
         this.redisTemplate.setConnectionFactory(connectionFactory);
         this.redisTemplate.setKeySerializer(new StringRedisSerializer());
+        this.redisTemplate.setHashKeySerializer(new StringRedisSerializer());
+        this.redisTemplate.setValueSerializer(new GenericJackson2JsonRedisSerializer());
+        this.redisTemplate.setHashValueSerializer(new GenericJackson2JsonRedisSerializer());
         this.redisTemplate.afterPropertiesSet();
     }
 
     /**
-     * Enforces mandatory TTL on all volatile cache writes.
+     * Enforces mandatory TTL on all volatile string cache writes.
      * Rejects or overrides any write lacking an expiration duration.
      */
     public void setWithEnforcedTtl(String key, Object value, Duration ttl) {
-        if (ttl == null || ttl.isZero() || ttl.isNegative()) {
-            log.warn("[REDIS_VOLATILE_GUARD] Attempted write without valid TTL for key '{}'. Overriding with default {}s",
-                    key, DEFAULT_FALLBACK_TTL.getSeconds());
-            ttl = DEFAULT_FALLBACK_TTL;
-        } else if (ttl.compareTo(MAX_ALLOWED_TTL) > 0) {
-            log.warn("[REDIS_VOLATILE_GUARD] TTL for key '{}' exceeded maximum bound ({}s > {}s). Capping TTL.",
-                    key, ttl.getSeconds(), MAX_ALLOWED_TTL.getSeconds());
-            ttl = MAX_ALLOWED_TTL;
-        }
+        Duration validatedTtl = validateTtl(key, ttl);
+        redisTemplate.opsForValue().set(key, value, validatedTtl);
+    }
 
-        redisTemplate.opsForValue().set(key, value, ttl);
+    /**
+     * Enforces mandatory TTL on Redis Hash writes (e.g., shopping cart holds)
+     * using pipelined HSET and EXPIRE to prevent persistent key leaks in Redis 7.2.
+     */
+    public void hsetWithEnforcedTtl(String key, String field, Object value, Duration ttl) {
+        Duration validatedTtl = validateTtl(key, ttl);
+        redisTemplate.executePipelined((org.springframework.data.redis.core.RedisCallback<Object>) connection -> {
+            byte[] rawKey = key.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            byte[] rawField = field.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            byte[] rawValue = redisTemplate.getHashValueSerializer() != null
+                    ? ((org.springframework.data.redis.serializer.RedisSerializer<Object>) redisTemplate.getHashValueSerializer()).serialize(value)
+                    : String.valueOf(value).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            connection.hashCommands().hSet(rawKey, rawField, rawValue);
+            connection.keyCommands().expire(rawKey, validatedTtl.getSeconds());
+            return null;
+        });
     }
 
     public Object get(String key) {
         return redisTemplate.opsForValue().get(key);
+    }
+
+    public Object hget(String key, String field) {
+        return redisTemplate.opsForHash().get(key, field);
+    }
+
+    private Duration validateTtl(String key, Duration ttl) {
+        if (ttl == null || ttl.isZero() || ttl.isNegative()) {
+            log.warn("[REDIS_VOLATILE_GUARD] Attempted write without valid TTL for key '{}'. Overriding with default {}s",
+                    key, DEFAULT_FALLBACK_TTL.getSeconds());
+            return DEFAULT_FALLBACK_TTL;
+        }
+        if (ttl.compareTo(MAX_ALLOWED_TTL) > 0) {
+            log.warn("[REDIS_VOLATILE_GUARD] TTL for key '{}' exceeded maximum bound ({}s > {}s). Capping TTL.",
+                    key, ttl.getSeconds(), MAX_ALLOWED_TTL.getSeconds());
+            return MAX_ALLOWED_TTL;
+        }
+        return ttl;
     }
 }
 ```
@@ -425,23 +477,30 @@ redis-cli -a "<PASSWORD>" config set maxmemory-policy volatile-ttl
 # 3. Increase eviction sampling pool accuracy to 10
 redis-cli -a "<PASSWORD>" config set maxmemory-samples 10
 
-# 4. Elevate eviction tenacity to 30 to give eviction loop more CPU budget during write bursts
+# 4. Elevate eviction tenacity to 30 (~8.18ms eviction quota under write surges)
 redis-cli -a "<PASSWORD>" config set maxmemory-eviction-tenacity 30
 
-# 5. Enable asynchronous background memory freeing
+# 5. Cap aggregate client memory buffers to 5% of maxmemory (Redis 7.0+)
+redis-cli -a "<PASSWORD>" config set maxmemory-clients 5%
+
+# 6. Enable asynchronous background memory freeing
 redis-cli -a "<PASSWORD>" config set lazyfree-lazy-eviction yes
 redis-cli -a "<PASSWORD>" config set lazyfree-lazy-expire yes
 redis-cli -a "<PASSWORD>" config set lazyfree-lazy-server-del yes
 
-# 6. Enable jemalloc active defragmentation
+# 7. Enable jemalloc active defragmentation and set field scan limits
 redis-cli -a "<PASSWORD>" config set activedefrag yes
 redis-cli -a "<PASSWORD>" config set active-defrag-ignore-bytes 104857600
 redis-cli -a "<PASSWORD>" config set active-defrag-threshold-lower 10
 redis-cli -a "<PASSWORD>" config set active-defrag-threshold-upper 30
 redis-cli -a "<PASSWORD>" config set active-defrag-cycle-min 5
 redis-cli -a "<PASSWORD>" config set active-defrag-cycle-max 25
+redis-cli -a "<PASSWORD>" config set active-defrag-max-scan-fields 1000
 
-# 7. Persist running configuration to redis.conf
+# 8. Enable latency monitoring threshold for events exceeding 100ms
+redis-cli -a "<PASSWORD>" config set latency-monitor-threshold 100
+
+# 9. Persist running configuration to redis.conf
 redis-cli -a "<PASSWORD>" config rewrite
 ```
 
@@ -474,19 +533,22 @@ Interrogate latency diagnostics to confirm zero event loop stalls:
 redis-cli -a "<PASSWORD>" latency doctor
 ```
 ```text
-Dave, I have observed zero latency spikes in the event loop!
-All background lazy freeing and active defragmentation cycles are operating within the microsecond thresholds.
+Dave, no latency spike was observed during the lifetime of this Redis instance, not in the slightest bit. I honestly think you ought to sit down calmly, take a stress pill, and think things over.
 ```
 
 ### Step 3: High-Concurrency Load Verification with `memtier_benchmark`
-Subject the remediated instance to an intense synthetic flash-sale workload matching 50,000 operations/sec with 80% writes and 20% reads using `memtier_benchmark`:
+Subject the remediated instance to an intense synthetic flash-sale workload matching 50,000 operations/sec with 80% writes and 20% reads using `memtier_benchmark` [Source: Redis Documentation - Eviction Policies](https://redis.io/docs/latest/develop/reference/eviction/):
 
 ```bash
+# Note: --expiry-range=60-300 is strictly mandatory for testing volatile-ttl.
+# Without expiry ranges, memtier_benchmark writes persistent keys that bypass db->expires,
+# which would falsely trigger OOM once maxmemory is saturated.
 memtier_benchmark -s 127.0.0.1 -p 6379 -a "<PASSWORD>" \
   --threads=4 \
   --clients=50 \
   --pipeline=16 \
   --ratio=4:1 \
+  --expiry-range=60-300 \
   --key-pattern=R:R \
   --key-minimum=1 \
   --key-maximum=5000000 \
@@ -525,7 +587,7 @@ The deployment of asynchronous lazy freeing, active defragmentation tuning, evic
 | **`used_memory_rss` (Physical RAM)** | **13.80 GB** (86.3% Host RAM) | **6.64 GB** (41.5% Host RAM) | Active jemalloc slab compaction (`activedefrag`) |
 | **`mem_fragmentation_ratio`** | **1.72** (Severe page fragmentation) | **1.14** (Healthy contiguous bins) | `active-defrag-cycle-min 5`, `cycle-max 25` |
 | **Eviction Deallocation Mode** | Synchronous main-thread (`dbSyncDelete`) | Asynchronous background (`lazyfree-lazy-eviction`) | Offloaded to background `bio` worker thread |
-| **Eviction Tenacity Budget** | 10 ($\sim 50\,\mu\text{s}$ cycle budget) | 30 ($\sim 150\,\mu\text{s}$ cycle budget) | Allows eviction loop to absorb 50k ops/sec writes |
+| **Eviction Tenacity Budget** | 10 ($500\,\mu\text{s}$ linear budget: $50\,\mu\text{s} \times 10$) | 30 ($\sim 8,183\,\mu\text{s}$ exponential budget: $500 \times 1.15^{20}$) | `evictionTimeLimitUs()` formula in `src/evict.c` |
 | **Sampling Accuracy (`maxmemory-samples`)** | 5 random keys per tick | 10 random keys per tick | Eliminates premature eviction of long-TTL keys |
 | **p99 Write Latency** | 1,240 ms / `RedisSystemException` | **1.74 ms** | Unblocked event loop and sub-millisecond network I/O |
 | **Background Snapshot Safety** | Fatal risk of Linux `oom-killer` | Zero COW pressure, $vm.overcommit\_memory = 1$ | 10 GB unallocated host RAM reserved for forks |
