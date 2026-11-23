@@ -12,16 +12,20 @@ fact_check_sources:
   - "https://nginx.org/en/docs/http/ngx_http_upstream_module.html#keepalive"
   - "https://nginx.org/en/docs/http/ngx_http_upstream_module.html#keepalive_timeout"
   - "https://nginx.org/en/docs/http/ngx_http_upstream_module.html#keepalive_requests"
+  - "https://nginx.org/en/docs/http/ngx_http_upstream_module.html#keepalive_time"
   - "https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_http_version"
   - "https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_set_header"
   - "https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_next_upstream"
   - "https://nginx.org/en/docs/http/ngx_http_core_module.html#keepalive_timeout"
   - "https://docs.spring.io/spring-boot/appendix/application-properties/index.html#appendix.application-properties.server"
   - "https://nodejs.org/api/http.html#serverkeepalivetimeout"
+  - "https://nodejs.org/api/http.html#serverheaderstimeout"
+  - "https://nodejs.org/api/http.html#serverrequesttimeout"
   - "https://docs.gunicorn.org/en/stable/settings.html#keepalive"
   - "https://pkg.go.dev/net/http#Server"
   - "https://www.rfc-editor.org/rfc/rfc9293.html"
   - "https://www.rfc-editor.org/rfc/rfc9110.html"
+  - "https://www.rfc-editor.org/rfc/rfc2525.html#section-2.17"
   - "https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/"
 ---
 
@@ -96,9 +100,13 @@ RFC 9293 Section 3.6.1 explicitly governs the half-closed operational condition:
 
 If an application closes the socket while incoming segment bytes arrive across the wire, or if new data packets are received after a connection termination handshake has started, the operating system's TCP stack cannot deliver the payload to any active application-level buffer. In accordance with RFC 9293 Section 3.5.2 (Reset Generation) and Section 3.6.1, the kernel implementation mandates an immediate transmission of a `TCP RST` (Reset) segment to signal unrecoverable data loss [Source: RFC 9293 - Reset Generation](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.5.2).
 
-When Nginx dispatches an outbound HTTP request on a pre-existing pooled socket, it calls `writev()` on the file descriptor. If the remote peer's `FIN` is in flight, the local socket still registers as writable (`POLLOUT`). The outbound `TCP PSH+ACK` packet crosses the incoming `TCP FIN` packet on the wire. When the backend kernel receives data on a socket whose receive buffer has already been discarded by `close()`, `tcp_v4_send_reset()` immediately emits `TCP RST` with sequence number derived from the incoming acknowledgment field (`th->ack_seq`).
+When Nginx dispatches an outbound HTTP request on a pre-existing pooled socket, it calls `writev()` on the file descriptor. If the remote peer's `FIN` is in flight, the local socket still registers as writable (`POLLOUT`). The outbound `TCP PSH+ACK` packet crosses the incoming `TCP FIN` packet on the wire. When the backend kernel receives data on a socket whose receive buffer has already been discarded by `close()`, `tcp_v4_send_reset()` immediately emits `TCP RST` with sequence number derived from the incoming acknowledgment field (`th->ack_seq`), incrementing the Linux kernel `LINUX_MIB_TCPABORTONCLOSE` counter in accordance with RFC 2525 Section 2.17 [Source: RFC 2525 - Known TCP Implementation Problems](https://www.rfc-editor.org/rfc/rfc2525.html#section-2.17).
 
-Nginx, awaiting the HTTP status line via `epoll_wait()`, invokes `recv()` on the socket descriptor. The system call aborts with error code `104: Connection reset by peer` (`ECONNRESET`). Because Nginx has already transmitted the request headers to the backend and cannot determine whether the upstream executed partial transaction logic, it logs `upstream prematurely closed connection while reading response header from upstream` and returns `502 Bad Gateway` to the downstream client [Source: Nginx Documentation - ngx_http_proxy_module](https://nginx.org/en/docs/http/ngx_http_proxy_module.html).
+Nginx, awaiting the HTTP status line via `epoll_wait()`, invokes `c->recv()` on the socket descriptor in `ngx_http_upstream_process_header` [Source: Nginx Documentation - ngx_http_proxy_module](https://nginx.org/en/docs/http/ngx_http_proxy_module.html):
+* **Branch A (Clean EOF / 0 Bytes)**: If the backend's active close completed before incoming request bytes touched the socket and Nginx reads EOF (`n == 0`), Nginx logs `upstream prematurely closed connection while reading response header from upstream`.
+* **Branch B (Transport Reset / `ECONNRESET`)**: If the backend kernel drops the incoming data on a closed descriptor and emits `TCP RST`, the system call aborts with `n == NGX_ERROR` and error code `104: Connection reset by peer` (`ECONNRESET`), causing Nginx to log `recv() failed (104: Connection reset by peer) while reading response header from upstream`.
+
+In both branches, because Nginx received no valid HTTP status line or headers from the upstream, it cannot determine whether the upstream executed partial transaction logic. It transitions to `ngx_http_upstream_next()` to evaluate retry failover policies, or terminates with a `502 Bad Gateway` to the downstream client.
 
 ### The Mathematical Inequality of Keepalive Timing
 To ensure that idle sockets are always decommissioned gracefully from the proxy side before the upstream backend terminates them, the connection lifecycle must satisfy the following strict timing inequality:
@@ -172,11 +180,13 @@ Permanent resolution requires a three-fold engineering strategy:
 
 By default, Nginx communicates with upstream servers using **HTTP/1.0** and injects `Connection: close` unless explicitly configured otherwise [Source: Nginx Documentation - ngx_http_proxy_module](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_http_version). 
 
-To enable upstream connection pooling, you must:
+To enable upstream connection pooling and eradicate keepalive race conditions, you must enforce the following six-point configuration:
 1. Define the `keepalive` directive inside the `upstream` block to specify the cache capacity of idle connections per worker process [Source: Nginx Documentation - ngx_http_upstream_module](https://nginx.org/en/docs/http/ngx_http_upstream_module.html#keepalive).
-2. Set `keepalive_timeout` in the `upstream` block to **55 seconds** (lower than the backend's 65 seconds) [Source: Nginx Documentation - ngx_http_upstream_module](https://nginx.org/en/docs/http/ngx_http_upstream_module.html#keepalive_timeout).
-3. Set `proxy_http_version 1.1;` and `proxy_set_header Connection "";` in the `location` block to preserve persistent connections [Source: Nginx Documentation - ngx_http_proxy_module](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_http_version).
-4. Configure `proxy_next_upstream` to fail over cleanly across healthy upstream nodes on transport errors [Source: Nginx Documentation - ngx_http_proxy_module](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_next_upstream).
+2. Set `keepalive_requests` (e.g., 1000) to cap maximum requests serviced over a single socket, preventing connection-level memory leaks [Source: Nginx Documentation - ngx_http_upstream_module](https://nginx.org/en/docs/http/ngx_http_upstream_module.html#keepalive_requests).
+3. Set `keepalive_timeout` in the `upstream` block to **55 seconds** (strictly lower than the backend's 65 seconds) [Source: Nginx Documentation - ngx_http_upstream_module](https://nginx.org/en/docs/http/ngx_http_upstream_module.html#keepalive_timeout).
+4. Set `keepalive_time 1h;` (introduced in Nginx 1.19.10) to bound total persistent socket lifespan, ensuring automatic DNS re-resolution and even pod re-balancing across Kubernetes rolling updates [Source: Nginx Documentation - ngx_http_upstream_module](https://nginx.org/en/docs/http/ngx_http_upstream_module.html#keepalive_time).
+5. Set `proxy_http_version 1.1;` and `proxy_set_header Connection "";` in the `location` block to upgrade upstream transport from default HTTP/1.0 and clear the hop-by-hop `Connection: close` header [Source: Nginx Documentation - ngx_http_proxy_module](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_http_version).
+6. Configure `proxy_next_upstream` with `error timeout invalid_header http_502 non_idempotent` to transparently retry failed requests on healthy peers upon transport resets [Source: Nginx Documentation - ngx_http_proxy_module](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_next_upstream).
 
 ```diff
 --- a/etc/nginx/conf.d/upstream.conf
@@ -232,7 +242,9 @@ To enable upstream connection pooling, you must:
 All backend application runtimes must be configured with an idle Keep-Alive timeout of **65 seconds** (satisfying $T_{\text{backend}} = 65\text{ s} > T_{\text{nginx}} = 55\text{ s}$).
 
 #### Option A: Spring Boot 3.x with Embedded Tomcat (`application.yml`)
-Spring Boot exposes `server.tomcat.keep-alive-timeout` to control how long Tomcat holds an idle connection awaiting the next HTTP request [Source: Spring Boot Common Application Properties](https://docs.spring.io/spring-boot/appendix/application-properties/index.html#appendix.application-properties.server).
+Spring Boot exposes `server.tomcat.keep-alive-timeout` to control how long Tomcat holds an idle connection awaiting the next HTTP request [Source: Spring Boot Common Application Properties](https://docs.spring.io/spring-boot/appendix/application-properties/index.html#appendix.application-properties.server). 
+
+Crucially, in Apache Tomcat, if `server.tomcat.keep-alive-timeout` is omitted, the connector automatically falls back to `server.tomcat.connection-timeout` (default: 20,000ms / 20 seconds). When fronted by Nginx, this 20-second default guarantees that Tomcat tears down idle sockets 35–40 seconds before Nginx expects, triggering the collision. Setting `keep-alive-timeout: 65000ms` (or `65s`) explicitly ensures that the backend keeps idle sockets open longer than Nginx:
 
 ```diff
 --- a/src/main/resources/application.yml
@@ -251,12 +263,16 @@ Spring Boot exposes `server.tomcat.keep-alive-timeout` to control how long Tomca
 ```
 
 #### Option B: Node.js Express Server (`server.js`)
-In Node.js, `server.keepAliveTimeout` specifies the milliseconds of inactivity before destroying an idle socket [Source: Node.js HTTP Documentation](https://nodejs.org/api/http.html#serverkeepalivetimeout). Crucially, `server.headersTimeout` must be configured to a strictly greater value than `keepAliveTimeout` to prevent internal race conditions within the Node.js HTTP parser [Source: Node.js HTTP Documentation](https://nodejs.org/api/http.html#serverheaderstimeout).
+In Node.js, `server.keepAliveTimeout` specifies the milliseconds of inactivity before destroying an idle persistent socket [Source: Node.js HTTP Documentation - keepAliveTimeout](https://nodejs.org/api/http.html#serverkeepalivetimeout). 
+
+Crucially, in the Node.js HTTP parser:
+1. `server.headersTimeout` must be configured strictly greater than `keepAliveTimeout` (e.g., 66,000ms vs 65,000ms) to avoid parser deadlocks and race conditions on incoming request chunks [Source: Node.js HTTP Documentation - headersTimeout](https://nodejs.org/api/http.html#serverheaderstimeout).
+2. `server.requestTimeout` (introduced in Node.js 18) sets the maximum duration for receiving the entire HTTP request payload (default: 300,000ms / 5 minutes) [Source: Node.js HTTP Documentation - requestTimeout](https://nodejs.org/api/http.html#serverrequesttimeout).
 
 ```diff
 --- a/server.js
 +++ b/server.js
-@@ -1,7 +1,13 @@
+@@ -1,7 +1,16 @@
  const express = require('express');
  const app = express();
 
@@ -269,6 +285,9 @@ In Node.js, `server.keepAliveTimeout` specifies the milliseconds of inactivity b
 +
 +// Header timeout: must be strictly greater than keepAliveTimeout in Node.js runtime
 +server.headersTimeout = 66000;
++
++// Total request timeout: 5 minutes (guards against slow client attacks)
++server.requestTimeout = 300000;
 ```
 
 #### Option C: Python Gunicorn (`gunicorn.conf.py`)
@@ -312,9 +331,15 @@ In Go, `IdleTimeout` on `http.Server` controls the maximum amount of time to wai
 
 Enabling `non_idempotent` in `proxy_next_upstream` requires rigorous architectural hygiene [Source: RFC 9110 - HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.2.2). 
 
-Under RFC 9110 (Section 9.2.2), HTTP methods such as `GET`, `HEAD`, `PUT`, and `DELETE` are defined as idempotent (executing multiple identical requests produces the exact same intended effect on the server as a single request), whereas `POST` and `PATCH` are explicitly non-idempotent [Source: RFC 9110 - Idempotent Methods](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.2.2).
+#### Understanding Which Flags Intercept Keep-Alive Resets
+A common operational fallacy is configuring `proxy_next_upstream http_502;` and assuming upstream connection closures are handled. When an upstream backend closes an idle socket or emits `TCP RST` before sending headers, **the backend never returns an HTTP 502 status line**. The 502 status is generated locally by Nginx only after all retries fail.
+* **`error` and `invalid_header`**: These are the specific flags that catch transport-layer socket errors (`ECONNRESET`) and empty EOF responses (`n == 0`) while reading headers [Source: Nginx Documentation - ngx_http_proxy_module](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_next_upstream). Without `error`, Nginx will not attempt failover on Keep-Alive race resets.
+* **`non_idempotent`**: By default, Nginx only retries idempotent requests (`GET`, `HEAD`, `PUT`, `DELETE`). It refuses to retry requests with methods like `POST` or `PATCH` once the request body has begun transmitting to an upstream node [Source: RFC 9110 - Idempotent Methods](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.2.2). Adding `non_idempotent` overrides this restriction.
 
-By default, Nginx refuses to retry non-idempotent requests if any portion of the request body has already been dispatched to an upstream node [Source: Nginx Documentation - ngx_http_proxy_module](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_next_upstream). When `non_idempotent` is enabled, Nginx will re-send a failed `POST` request to another upstream peer. If the initial backend node received the request, processed a financial transaction or database record creation, and severed the socket right before returning HTTP headers, an automatic retry would cause **duplicate transactions** or **double billing**.
+#### The Duplicate Transaction Risk with `non_idempotent`
+Under RFC 9110 (Section 9.2.2), `POST` and `PATCH` methods are non-idempotent because multiple executions can cause distinct side-effects (e.g., creating multiple orders or charging a credit card twice) [Source: RFC 9110 - Idempotent Methods](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.2.2).
+
+When `non_idempotent` is enabled globally, Nginx will re-send a failed `POST` request to another upstream peer. If the initial backend node received the request, processed a financial transaction or database record creation, and severed the socket right before returning HTTP headers, an automatic retry would cause **duplicate transactions** or **double billing**.
 
 To safely deploy `non_idempotent`, organizations must enforce one of two production patterns:
 
