@@ -37,10 +37,9 @@ Checking host kernel messages via `dmesg -T` during the crash confirms that the 
 
 ```text
 [Wed Nov 11 11:15:32 2026] traps: python[284] trap page fault ip:7f9201948210 sp:7ffe81902830 error:4 in libtorch_cpu.so[7f9200000000+3a00000]
-[Wed Nov 11 11:15:32 2026] tmpfs: size 64M exceeded on /dev/shm
 ```
 
-The process terminates with exit code 135 (128 + signal 7, `SIGBUS`).
+Notice that the host kernel outputs **no explicit `tmpfs: size exceeded` or out-of-space warning**. The Linux kernel handles tmpfs quota exhaustion silently at the filesystem layer by converting block allocation failure into `VM_FAULT_SIGBUS`. The worker terminates abruptly with exit code 135 (128 + signal 7, `SIGBUS`).
 
 ---
 
@@ -115,37 +114,51 @@ A critical engineering question is why the container crashes with `SIGBUS` (Bus 
 The explanation lies in the Linux virtual memory manager's implementation of `tmpfs` in `mm/shmem.c` [Source: Linux Kernel Memory Management — mm/shmem.c](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/mm/shmem.c):
 1. When `shm_open()` and `mmap(MAP_SHARED)` are called, the kernel creates a Virtual Memory Area (`vm_area_struct`). Physical RAM pages are **not** allocated at mapping time; allocation is deferred until actual memory write operations via lazy demand paging.
 2. When the PyTorch worker writes decoded pixel data into the mapped memory addresses, the CPU encounters unmapped pages and triggers a hardware page fault exception (`do_user_addr_fault` on x86_64).
-3. The kernel fault handler dispatches execution to `shmem_fault()` to allocate physical backing pages in RAM for the `tmpfs` inode.
-4. `shmem_fault()` calls `shmem_acct_block()` to verify whether the allocation fits within the mount size limit.
-5. Once `/dev/shm` reaches its 64MB boundary, `shmem_acct_block()` detects that the block count has been exhausted and returns `-ENOSPC` (No space left on device).
-6. Because the application was writing to an already validated `mmap` pointer, returning an error code is impossible at the CPU instruction level. However, triggering the Out-Of-Memory (OOM) killer would be inappropriate because the system itself is not out of RAM—only this specific `tmpfs` quota is full.
-7. Under POSIX specifications, when a page fault on a valid memory mapping cannot be satisfied by the underlying filesystem backing store, the kernel returns `VM_FAULT_SIGBUS`.
-8. The kernel immediately sends signal 7 (`SIGBUS`, `BUS_ADRERR`) to the faulting thread. Because PyTorch worker processes do not intercept `SIGBUS`, the process terminates instantly. The parent DataLoader thread notices the dead worker socket and raises `RuntimeError: DataLoader worker is killed by signal: Bus error`.
+3. The kernel fault handler dispatches execution to `shmem_fault()` to allocate physical backing pages (folios) in RAM for the `tmpfs` inode. In modern kernels (Linux 6.x), this calls `shmem_get_folio_gfp()`.
+4. `shmem_get_folio_gfp()` invokes block accounting (`shmem_acct_blocks`) to verify whether the allocation fits within the mount size limit.
+5. Once `/dev/shm` reaches its 64MB boundary, block accounting fails. As documented in the Linux kernel source comments:
+   > `/* shmem_get_folio reports shmem_acct_block failure as -ENOSPC not -ENOMEM, so that a failure on a sparse tmpfs mapping will give SIGBUS not OOM. */`
+6. Because the application was writing to an already validated `mmap` pointer, returning an error code is impossible at the CPU instruction level. Furthermore, triggering the Out-Of-Memory (OOM) killer would be inappropriate because the system itself is not out of physical RAM—only this specific `tmpfs` quota is full.
+7. Under POSIX specifications, when a page fault on a valid memory mapping cannot be satisfied by the underlying filesystem backing store due to filesystem space exhaustion (`-ENOSPC`), the virtual memory manager returns `VM_FAULT_SIGBUS`.
+8. The kernel immediately sends signal 7 (`SIGBUS`, `BUS_ADRERR`) to the faulting thread without printing any filesystem quota warnings in `dmesg`. Because PyTorch worker processes do not intercept `SIGBUS`, the worker terminates instantly. The parent DataLoader thread notices the dead worker socket and raises `RuntimeError: DataLoader worker is killed by signal: Bus error`.
 
-### 1.4 Mathematical Memory Footprint Model
+### 1.4 Mathematical Memory Footprint Model: Single-Rank vs. Multi-GPU DDP
 
 We can calculate the exact shared memory footprint required by multi-process DataLoader pipelines:
 
 $$M_{\text{shm}} = N_{\text{workers}} \times (\text{prefetch\_factor} + 1) \times B \times C \times H \times W \times S_{\text{dtype}}$$
 
 Where:
-* $N_{\text{workers}}$: Number of active DataLoader worker processes (e.g., 8).
-* $\text{prefetch\_factor}$: Batches loaded in advance per worker (default: 2).
-* $B$: Per-process batch size (e.g., 128).
+* $N_{\text{workers}}$: Number of active DataLoader worker processes per training rank (e.g., 8).
+* $\text{prefetch\_factor}$: Batches loaded in advance per worker (PyTorch default: 2).
+* $B$: Per-rank batch size (e.g., 128).
 * $C, H, W$: Tensor dimensions (e.g., 3 channels, 224 height, 224 width).
 * $S_{\text{dtype}}$: Bytes per element (e.g., 4 bytes for `torch.float32`).
 
-Calculating the memory consumption for a single batch:
+#### Single-Batch Memory Consumption
+Calculating the tensor memory consumption for a single batch:
 
-$$S_{\text{batch}} = 128 \times 3 \times 224 \times 224 \times 4\text{ bytes} = 77{,}070{,}336\text{ bytes} \approx 73.50\text{ MiB}$$
+$$S_{\text{batch}} = 128 \times 3 \times 224 \times 224 \times 4\text{ bytes} = 77{,}070{,}336\text{ bytes} \approx 73.50\text{ MiB}\ (77.07\text{ MB})$$
 
-A single mini-batch consumes **73.50 MiB**, which exceeds Docker's entire 64MB `/dev/shm` quota before worker 1 has even finished assembling its first payload.
+A single mini-batch consumes **73.50 MiB**, which immediately breaches Docker's entire 64MB (`67,108,864` bytes) `/dev/shm` quota before worker 1 has even finished collating its first payload.
 
-With 8 workers and `prefetch_factor = 2`, the DataLoader maintains up to $8 \times (2 + 1) = 24$ batches concurrently in shared memory:
+#### Single-Rank Buffer Accumulation
+With 8 workers and `prefetch_factor = 2`, each worker maintains up to 2 queued prefetched batches plus 1 active in-progress collation batch ($2 + 1 = 3$). A single DataLoader rank maintains up to $8 \times 3 = 24$ batches concurrently in shared memory:
 
-$$M_{\text{shm\_total}} = 24 \times 73.50\text{ MiB} \approx 1{,}764\text{ MiB} \approx 1.72\text{ GiB}$$
+$$M_{\text{single\_rank}} = 24 \times 73.50\text{ MiB} \approx 1{,}764\text{ MiB} \approx 1.72\text{ GiB}$$
 
-Adding target label tensors, data augmentation temporary copies, and pinned memory staging buffers, the required shared memory quickly exceeds 3 to 4 GiB under heavy data ingestion.
+#### Multi-GPU DDP Node-Level Aggregation (8x A100 GPUs)
+In distributed multi-GPU training (e.g., `torchrun --nproc_per_node=8` inside a single Docker container with `--gpus all`), all 8 local ranks share the container's single `/dev/shm` mount:
+
+$$N_{\text{total\_workers}} = 8\text{ ranks} \times 8\text{ workers/rank} = 64\text{ workers}$$
+
+$$\text{Total Concurrent Batches} = 64\text{ workers} \times 3\text{ in-flight batches} = 192\text{ batches}$$
+
+$$M_{\text{ddp\_shm}} = 192 \times 73.50\text{ MiB} \approx 14{,}112\text{ MiB} \approx 13.78\text{ GiB}$$
+
+Adding target label tensors, data augmentation temporary pinned staging buffers, and memory alignment padding (~5–10%), peak shared memory utilization across all 8 ranks reaches **14.5 to 15.2 GiB**.
+
+This mathematical reality proves why the default 64MB is catastrophic, and why allocating **`--shm-size=16g`** (or `16Gi` in Kubernetes) provides the exact necessary headroom for high-throughput 8-GPU Vision Transformer pipelines.
 
 ---
 
@@ -174,8 +187,8 @@ Another frequently recommended forum fix is adding `--ipc=host` to the `docker r
 
 PyTorch provides an alternative sharing strategy: `torch.multiprocessing.set_sharing_strategy('file_system')` [Source: PyTorch Multiprocessing Sharing Strategies Documentation](https://pytorch.org/docs/stable/multiprocessing.html#sharing-strategies).
 
-* **Why It Backfires**: While `file_system` avoids running out of file descriptors (`OSError: [Errno 24] Too many open files`) by using filenames instead of holding open file handles, it **still writes temporary shared memory files directly into `/dev/shm`** (e.g., `/dev/shm/torch_*`).
-* It does not increase the 64MB filesystem limit. Furthermore, if worker processes are abruptly killed or crash, PyTorch's cleanup handlers fail to delete these temporary files, causing orphaned files to accumulate and permanently exhaust `/dev/shm` until the container restarts.
+* **Why It Backfires**: While `file_system` avoids running out of file descriptors (`OSError: [Errno 24] Too many open files`) by using filenames instead of passing open file handles across sockets, it **still writes temporary shared memory files directly into `/dev/shm`** (e.g., `/dev/shm/torch_*`).
+* It does not increase the 64MB filesystem limit. Furthermore, PyTorch relies on a background management process (`torch_shm_manager`) to track and unlink these files. If worker processes are abruptly killed via `SIGKILL`, crash from unhandled native exceptions, or the training job is forcibly interrupted (`Ctrl+C` / SIGINT), `torch_shm_manager` cannot unlink the orphaned files. The stale `/dev/shm/torch_*` files permanently consume `/dev/shm` capacity until the container is restarted or manually purged.
 
 ---
 
@@ -291,17 +304,23 @@ Verify the filesystem mount parameters and shared memory utilization inside the 
 df -h /dev/shm
 
 # Inspect active shared memory allocations by PyTorch
+# NOTE: Under the default 'file_descriptor' strategy, PyTorch calls shm_unlink() immediately
+# after creation, so active allocations will NOT be visible via 'ls -lh /dev/shm'.
+# Use lsof to view in-flight unlinked memory objects held open by active workers:
+lsof /dev/shm
+
+# If using 'file_system' strategy, persistent named files will appear directly:
 ls -lh /dev/shm
 
-# Display active POSIX shared memory segments and semaphores
+# Display active System V shared memory segments and semaphores
 ipcs -m
 ```
 
-Expected output showing the expanded 16GB `tmpfs` volume:
+Expected output showing the expanded 16GB `tmpfs` volume under full 8-GPU DDP training:
 
 ```text
 Filesystem      Size  Used Avail Use% Mounted on
-shm              16G  4.2G   12G  27% /dev/shm
+shm              16G   14G  2.0G  88% /dev/shm
 ```
 
 ### 4.2 Inspecting Kubernetes Pod Shared Memory
@@ -344,10 +363,10 @@ Performance benchmarks conducted across 100 epochs of ViT-H/14 training on 8x NV
 ## 5. Production FAQ & Prevention Checklist
 
 ### How do I size `--shm-size` accurately for a given model?
-Use the sizing formula: $M_{\text{shm}} = N_{\text{workers}} \times (\text{prefetch\_factor} + 1) \times \text{batch\_size} \times \text{sample\_size\_bytes}$. Add a 50% safety margin to account for batch collation overhead, labels, and bounding boxes. For vision datasets with batch size 128 and 8 workers, allocating **16GB** provides ample headroom.
+Use the sizing formula: $M_{\text{shm}} = N_{\text{ranks}} \times N_{\text{workers/rank}} \times (\text{prefetch\_factor} + 1) \times \text{batch\_size} \times \text{sample\_size\_bytes}$. Add a 20–30% safety margin to account for batch collation overhead, labels, and bounding boxes. For an 8-GPU node running 8 ranks with 8 workers per rank and batch size 128, allocating **16GB** provides the necessary headroom.
 
 ### Does allocating `--shm-size=16g` immediately consume 16GB of physical host RAM?
-No. `tmpfs` is a virtual memory filesystem that allocates physical pages lazily on demand. If your training job only uses 4.2GB of shared memory, only 4.2GB of physical host RAM will be consumed. The remaining capacity remains available to the host operating system.
+No. `tmpfs` is a virtual memory filesystem that allocates physical pages lazily on demand upon page fault. If your training job only uses 6GB of shared memory during initial warmup, only 6GB of physical host RAM will be consumed. The remaining capacity remains available to the host operating system.
 
 ### How do I clean up orphaned `torch_*` files if a container crashes?
 When using `torch.multiprocessing.set_sharing_strategy('file_system')`, abnormal process terminations can leave stale `/dev/shm/torch_*` files. Inspect `/dev/shm` with `ls -lah /dev/shm` and remove orphaned files using `rm -f /dev/shm/torch_*`. With `--shm-size=16g`, keep the default `file_descriptor` strategy to let the operating system automatically reclaim shared memory handles when file descriptors close.
