@@ -11,6 +11,7 @@ fact_check_sources:
   - "https://openjdk.org/jeps/387"
   - "https://openjdk.org/jeps/122"
   - "https://openjdk.org/jeps/363"
+  - "https://openjdk.org/jeps/439"
   - "https://docs.oracle.com/en/java/javase/21/docs/specs/jvms/se21/html/jvms-5.html#jvms-5.3"
   - "https://docs.oracle.com/en/java/javase/21/vm/native-memory-tracking.html"
   - "https://docs.kernel.org/admin-guide/cgroup-v2.html"
@@ -20,20 +21,21 @@ fact_check_sources:
 ```text
 2026-11-08T02:14:09.114Z [http-nio-8080-exec-42] ERROR org.apache.catalina.core.ContainerBase - Servlet.service() for servlet [dispatcherServlet] in context with path [] threw exception
 java.lang.OutOfMemoryError: Metaspace
-    at java.base/java.lang.ClassLoader.defineClass1(Native Method)
-    at java.base/java.lang.ClassLoader.defineClass(ClassLoader.java:1017)
-    at java.base/java.security.SecureClassLoader.defineClass(SecureClassLoader.java:150)
-    at java.base/jdk.internal.loader.BuiltinClassLoader.defineClass(BuiltinClassLoader.java:862)
-    at net.bytebuddy.dynamic.loading.ByteArrayClassLoader.findClass(ByteArrayClassLoader.java:401)
-    at java.base/java.lang.ClassLoader.loadClass(ClassLoader.java:587)
-    at org.springframework.cglib.core.ReflectUtils.defineClass(ReflectUtils.java:574)
-    at org.springframework.cglib.core.AbstractClassGenerator.generate(AbstractClassGenerator.java:363)
-    at org.springframework.cglib.proxy.Enhancer.generate(Enhancer.java:585)
-    at org.springframework.cglib.core.AbstractClassGenerator$ClassLoaderData.get(AbstractClassGenerator.java:152)
-    at org.springframework.cglib.core.AbstractClassGenerator.create(AbstractClassGenerator.java:319)
-    at org.springframework.cglib.proxy.Enhancer.createHelper(Enhancer.java:572)
-    at org.springframework.cglib.proxy.Enhancer.create(Enhancer.java:387)
-    at com.ideaspot360.rules.DynamicValidatorFactory.getValidator(DynamicValidatorFactory.java:48)
+	at java.base/java.lang.ClassLoader.defineClass1(Native Method)
+	at java.base/java.lang.ClassLoader.defineClass(ClassLoader.java:1017)
+	at java.base/java.security.SecureClassLoader.defineClass(SecureClassLoader.java:150)
+	at java.base/jdk.internal.loader.BuiltinClassLoader.defineClass(BuiltinClassLoader.java:862)
+	at java.base/jdk.internal.loader.ClassLoaders$AppClassLoader.defineClass(ClassLoaders.java:176)
+	at java.base/java.lang.ClassLoader.defineClass(ClassLoader.java:893)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+	at org.springframework.cglib.core.ReflectUtils.defineClass(ReflectUtils.java:574)
+	at org.springframework.cglib.core.AbstractClassGenerator.generate(AbstractClassGenerator.java:363)
+	at org.springframework.cglib.proxy.Enhancer.generate(Enhancer.java:585)
+	at org.springframework.cglib.core.AbstractClassGenerator$ClassLoaderData.get(AbstractClassGenerator.java:152)
+	at org.springframework.cglib.core.AbstractClassGenerator.create(AbstractClassGenerator.java:319)
+	at org.springframework.cglib.proxy.Enhancer.createHelper(Enhancer.java:572)
+	at org.springframework.cglib.proxy.Enhancer.create(Enhancer.java:387)
+	at com.ideaspot360.rules.DynamicValidatorFactory.getValidator(DynamicValidatorFactory.java:48)
 ```
 
 Inspecting the host kernel ring buffer reveals immediate cgroup termination:
@@ -192,25 +194,23 @@ The resulting NMT diff revealed continuous expansion in Metaspace allocations:
 Inspecting class loaders using `jcmd 1 VM.classloader_stats`:
 
 ```text
-ClassLoader         Parent              CLD*               Classes   ChunkSz   BlockSz
---------------------------------------------------------------------------------------
-<bootstrap>         null                0x00007f3a8c010    3210      14.2MB    12.8MB
-org.springframework net.bytebuddy...    0x00007f3a9a140    1         16.0KB    8.2KB
-org.springframework net.bytebuddy...    0x00007f3a9a210    1         16.0KB    8.2KB
-org.springframework net.bytebuddy...    0x00007f3a9a2f0    1         16.0KB    8.2KB
-... [24,000 distinct ByteArrayClassLoader instances]
+ClassLoader         Parent              CLD*               Classes   ChunkSz   BlockSz   Type
+-------------------------------------------------------------------------------------------------------------------------
+0x0000000000000000  null                0x00007f3a8c010    3210      14.2MB    12.8MB    <boot class loader>
+0x000000080004e900  null                0x00007f3a8c030    142       1.2MB     890KB     jdk.internal.loader.ClassLoaders$PlatformClassLoader
+0x000000080004e8b0  0x000000080004e900  0x00007f3a8c050    52490     482.0MB   441.2MB   jdk.internal.loader.ClassLoaders$AppClassLoader
 ```
 
-Executing `jcmd 1 VM.metaspace show-loaders=true scale=KB` confirmed that each isolated loader held an allocated 16 KB chunk:
+Executing `jcmd 1 VM.metaspace show-loaders=true scale=KB` confirmed that the application class loader arena was holding nearly the entire allocated native space:
 
 ```text
 jcmd 1 VM.metaspace show-loaders=true scale=KB
 ...
-ClassLoader: net.bytebuddy.dynamic.loading.ByteArrayClassLoader @ 0x00007f3a9a140
-  Classes: 1
-  Chunk size: 16.00 KB
-  Block size: 8.20 KB
-  Waste: 7.80 KB
+ClassLoader: jdk.internal.loader.ClassLoaders$AppClassLoader @ 0x000000080004e8b0
+  Classes: 52490 (accumulating uncached CGLIB proxy definitions)
+  Chunk size: 493568 KB (482.00 MB)
+  Block size: 451788 KB (441.20 MB)
+  Waste: 41780 KB (40.80 MB)
 ```
 
 ### The Source Code Antipattern
@@ -225,7 +225,9 @@ enhancer.setUseCache(false); // CRITICAL BUG: Bypasses CGLIB Class Cache!
 RuleValidator validator = (RuleValidator) enhancer.create();
 ```
 
-By explicitly invoking `enhancer.setUseCache(false)`, CGLIB generated a new runtime bytecode definition and instantiated a dedicated `ByteArrayClassLoader` on every HTTP request. Because generated validator proxies were referenced by active user session security contexts, none of the 24,000 ClassLoaders were eligible for garbage collection. Each loader retained a dedicated 16 KB Metachunk arena until the 512 MiB limit was breached.
+By explicitly invoking `enhancer.setUseCache(false)`, CGLIB completely bypassed its internal proxy cache. On every HTTP request, CGLIB generated fresh bytecode (`RuleValidator$$EnhancerByCGLIB$$<hash>`) and invoked `ReflectUtils.defineClass` to define it into `RuleValidator`'s class loader—which is the JVM's `AppClassLoader`. 
+
+Because `AppClassLoader` is a system root loader that lives for the entire application lifetime, **Condition 3 of JVMS §5.3 can never be met**. Even when proxy instances were collected from the Java heap after request completion, every corresponding `Klass` metadata structure remained permanently anchored in Metaspace native memory, linearly exhausting the 512 MiB limit until the service crashed.
 
 ---
 
@@ -242,7 +244,9 @@ Obsolete CMS flags were eliminated. Metaspace sizing was constrained within cont
  -Xms2048m
  -Xmx2048m
 --XX:MaxMetaspaceSize=1024m
++# Metaspace High-Water Mark (Initial GC threshold, avoids early STW storms)
 +-XX:MetaspaceSize=128m
++# Hard Metaspace ceiling constrained strictly within container cgroup
 +-XX:MaxMetaspaceSize=384m
 +-XX:CompressedClassSpaceSize=256m
  
@@ -258,14 +262,16 @@ Obsolete CMS flags were eliminated. Metaspace sizing was constrained within cont
 +-XX:HeapDumpPath=/var/log/jvm/heapdump.hprof
 ```
 
+**Key Architectural Insight**: In HotSpot, `-XX:MetaspaceSize` does not pre-allocate physical RAM; it acts as the **initial high-water mark** (`capacity_until_GC`). When Metaspace usage crosses this mark, the JVM triggers a GC cycle to prune dead class loaders. Setting it to `128m` prevents startup Full GC thrashing while `-XX:MaxMetaspaceSize=384m` protects container cgroup limits.
+
 ### B. Application Layer: Proxy & ClassLoader Caching Diff
 
-Dynamic proxy generation was refactored to cache compiled `Class<?>` references by rule key:
+Dynamic proxy generation was refactored to cache compiled `Class<?>` references by rule key, and `Enhancer.registerCallbacks` was wrapped in a `try ... finally` block to prevent thread-local leakage on Tomcat worker threads:
 
 ```diff
  public class DynamicValidatorFactory {
  
--    // Leaking implementation: creates an isolated ClassLoader per call
+-    // Leaking implementation: creates an uncached Class definition per call
 -    public static RuleValidator getValidator(SecurityRule rule) {
 -        Enhancer enhancer = new Enhancer();
 -        enhancer.setSuperclass(RuleValidator.class);
@@ -285,8 +291,14 @@ Dynamic proxy generation was refactored to cache compiled `Class<?>` references 
 +            return enhancer.createClass();
 +        });
 +
++        // Bind callbacks to CGLIB ThreadLocal storage and immediately clear in finally
++        // to eliminate ThreadLocal leaks on pooled Tomcat worker threads (http-nio-8080-exec-*)
 +        Enhancer.registerCallbacks(proxyClass, new Callback[]{new SecurityInterceptor(rule)});
-+        return (RuleValidator) ObjenesisHelper.newInstance(proxyClass);
++        try {
++            return (RuleValidator) ObjenesisHelper.newInstance(proxyClass);
++        } finally {
++            Enhancer.registerCallbacks(proxyClass, null);
++        }
 +    }
  }
 ```
@@ -353,6 +365,12 @@ A 72-hour synthetic stress test running 5,000,000 security rule validation reque
 
 When Metaspace expands indefinitely, caching generated proxy classes and ensuring dynamic ClassLoaders can be collected by GC resolves the root cause without inflating `-XX:MaxMetaspaceSize` into container cgroup limits.
 
+### Architectural Consideration: Generational ZGC (JEP 439) vs G1GC
+
+For workloads running on OpenJDK 21 with Generational ZGC (`-XX:+UseZGC -XX:+ZGenerational` [Source: OpenJDK JEP 439 — Generational ZGC](https://openjdk.org/jeps/439)), a critical operational nuance in class unloading must be accounted for:
+* **Young vs Old Collections**: In Generational ZGC, frequent young-generation cycles focus strictly on short-lived heap allocations to maintain sub-millisecond pause times and intentionally skip heavy reference processing and class unloading.
+* **Class Unloading Cadence**: Dead class loaders and unreferenced dynamic classes are only swept during concurrent **Old Generation** collections. If an application rapidly defines dynamic classes faster than old-generation collection triggers, Metaspace usage can climb precipitously. Operators adopting Generational ZGC should size `-XX:MetaspaceSize` with an adequate headroom buffer to prevent triggering premature OOM before concurrent old-generation marking finishes uncommitting Elastic Metaspace chunks.
+
 ---
 
 ### References & Official Specifications
@@ -360,6 +378,7 @@ When Metaspace expands indefinitely, caching generated proxy classes and ensurin
 * [Source: OpenJDK JEP 387 — Elastic Metaspace](https://openjdk.org/jeps/387)
 * [Source: OpenJDK JEP 122 — Remove the Permanent Generation](https://openjdk.org/jeps/122)
 * [Source: OpenJDK JEP 363 — Remove the Concurrent Mark Sweep Garbage Collector](https://openjdk.org/jeps/363)
+* [Source: OpenJDK JEP 439 — Generational ZGC](https://openjdk.org/jeps/439)
 * [Source: The Java® Virtual Machine Specification Java SE 21 Edition — §5.3 Creation and Loading](https://docs.oracle.com/en/java/javase/21/docs/specs/jvms/se21/html/jvms-5.html#jvms-5.3)
 * [Source: OpenJDK HotSpot Native Memory Tracking Reference](https://docs.oracle.com/en/java/javase/21/vm/native-memory-tracking.html)
 * [Source: Linux Kernel Documentation — Control Group v2 Memory Interface](https://docs.kernel.org/admin-guide/cgroup-v2.html)
