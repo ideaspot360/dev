@@ -3,12 +3,14 @@ layout: post
 title: "Fixing MySQL Deadlock in High-Concurrency Transactions: Gap Locks vs Next-Key Locks"
 date: 2026-11-09 10:14:38 +0900
 category: "Database & Storage"
-tags: [mysql, inno-db, deadlock, gap-lock, next-key-lock, transaction-isolation, database-tuning, performance]
+tags: [mysql, innodb, deadlock, gap-lock, next-key-lock, transaction-isolation, database-tuning, performance]
 author: "IdeaSpot360 Engineering Notes"
 excerpt: "When concurrent INSERT statements fail with MySQL Error 1213 (Deadlock found when trying to get lock), application retries only worsen lock contention. Here is how InnoDB Gap Locks, Next-Key Locks, and Insert Intention Locks interact, and how transitioning to READ COMMITTED and atomic idempotency eliminates deadlocks."
 verification_date: "2026-11-23"
 fact_check_sources:
   - "https://dev.mysql.com/doc/refman/8.0/en/innodb-locking.html"
+  - "https://dev.mysql.com/doc/refman/8.0/en/innodb-locks-set.html"
+  - "https://dev.mysql.com/doc/refman/8.0/en/insert-on-duplicate.html"
   - "https://dev.mysql.com/doc/refman/8.0/en/innodb-deadlocks.html"
   - "https://dev.mysql.com/doc/refman/8.0/en/innodb-deadlock-detection.html"
   - "https://dev.mysql.com/doc/refman/8.0/en/innodb-transaction-isolation-levels.html"
@@ -130,12 +132,12 @@ In an order ingestion pipeline under 3,200 requests/sec, concurrent transactions
 
 Engineers inspecting the transaction parameters were confused: Transaction 1 attempted to insert row `id = 502`, while Transaction 2 attempted to insert row `id = 508`. Because the two operations operated on mutually distinct primary keys, naive intuition suggested that row-level locking would execute concurrently without contention.
 
-However, prior to issuing the `INSERT`, the business logic executed an application-level uniqueness pre-check to prevent duplicate sequence assignment:
+However, prior to issuing the `INSERT`, the business logic executed an application-level uniqueness pre-check to verify whether any order IDs had already been claimed in the current allocation batch (orders $[501, 510]$ after the last committed record $id = 500$):
 
 ```sql
 -- Transaction 1
 START TRANSACTION;
-SELECT id FROM orders WHERE id BETWEEN 500 AND 510 FOR UPDATE;
+SELECT id FROM orders WHERE id BETWEEN 501 AND 510 FOR UPDATE;
 INSERT INTO orders (id, user_id, order_no, status, created_at) 
 VALUES (502, 1082, 'ORD-20261109-01', 'PENDING', NOW());
 COMMIT;
@@ -144,7 +146,7 @@ COMMIT;
 ```sql
 -- Transaction 2
 START TRANSACTION;
-SELECT id FROM orders WHERE id BETWEEN 500 AND 510 FOR UPDATE;
+SELECT id FROM orders WHERE id BETWEEN 501 AND 510 FOR UPDATE;
 INSERT INTO orders (id, user_id, order_no, status, created_at) 
 VALUES (508, 1083, 'ORD-20261109-02', 'PENDING', NOW());
 COMMIT;
@@ -164,6 +166,7 @@ InnoDB does not merely lock rows; it locks physical records within index B-trees
 
 1. **Record Lock (`X,REC_NOT_GAP`)**: Locks the index record itself. It does not protect the gap before or after the record.
 2. **Gap Lock (`X,GAP`)**: Locks the gap *before* an index record (or the gap before the pseudo-record `supremum` for intervals extending to infinity). Its sole purpose is to prevent concurrent transactions from inserting new rows into that specific range.
+   * **Physical Anchoring**: In InnoDB's physical B-tree leaf layout, a gap lock does not float freely in memory; it is physically anchored to the lock bitmap of the index record that immediately follows the gap [Source: MySQL 8.0 Reference Manual](https://dev.mysql.com/doc/refman/8.0/en/innodb-locking.html). For intervals extending beyond the maximum existing primary key, InnoDB anchors the gap lock to the **`supremum` pseudo-record** (a reserved record on the leaf page representing $+\infty$).
    * **Crucial Rule**: *Gap locks are purely non-conflicting with other gap locks*. A shared gap lock (`S,GAP`) and an exclusive gap lock (`X,GAP`) perform identically. Two concurrent transactions can hold conflicting exclusive gap locks on the exact same gap without blocking each other [Source: MySQL 8.0 InnoDB Locking](https://dev.mysql.com/doc/refman/8.0/en/innodb-locking.html).
 3. **Next-Key Lock (`X`)**: A compound lock consisting of a Record Lock on the index entry combined with a Gap Lock on the gap immediately preceding that record:
    $$\text{Next-Key Lock on } R_k = \text{Gap Lock on } (R_{k-1}, R_k) + \text{Record Lock on } R_k$$
@@ -194,11 +197,11 @@ Index State:  [ ... ] -> [ 500 ] -------- GAP (500, 515) --------> [ 515 ] -> [ 
 ```
 
 1. **Step $t_1$ (Trx 1 Range Lock)**:
-   Transaction 1 issues `SELECT id FROM orders WHERE id BETWEEN 500 AND 510 FOR UPDATE;`.
-   Because no record exists with $id \in [501, 510]$, InnoDB scans to the next existing index record, which is $515$. InnoDB places a Next-Key Lock on $515$, which includes an exclusive **Gap Lock on $(500, 515)$**.
+   Transaction 1 issues `SELECT id FROM orders WHERE id BETWEEN 501 AND 510 FOR UPDATE;`.
+   Because the last committed order was $R_1 = 500$, no record exists with $id \in [501, 510]$. InnoDB navigates the clustered index B-tree and scans forward to the first existing record beyond the search boundary, which is $R_2 = 515$. Because record 515 does not match the predicate condition ($515 > 510$), InnoDB does not lock record 515 itself; instead, it places an exclusive **Gap Lock on $(500, 515)$** anchored to record 515 (`LOCK_MODE = X,GAP`, `LOCK_DATA = 515`).
 2. **Step $t_2$ (Trx 2 Range Lock)**:
-   Transaction 2 executes the same query. Because Gap Locks are mutually compatible (Gap-Gap conflict = False), Transaction 2 is immediately granted an overlapping **Gap Lock on $(500, 515)$**.
-   *Both transactions now concurrently hold a Gap Lock on $(500, 515)$*.
+   Transaction 2 executes the same range query. Because Gap Locks are mutually compatible (Gap-Gap conflict = False), Transaction 2 is immediately granted an overlapping **Gap Lock on $(500, 515)$**. Neither transaction blocks on an existing row because no row in $[501, 510]$ was present.
+   *Both transactions now concurrently hold an exclusive Gap Lock on $(500, 515)$*.
 3. **Step $t_3$ (Trx 1 Insert Attempt)**:
    Transaction 1 executes `INSERT INTO orders VALUES (502, ...)`.
    To insert at $502 \in (500, 515)$, InnoDB requests an **Insert Intention Lock** on the gap before $515$.
@@ -282,8 +285,8 @@ Resolving gap lock deadlocks requires a dual approach: tuning the database trans
 
 In write-heavy OLTP workloads, Gap Locking in `REPEATABLE READ` introduces severe concurrency bottlenecks. Transitioning the database engine to `READ COMMITTED` completely disables gap locking during search and index scans [Source: MySQL 8.0 Transaction Isolation Levels](https://dev.mysql.com/doc/refman/8.0/en/innodb-transaction-isolation-levels.html).
 
-* Under `READ COMMITTED`, InnoDB acquires only **Record Locks (`X,REC_NOT_GAP`)** for matching rows. Gap locks are only used for foreign-key constraint validation and duplicate-key checks.
-* **Prerequisite**: Row-Based Binary Logging (`binlog_format = ROW`) is strictly required to prevent replication inconsistencies [Source: MySQL 8.0 Reference Manual](https://dev.mysql.com/doc/refman/8.0/en/innodb-transaction-isolation-levels.html).
+* Under `READ COMMITTED`, InnoDB acquires only **Record Locks (`X,REC_NOT_GAP`)** for matching rows. Gap locks are disabled for standard searches and index scans.
+* **Prerequisite**: Row-Based Binary Logging (`binlog_format = ROW`) is strictly required to prevent replication inconsistencies [Source: MySQL 8.0 Reference Manual](https://dev.mysql.com/doc/refman/8.0/en/innodb-transaction-isolation-levels.html). (Note: `binlog_format` is officially deprecated as of MySQL 8.0.34 in anticipation of MySQL 8.4 LTS, where `ROW` is the mandatory default).
 
 ```diff
 # /etc/mysql/mysql.conf.d/mysqld.cnf
@@ -295,10 +298,10 @@ In write-heavy OLTP workloads, Gap Locking in `REPEATABLE READ` introduces sever
 + innodb_print_all_deadlocks = ON
 ```
 
-Verify dynamic runtime application without database restart:
+Verify dynamic runtime application without database restart using MySQL 8.0 `SET PERSIST` (which records variables into `mysqld-auto.cnf` across daemon restarts):
 
 ```sql
-SET GLOBAL transaction_isolation = 'READ-COMMITTED';
+SET PERSIST transaction_isolation = 'READ-COMMITTED';
 SET GLOBAL binlog_format = 'ROW';
 ```
 
@@ -313,19 +316,19 @@ Instead of executing speculative `SELECT ... FOR UPDATE` queries that lock non-e
      public Order createOrder(Order order) {
 -        // FLAWED APPROACH: Speculative range check under REPEATABLE READ acquires gap locks
 -        String checkSql = "SELECT id FROM orders WHERE id BETWEEN ? AND ? FOR UPDATE";
--        List<Long> existingIds = jdbcTemplate.queryForList(checkSql, Long.class, order.getId() - 5, order.getId() + 5);
+-        List<Long> existingIds = jdbcTemplate.queryForList(checkSql, Long.class, 501L, 510L);
 -        if (!existingIds.isEmpty() && existingIds.contains(order.getId())) {
 -            throw new DuplicateOrderException("Order ID collision detected");
 -        }
 -        String insertSql = "INSERT INTO orders (id, user_id, order_no, status, created_at) VALUES (?, ?, ?, ?, ?)";
 -        jdbcTemplate.update(insertSql, order.getId(), order.getUserId(), order.getOrderNo(), order.getStatus(), order.getCreatedAt());
-+        // PRODUCTION FIX: Atomic idempotency utilizing UNIQUE index on order_no
++        // PRODUCTION FIX: Atomic idempotency utilizing modern MySQL 8.0 row alias syntax
 +        String upsertSql = """
 +            INSERT INTO orders (id, user_id, order_no, status, created_at)
-+            VALUES (?, ?, ?, ?, ?)
++            VALUES (?, ?, ?, ?, ?) AS new_orders
 +            ON DUPLICATE KEY UPDATE
-+                status = VALUES(status),
-+                created_at = VALUES(created_at)
++                status = new_orders.status,
++                created_at = new_orders.created_at
 +            """;
 +        jdbcTemplate.update(upsertSql, order.getId(), order.getUserId(), order.getOrderNo(), order.getStatus(), order.getCreatedAt());
          return order;
@@ -333,7 +336,15 @@ Instead of executing speculative `SELECT ... FOR UPDATE` queries that lock non-e
  }
 ```
 
-By removing the range scan, no gap locks are placed on $(500, 515)$. Each transaction directly executes its atomic insert. If an identical `order_no` arrives concurrently, the `UNIQUE KEY uk_order_no` safely resolves the collision via row-level record locking rather than uncoordinated gap lock cycles.
+#### Modern MySQL 8.0 Alias Syntax & Deep Locking Mechanics
+1. **Modern Row Alias Syntax (`AS new_orders`)**: In MySQL 8.0.20+, referencing columns via `VALUES(col_name)` in `ON DUPLICATE KEY UPDATE` is formally deprecated (`ER_WARN_DEPRECATED_SYNTAX_NO_REPLACEMENT`) [Source: MySQL 8.0 Reference Manual — INSERT ... ON DUPLICATE KEY UPDATE Statement](https://dev.mysql.com/doc/refman/8.0/en/insert-on-duplicate.html). The modern standard declares a row alias after the `VALUES` clause (`VALUES (...) AS new_orders`) and accesses incoming fields directly (`new_orders.status`).
+2. **Clustered Primary Key vs Unique Secondary Index Locking**:
+   Under MySQL's internal lock rules [Source: MySQL 8.0 Reference Manual — Locks Set by Different SQL Statements in InnoDB](https://dev.mysql.com/doc/refman/8.0/en/innodb-locks-set.html):
+   * When an `ON DUPLICATE KEY UPDATE` collision occurs on the clustered **PRIMARY KEY**, InnoDB acquires an **exclusive record-only lock (`X,REC_NOT_GAP`)** on the existing row, introducing zero gap locks.
+   * When a duplicate collision occurs on a **UNIQUE SECONDARY KEY** (`uk_order_no`), InnoDB acquires an **exclusive Next-Key Lock (`X`)**, locking both the secondary index record and the preceding gap.
+   * **Foreign Key & Duplicate Checks under `READ COMMITTED`**: While `READ COMMITTED` eliminates gap locking for regular search queries and index scans, InnoDB **explicitly retains gap locking for duplicate-key checks and foreign-key constraint validations** [Source: MySQL 8.0 Reference Manual — Transaction Isolation Levels](https://dev.mysql.com/doc/refman/8.0/en/innodb-transaction-isolation-levels.html). Removing speculative range pre-checks ensures that standard insert flows operate exclusively with atomic record locks, completely eliminating the circular gap lock wait graph.
+
+By removing the range scan, no gap locks are placed on $(500, 515)$. Each transaction directly executes its atomic insert. When unique record insertions occur without artificial gap scans, lock acquisition proceeds in sub-millisecond execution cycles.
 
 ---
 
@@ -351,15 +362,18 @@ mysql -u root -p -e "SELECT @@GLOBAL.transaction_isolation, @@SESSION.transactio
 mysql -u root -p -e "
 SELECT 
     w.REQUESTING_ENGINE_TRANSACTION_ID AS waiting_trx,
+    req.LOCK_MODE AS waiting_mode,
+    req.LOCK_DATA AS waiting_data,
     w.BLOCKING_ENGINE_TRANSACTION_ID AS blocking_trx,
-    l.OBJECT_NAME,
-    l.INDEX_NAME,
-    l.LOCK_TYPE,
-    l.LOCK_MODE,
-    l.LOCK_STATUS
+    blk.LOCK_MODE AS blocking_mode,
+    blk.LOCK_DATA AS blocking_data,
+    req.OBJECT_NAME,
+    req.INDEX_NAME
 FROM performance_schema.data_lock_waits w
-JOIN performance_schema.data_locks l 
-    ON w.REQUESTING_ENGINE_LOCK_ID = l.ENGINE_LOCK_ID;
+JOIN performance_schema.data_locks req 
+    ON w.REQUESTING_ENGINE_LOCK_ID = req.ENGINE_LOCK_ID
+JOIN performance_schema.data_locks blk 
+    ON w.BLOCKING_ENGINE_LOCK_ID = blk.ENGINE_LOCK_ID;
 "
 
 # 3. Check MySQL service status and network port bindings
@@ -392,6 +406,8 @@ By understanding the exact compatibility semantics of InnoDB Gap Locks and Next-
 ## References
 
 * [MySQL 8.0 Reference Manual — 17.7.1 InnoDB Locking](https://dev.mysql.com/doc/refman/8.0/en/innodb-locking.html)
+* [MySQL 8.0 Reference Manual — 17.7.3 Locks Set by Different SQL Statements in InnoDB](https://dev.mysql.com/doc/refman/8.0/en/innodb-locks-set.html)
+* [MySQL 8.0 Reference Manual — 15.2.7.2 INSERT ... ON DUPLICATE KEY UPDATE Statement](https://dev.mysql.com/doc/refman/8.0/en/insert-on-duplicate.html)
 * [MySQL 8.0 Reference Manual — 17.7.5 Deadlocks in InnoDB](https://dev.mysql.com/doc/refman/8.0/en/innodb-deadlocks.html)
 * [MySQL 8.0 Reference Manual — 17.7.5.2 Deadlock Detection](https://dev.mysql.com/doc/refman/8.0/en/innodb-deadlock-detection.html)
 * [MySQL 8.0 Reference Manual — 17.7.2.1 Transaction Isolation Levels](https://dev.mysql.com/doc/refman/8.0/en/innodb-transaction-isolation-levels.html)
