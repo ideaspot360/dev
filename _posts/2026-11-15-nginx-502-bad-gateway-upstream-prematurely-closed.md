@@ -15,12 +15,14 @@ fact_check_sources:
   - "https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_http_version"
   - "https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_set_header"
   - "https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_next_upstream"
+  - "https://nginx.org/en/docs/http/ngx_http_core_module.html#keepalive_timeout"
   - "https://docs.spring.io/spring-boot/appendix/application-properties/index.html#appendix.application-properties.server"
   - "https://nodejs.org/api/http.html#serverkeepalivetimeout"
   - "https://docs.gunicorn.org/en/stable/settings.html#keepalive"
   - "https://pkg.go.dev/net/http#Server"
   - "https://www.rfc-editor.org/rfc/rfc9293.html"
   - "https://www.rfc-editor.org/rfc/rfc9110.html"
+  - "https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/"
 ---
 
 Intermittent `502 Bad Gateway` errors with `upstream prematurely closed connection while reading response header from upstream` are notoriously difficult to isolate during production triage. They manifest exclusively under sustained concurrency, while upstream application performance indicators—such as CPU utilization, heap residency, garbage collection pauses, and database connection pool availability—remain entirely normal.
@@ -88,11 +90,13 @@ t5 │ Nginx recv() triggers ECONNRESET (104)                                │
 ```
 
 ### The RFC 9293 Invariant on Half-Closed Sockets
-Under RFC 9293 (Section 3.6.1, which updates and consolidates RFC 793), when an endpoint initiates a passive or active close of a TCP socket, its internal state transitions through `FIN_WAIT_1`, `FIN_WAIT_2`, or `CLOSE_WAIT` [Source: RFC 9293 - Connection Termination](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.6.1). 
+Under RFC 9293 (which updates and consolidates RFC 793), connection termination operates independently in each direction [Source: RFC 9293 - Connection Termination](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.6). When an endpoint initiates an active close by calling `close()`, its socket state transitions from `ESTABLISHED` through `FIN_WAIT_1` and `FIN_WAIT_2` (or `CLOSING` / `TIME_WAIT`). Conversely, a peer receiving that `FIN` performs a passive close, transitioning from `ESTABLISHED` to `CLOSE_WAIT` and subsequently `LAST_ACK` [Source: RFC 9293 - Connection State Machine](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.3.2).
 
-If an application closes the socket descriptor while incoming segment bytes arrive across the wire, or if new data packets are received after a connection termination handshake has started, the operating system's TCP stack cannot deliver the payload to any active application-level buffer. The protocol implementation mandates an immediate transmission of a `TCP RST` (Reset) segment to indicate unrecoverable data loss [Source: RFC 9293 - Reset Generation](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.6.1).
+RFC 9293 Section 3.6.1 explicitly governs the half-closed operational condition: while a peer that sent `FIN` may theoretically continue to receive incoming data, an application calling `close()` executes a half-duplex close that destroys its user-space socket descriptor and reader buffer [Source: RFC 9293 - Half-Closed Connections](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.6.1). 
 
-When Nginx dispatches an outbound HTTP request on a pre-existing pooled socket, it calls `writev()` on the file descriptor. If the remote peer's `FIN` is in flight, the local socket still registers as writable (`POLLOUT`). The outbound `TCP PSH+ACK` packet crosses the incoming `TCP FIN` packet on the wire. When the backend kernel receives data on a socket whose receive buffer has already been discarded by `close()`, it immediately emits `TCP RST`.
+If an application closes the socket while incoming segment bytes arrive across the wire, or if new data packets are received after a connection termination handshake has started, the operating system's TCP stack cannot deliver the payload to any active application-level buffer. In accordance with RFC 9293 Section 3.5.2 (Reset Generation) and Section 3.6.1, the kernel implementation mandates an immediate transmission of a `TCP RST` (Reset) segment to signal unrecoverable data loss [Source: RFC 9293 - Reset Generation](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.5.2).
+
+When Nginx dispatches an outbound HTTP request on a pre-existing pooled socket, it calls `writev()` on the file descriptor. If the remote peer's `FIN` is in flight, the local socket still registers as writable (`POLLOUT`). The outbound `TCP PSH+ACK` packet crosses the incoming `TCP FIN` packet on the wire. When the backend kernel receives data on a socket whose receive buffer has already been discarded by `close()`, `tcp_v4_send_reset()` immediately emits `TCP RST` with sequence number derived from the incoming acknowledgment field (`th->ack_seq`).
 
 Nginx, awaiting the HTTP status line via `epoll_wait()`, invokes `recv()` on the socket descriptor. The system call aborts with error code `104: Connection reset by peer` (`ECONNRESET`). Because Nginx has already transmitted the request headers to the backend and cannot determine whether the upstream executed partial transaction logic, it logs `upstream prematurely closed connection while reading response header from upstream` and returns `502 Bad Gateway` to the downstream client [Source: Nginx Documentation - ngx_http_proxy_module](https://nginx.org/en/docs/http/ngx_http_proxy_module.html).
 
@@ -144,14 +148,25 @@ sysctl -w net.ipv4.tcp_keepalive_time=60
 ```
 * **Why It Fails**: Linux kernel TCP keepalive (`SO_KEEPALIVE`) operates strictly at Layer 4 to detect dead physical links and unreachable peers by sending empty ACK probes with sequence number $SEG.UNA - 1$ [Source: RFC 9293 - Keep-Alive Probes](https://www.rfc-editor.org/rfc/rfc9293.html). It does not trigger application-level HTTP idle timeouts. Application servers such as Tomcat, Node.js, and Gunicorn manage HTTP keepalive timeouts entirely within application space using software event timers. Modifying kernel L4 parameters has no bearing on L7 keepalive race conditions.
 
+### Misstep 4: Configuring `keepalive_timeout` in the Wrong Nginx Block (`http` / `server`)
+Engineers frequently configure `keepalive_timeout 55s;` within the top-level `http` or `server` blocks and assume upstream keepalive timeouts are solved:
+```nginx
+# Ineffective: Only configures downstream client keep-alive, not upstream pooling
+http {
+    keepalive_timeout 55s;
+    ...
+}
+```
+* **Why It Fails**: In Nginx, `keepalive_timeout` declared in the `http`, `server`, or `location` contexts belongs to `ngx_http_core_module` and configures the timeout during which a **downstream client** connection will stay open on the server side (default: 75 seconds) [Source: Nginx Documentation - Core Functionality](https://nginx.org/en/docs/http/ngx_http_core_module.html#keepalive_timeout). It has zero effect on the upstream connection pool. To configure the idle timeout between Nginx and upstream backend servers, `keepalive_timeout` must be declared specifically inside the `upstream { ... }` directive block, which was introduced in Nginx 1.15.3 [Source: Nginx Documentation - ngx_http_upstream_module](https://nginx.org/en/docs/http/ngx_http_upstream_module.html#keepalive_timeout).
+
 ---
 
 ## 3. Remediation Strategy & Production Implementation
 
-Permanent resolution requires a two-fold engineering strategy:
+Permanent resolution requires a three-fold engineering strategy:
 1. Establish explicit upstream connection pooling in Nginx with conservative keepalive timers.
 2. Synchronize all upstream backend runtimes so their keepalive idle timeout exceeds Nginx's upstream keepalive timeout by at least 10 seconds.
-3. Configure `proxy_next_upstream` retry policies to handle any anomalous transient TCP resets safely.
+3. Configure `proxy_next_upstream` retry policies with robust idempotency safeguards to handle anomalous transient TCP resets safely.
 
 ### 1) Nginx Reverse Proxy Remediation (`/etc/nginx/conf.d/upstream.conf`)
 
@@ -159,14 +174,14 @@ By default, Nginx communicates with upstream servers using **HTTP/1.0** and inje
 
 To enable upstream connection pooling, you must:
 1. Define the `keepalive` directive inside the `upstream` block to specify the cache capacity of idle connections per worker process [Source: Nginx Documentation - ngx_http_upstream_module](https://nginx.org/en/docs/http/ngx_http_upstream_module.html#keepalive).
-2. Set `keepalive_timeout` in the `upstream` block to **55 seconds** (lower than the backend's 65 seconds).
-3. Set `proxy_http_version 1.1;` and `proxy_set_header Connection "";` in the `location` block to preserve persistent connections [Source: Nginx Documentation - ngx_http_upstream_module](https://nginx.org/en/docs/http/ngx_http_upstream_module.html).
-4. Configure `proxy_next_upstream` with `invalid_header http_502 non_idempotent` to retry failed requests transparently across healthy upstream nodes.
+2. Set `keepalive_timeout` in the `upstream` block to **55 seconds** (lower than the backend's 65 seconds) [Source: Nginx Documentation - ngx_http_upstream_module](https://nginx.org/en/docs/http/ngx_http_upstream_module.html#keepalive_timeout).
+3. Set `proxy_http_version 1.1;` and `proxy_set_header Connection "";` in the `location` block to preserve persistent connections [Source: Nginx Documentation - ngx_http_proxy_module](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_http_version).
+4. Configure `proxy_next_upstream` to fail over cleanly across healthy upstream nodes on transport errors [Source: Nginx Documentation - ngx_http_proxy_module](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_next_upstream).
 
 ```diff
 --- a/etc/nginx/conf.d/upstream.conf
 +++ b/etc/nginx/conf.d/upstream.conf
-@@ -1,14 +1,30 @@
+@@ -1,14 +1,33 @@
  upstream backend_nodes {
 -    server 10.244.2.45:8080;
 -    server 10.244.2.46:8080;
@@ -181,6 +196,9 @@ To enable upstream connection pooling, you must:
 +
 +    # Proxy initiates clean termination of idle sockets at 55 seconds
 +    keepalive_timeout 55s;
++
++    # Maximum connection lifetime to guarantee DNS re-resolution and pod load spread
++    keepalive_time 1h;
  }
 
  server {
@@ -201,7 +219,7 @@ To enable upstream connection pooling, you must:
          proxy_set_header X-Real-IP $remote_addr;
          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 +
-+        # Idempotent retry on upstream connection closure or 502
++        # Failover retry across upstream nodes; 'non_idempotent' permits retrying POST requests
 +        proxy_next_upstream error timeout invalid_header http_502 non_idempotent;
 +        proxy_next_upstream_tries 3;
 +        proxy_next_upstream_timeout 10s;
@@ -289,6 +307,39 @@ In Go, `IdleTimeout` on `http.Server` controls the maximum amount of time to wai
  	log.Fatal(server.ListenAndServe())
  }
 ```
+
+### 3) Architectural Safeguards for `proxy_next_upstream ... non_idempotent`
+
+Enabling `non_idempotent` in `proxy_next_upstream` requires rigorous architectural hygiene [Source: RFC 9110 - HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.2.2). 
+
+Under RFC 9110 (Section 9.2.2), HTTP methods such as `GET`, `HEAD`, `PUT`, and `DELETE` are defined as idempotent (executing multiple identical requests produces the exact same intended effect on the server as a single request), whereas `POST` and `PATCH` are explicitly non-idempotent [Source: RFC 9110 - Idempotent Methods](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.2.2).
+
+By default, Nginx refuses to retry non-idempotent requests if any portion of the request body has already been dispatched to an upstream node [Source: Nginx Documentation - ngx_http_proxy_module](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_next_upstream). When `non_idempotent` is enabled, Nginx will re-send a failed `POST` request to another upstream peer. If the initial backend node received the request, processed a financial transaction or database record creation, and severed the socket right before returning HTTP headers, an automatic retry would cause **duplicate transactions** or **double billing**.
+
+To safely deploy `non_idempotent`, organizations must enforce one of two production patterns:
+
+#### Pattern 1: Route-Level Partitioning
+Separate state-mutating transactional endpoints from read-heavy idempotent queries within Nginx routing:
+```nginx
+# Safe for aggressive retries: Idempotent catalog read queries
+location /api/v1/catalog/ {
+    proxy_pass http://backend_nodes;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_next_upstream error timeout invalid_header http_502 non_idempotent;
+}
+
+# Transactional: Prohibit automatic non-idempotent retry to prevent duplicate orders
+location /api/v1/orders/ {
+    proxy_pass http://backend_nodes;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_next_upstream error timeout invalid_header http_502; # non_idempotent strictly omitted
+}
+```
+
+#### Pattern 2: Application-Level Idempotency Keys
+Enforce the `Idempotency-Key` HTTP header specification across state-changing APIs [Source: IETF - The Idempotency-Key HTTP Header Field](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/). Downstream clients supply a unique key (such as a UUIDv4). The upstream application records incoming idempotency keys in Redis or a relational database with an atomic transaction lock (`SET key tx_id NX EX 120`). If Nginx triggers a failover retry and re-delivers the identical `POST` request to another pod, the secondary node detects the existing key and returns the stored result without duplicate execution.
 
 ---
 
