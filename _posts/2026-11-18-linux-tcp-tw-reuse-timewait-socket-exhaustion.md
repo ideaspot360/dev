@@ -6,7 +6,7 @@ category: "Systems & Networking"
 categories: ["Systems & Networking"]
 tags: [Linux, Networking, TCP, Kernel, TIME_WAIT, sysctl, Troubleshooting, DevOps]
 author: "IdeaSpot360 Engineering Notes"
-excerpt: "When high-throughput API gateway nodes communicate with downstream microservices, rapid connection churn consumes ephemeral ports and triggers catastrophic TIME_WAIT socket exhaustion with 'Cannot assign requested address (errno 99)'. Here is an architectural deep dive into 2MSL lifecycle physics (RFC 9293), TCP timestamps and PAWS (RFC 7323), tcp_twsk_unique kernel logic (tcp_ipv4.c), why tcp_tw_recycle was excised in Linux 4.12, why tcp_tw_reuse=2 fails outside loopback, and how to achieve zero-handshake upstream pooling with NGINX, Go, and Envoy."
+excerpt: "When high-throughput API gateway nodes communicate with downstream microservices, rapid connection churn consumes ephemeral ports and triggers catastrophic TIME_WAIT socket exhaustion with 'Cannot assign requested address (errno 99)'. Here is an architectural deep dive into 2MSL lifecycle physics (RFC 9293), TCP timestamps and PAWS (RFC 7323), tcp_twsk_unique kernel logic (tcp_ipv4.c) with CVE-2024-36904 refcounting hardening, why tcp_tw_recycle was excised in Linux 4.12, why tcp_tw_reuse=2 fails outside loopback, why SO_REUSEADDR does not prevent outbound port starvation, and how to achieve zero-handshake upstream pooling with NGINX, Go, and Envoy."
 verification_date: "2026-11-23"
 fact_check_sources:
   - "https://docs.kernel.org/networking/ip-sysctl.html"
@@ -157,45 +157,59 @@ Inside `__inet_check_established()`, the kernel scans hash buckets for matching 
 /* net/ipv4/tcp_ipv4.c - Kernel 6.8 Implementation */
 int tcp_twsk_unique(struct sock *sk, struct sock *sktw, void *twp)
 {
+    const struct inet_timewait_sock *tw = inet_twsk(sktw);
     const struct tcp_timewait_sock *tcptw = tcp_twsk(sktw);
     struct tcp_sock *tp = tcp_sk(sk);
     int reuse = READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_tw_reuse);
+
+    /* Disallow reuse if socket transitioned via FIN_WAIT_2 abort */
+    if (READ_ONCE(tw->tw_substate) == TCP_FIN_WAIT2)
+        reuse = 0;
 
     /* tcp_tw_reuse = 2 restricts reuse strictly to loopback traffic */
     if (reuse == 2) {
         struct inet_sock *inet = inet_sk(sk);
 
-        if (tcptw->tw_substate != TCP_TIME_WAIT ||
+        if (READ_ONCE(tw->tw_substate) != TCP_TIME_WAIT ||
             !ipv4_is_loopback(inet->inet_daddr))
             return 0;
     }
 
     if (tcptw->tw_ts_recent_stamp &&
         (!twp || (reuse && (ktime_get_seconds() - tcptw->tw_ts_recent_stamp > 1)))) {
-        tp->write_seq = tcptw->tw_snd_nxt + 2;
-        if (tp->write_seq == 0)
-            tp->write_seq = 1;
+        /* Advance sequence number beyond max unscaled window (65535) + 2 */
+        u32 seq = tcptw->tw_snd_nxt + 65535 + 2;
+
+        if (!seq)
+            seq = 1;
+        WRITE_ONCE(tp->write_seq, seq);
         tp->rx_opt.ts_recent = tcptw->tw_ts_recent;
         tp->rx_opt.ts_recent_stamp = tcptw->tw_ts_recent_stamp;
-        sock_hold(sktw);
+
+        /* Safe atomic refcount acquisition to prevent hashdance race (CVE-2024-36904) */
+        if (unlikely(!refcount_inc_not_zero(&sktw->sk_refcnt)))
+            return 0;
         return 1;
     }
     return 0;
 }
 ```
 
-### 2.2 PAWS Verification (RFC 7323)
+### 2.2 PAWS Verification (RFC 7323) and Sequence Spacing
 
-Socket reuse via `tcp_twsk_unique` is safe only because of **PAWS (Protection Against Wrapped Sequences)**, standardized in RFC 7323 (which obsoleted RFC 1323) [Source: RFC 7323 — TCP Extensions for High Performance](https://www.rfc-editor.org/rfc/rfc7323.html).
+Socket reuse via `tcp_twsk_unique` is safe only because of **PAWS (Protection Against Wrapped Sequences)**, standardized in RFC 7323 (which obsoleted RFC 1323) [Source: RFC 7323 — TCP Extensions for High Performance](https://www.rfc-editor.org/rfc/rfc7323.html), combined with explicit sequence space offsets:
 
-1. Each TCP segment transmits a 32-bit timestamp option: `TSval` (sender clock) and `TSecr` (echoed receiver clock).
-2. When `tcp_twsk_unique()` reuses a `TIME_WAIT` socket, it advances the outgoing sequence number:
-   $$tp\to\text{write\_seq} = tcptw\to\text{tw\_snd\_nxt} + 2$$
-3. If an old, wandering duplicate segment arrives from the previous incarnation, the receiver compares the segment's `TSval` against `ts_recent`. Because the new incarnation uses strictly newer timestamps ($TSval_{\text{new}} > TSval_{\text{old}}$), the receiver identifies the stray segment as stale and drops it immediately.
+1. **TCP Timestamp Options**: Each TCP segment transmits a 32-bit timestamp option: `TSval` (sender clock) and `TSecr` (echoed receiver clock).
+2. **Initial Sequence Offset**: When `tcp_twsk_unique()` recycles a `TIME_WAIT` socket, it advances the outgoing sequence number:
+   $$\text{seq} = tcptw\to\text{tw\_snd\_nxt} + 65,535 + 2$$
+   $$\text{WRITE\_ONCE}(tp\to\text{write\_seq}, \text{seq})$$
+   The $+65,535$ component matches the maximum unscaled TCP receive window ($2^{16} - 1$), while $+2$ ensures strict sequence progression. This guarantees that even if the remote peer's receive window remained completely open, delayed duplicate segments from the old incarnation cannot fall within the initial sequence window of the new connection.
+3. **Timestamp Invalidation**: If an old, wandering duplicate segment arrives from the previous incarnation, the receiver compares the segment's `TSval` against `ts_recent`. Because the new incarnation uses strictly newer timestamps ($TSval_{\text{new}} > TSval_{\text{old}}$), the receiver identifies the stray segment as stale via PAWS and drops it immediately.
+4. **Refcount Race Safety (CVE-2024-36904)**: During the `inet_twsk_hashdance()` table insertion, `tcp_twsk_unique` uses `refcount_inc_not_zero(&sktw->sk_refcnt)` rather than an unconditional `sock_hold()`. If another CPU core is concurrently freeing or initializing the socket (`refcnt == 0`), the kernel safely aborts recycling rather than corrupting memory with a Use-After-Free.
 
 ---
 
-## 3. Common Missteps: Four Dangerous Workarounds and Flawed Fixes
+## 3. Common Missteps: Five Dangerous Workarounds and Flawed Fixes
 
 During the incident triage, engineering teams attempted several common workarounds that introduced severe regressions or failed to resolve the outage.
 
@@ -220,6 +234,13 @@ During the incident triage, engineering teams attempted several common workaroun
 
 * **The Flawed Fix**: Assuming that modern Linux distributions already enable socket reuse by default.
 * **Why It Failed**: In modern Linux kernels (including Ubuntu 24.04 and Debian 12), `net.ipv4.tcp_tw_reuse` defaults to `2` [Source: Linux Kernel Documentation — ip-sysctl](https://docs.kernel.org/networking/ip-sysctl.html). Value `2` restricts reuse exclusively to loopback addresses (`127.0.0.1` / `::1`) via `ipv4_is_loopback()`. In Kubernetes and cloud architectures, microservice traffic traverses overlay network interfaces (`eth0`, `cali+`, `cni0`), meaning value `2` actively blocked socket reuse for all inter-pod traffic.
+
+### Misstep 5: Conflating `SO_REUSEADDR` with `net.ipv4.tcp_tw_reuse`
+
+* **The Flawed Fix**: Adding `SO_REUSEADDR` socket options to client connection pools in application code (`setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, ...)`), expecting it to unlock ephemeral port reuse for outbound `connect()` calls.
+* **Why It Failed**: 
+  1. `SO_REUSEADDR` is predominantly a **server-side listening socket** flag. It permits a daemon to `bind()` to a local IP:port even if existing connections on that port are in `TIME_WAIT` (preventing `EADDRINUSE` after service restarts).
+  2. For outbound client sockets, `SO_REUSEADDR` only permits binding to the same local port if the **target destination 4-tuple is different**. When connecting repeatedly to the identical upstream cluster IP and port (`10.244.3.45:8080`), `SO_REUSEADDR` does **not** bypass RFC 9293 `TIME_WAIT` protection. Only `net.ipv4.tcp_tw_reuse` coupled with RFC 7323 PAWS timestamps can recycle a matching 4-tuple during `connect()`.
 
 ---
 
@@ -290,9 +311,9 @@ The primary architectural fix is eliminating short-lived connection turnover by 
  }
 ```
 
-### 4.3 Step 3: Go Client `http.Transport` Connection Pooling
+### 4.3 Step 3: Go Client `http.Transport` Connection Pooling & Response Body Drain
 
-For microservices communicating over HTTP, Go's default `http.Transport` caps idle connections per host to `2`, triggering massive connection teardowns under high concurrency:
+For microservices communicating over HTTP, Go's default `http.Transport` caps idle connections per host to `2`, triggering massive connection teardowns under high concurrency. Furthermore, **failing to read the response body to EOF (`io.Copy(io.Discard, resp.Body)`) and close it (`resp.Body.Close()`) prevents connection reuse entirely**, forcing Go to tear down the socket and flood the kernel with `TIME_WAIT` states:
 
 ```diff
 --- client/transport.go.orig	2026-11-18 01:30:00.000000000 +0900
@@ -318,24 +339,36 @@ For microservices communicating over HTTP, Go's default `http.Transport` caps id
  }
 ```
 
+Ensure application caller routines strictly drain and close response bodies:
+
+```go
+resp, err := client.Do(req)
+if err != nil {
+    return err
+}
+// MANDATORY: Drain response body to EOF before closing so Transport can recycle the TCP connection
+_, _ = io.Copy(io.Discard, resp.Body)
+_ = resp.Body.Close()
+```
+
 ### 4.4 Step 4: Envoy Proxy Cluster Connection Lifecycle Tuning
 
-For Envoy mesh sidecars, configure idle connection timeouts and maximum requests per connection to prevent thundering herd reconnections:
+For Envoy mesh sidecars, configure idle connection timeouts and maximum requests per connection nested properly within `HttpProtocolOptions` to prevent thundering herd reconnections and configuration validation failures:
 
 ```diff
 --- envoy-cluster.yaml.orig	2026-11-18 01:30:00.000000000 +0900
 +++ envoy-cluster.yaml	2026-11-18 01:45:00.000000000 +0900
-@@ -10,6 +10,10 @@
+@@ -10,6 +10,14 @@
      dns_lookup_family: V4_ONLY
      lb_policy: ROUND_ROBIN
      typed_extension_protocol_options:
        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
          use_downstream_protocol_config: {}
-+    common_http_protocol_options:
-+      idle_timeout: 60s
-+      max_connection_duration: 300s
-+      max_requests_per_connection: 50000
++        common_http_protocol_options:
++          idle_timeout: 60s
++          max_connection_duration: 300s
++          max_requests_per_connection: 50000
 ```
 
 ---
