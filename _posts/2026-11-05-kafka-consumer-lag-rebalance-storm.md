@@ -218,7 +218,7 @@ $$N_{\text{max.poll.records}} \le \frac{300 \times 0.30}{2.0} = \frac{90}{2.0} =
 
 Setting `max.poll.records: 45` (or rounding down to `40`) guarantees that even under a triple-sigma database latency spike, the entire batch finishes within 90 seconds, leaving a 210-second safety buffer before tripping the poll timeout.
 
-### Step 2: Implement Static Consumer Group Membership (KIP-345)
+### Step 2: Implement Static Consumer Group Membership (KIP-345) & Kubernetes Lifecycle Tuning
 In Kubernetes deployments, utilize `StatefulSet` with stable network identifiers (`order-service-0`, `order-service-1`) and inject the pod name into `group.instance.id` [Source: Apache Kafka KIP-345 - Static Membership Protocol](https://cwiki.apache.org/confluence/display/KAFKA/KIP-345%3A+Introduce+static+membership+protocol+to+reduce+consumer+rebalances):
 
 ```yaml
@@ -232,7 +232,25 @@ env:
     value: "order-service-$(POD_NAME)"
 ```
 
-When a static consumer pod restarts within `session.timeout.ms`, the broker preserves its partition assignments without triggering a rebalance.
+When a static consumer pod shuts down gracefully, it deliberately suppresses the `LeaveGroupRequest` frame sent to the Group Coordinator broker. Instead, the coordinator preserves its partition assignments in state and waits for `session.timeout.ms`.
+
+#### Sizing `session.timeout.ms` Against the Kubernetes Pod Lifecycle:
+To prevent false evictions during rolling deployments, `session.timeout.ms` must satisfy the following inequality:
+
+$$\text{session.timeout.ms} > \text{terminationGracePeriodSeconds} + t_{\text{scheduling}} + t_{\text{JVM startup}}$$
+
+In Kubernetes, default `terminationGracePeriodSeconds` is 30 seconds. If a Spring Boot application requires 20 seconds to drain active batches (`spring.lifecycle.timeout-per-shutdown-phase: 20s`), and subsequent pod scheduling plus JVM initialization requires 25 seconds, the total recycling duration is $45\text{ seconds}$. Setting `session.timeout.ms: 45000` leaves zero headroom; any minor image pull delay causes the broker to expire the session and trigger a full rebalance.
+
+Therefore, for containerized static consumers, raise `session.timeout.ms` to **`60000`** (60 seconds) with `heartbeat.interval.ms: 15000` (strictly maintaining the $\le 1/3$ ratio), ensuring the value remains within the broker-side `group.max.session.timeout.ms` boundary.
+
+#### Fencing Collisions and `FencedInstanceIdException`:
+If a slow pod restarts after `session.timeout.ms` has elapsed, or if a misconfigured deployment (such as a standard Kubernetes `Deployment` with rolling `maxSurge: 1`) starts a second pod sharing the identical `group.instance.id`, the Kafka broker detects an epoch violation and instantly terminates the rogue consumer:
+
+```text
+org.apache.kafka.common.errors.FencedInstanceIdException: The broker rejected this static consumer since another consumer with the same group.instance.id has registered with a newer member.id epoch.
+```
+
+This fencing mechanism guarantees data integrity and prevents split-brain partition writes. To avoid epoch collisions, static consumers must always be deployed via `StatefulSet` rather than surge-based `Deployment` controllers.
 
 ### Step 3: Production Configuration Unified Diff
 
@@ -242,11 +260,14 @@ Apply the following hardening diff to `application.yml` and client properties:
 # application.yml (Spring Boot / Apache Kafka Consumer)
 spring:
   kafka:
++   listener:
++     # REQUIRED: Explicit MANUAL_IMMEDIATE mode allows Acknowledgment injection in listeners
++     ack-mode: manual_immediate
     consumer:
 -     # VULNERABLE: Automatic offset commits hide batch processing failures and cause duplicate processing
 -     enable-auto-commit: true
 -     auto-commit-interval: 5000
-+     # RESILIENT: Manual immediate acknowledgment guarantees exact-boundary offset commits
++     # RESILIENT: Disable auto-commit to hand offset management over to application transaction boundaries
 +     enable-auto-commit: false
       auto-offset-reset: earliest
       
@@ -261,8 +282,8 @@ spring:
 +       # RESILIENT: Bounded batch size ensures processing completes well within the 300s window
 +       max.poll.records: 40
 +       max.poll.interval.ms: 300000
-+       # RESILIENT: Heartbeat interval maintained strictly at 1/3 of session timeout
-+       session.timeout.ms: 45000
++       # RESILIENT: Extended session timeout accommodates Kubernetes StatefulSet pod restart grace windows
++       session.timeout.ms: 60000
 +       heartbeat.interval.ms: 15000
 +       # RESILIENT: Zero-downtime incremental partition rebalancing
 +       partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
@@ -306,6 +327,10 @@ public class ResilientOrderEventListener {
         containerFactory = "batchKafkaListenerContainerFactory"
     )
     public void consumeBatch(List<ConsumerRecord<String, OrderEventPayload>> records, Acknowledgment ack) {
+        if (records == null || records.isEmpty()) {
+            return;
+        }
+
         long startTime = System.currentTimeMillis();
         int recordCount = records.size();
 
@@ -422,6 +447,6 @@ Before deploying Kafka consumer updates to production, audit your configuration 
 
 1. **Batch Bounds:** Is `max.poll.records` sized such that $N \times t_{\text{max single record latency}} \le \text{max.poll.interval.ms} \times 0.30$?
 2. **Assignor Strategy:** Is `partition.assignment.strategy` set to `org.apache.kafka.clients.consumer.CooperativeStickyAssignor` (or `group.protocol=consumer` for Kafka 4.0+)?
-3. **Heartbeat Alignment:** Is `heartbeat.interval.ms` maintained strictly at one-third of `session.timeout.ms` (e.g., 15s / 45s)?
+3. **Heartbeat & Session Alignment:** Is `heartbeat.interval.ms` maintained strictly at one-third or less of `session.timeout.ms` (e.g., 15s / 60s), with `session.timeout.ms` dimensioned to exceed Kubernetes `terminationGracePeriodSeconds` plus pod startup latency?
 4. **Static Identity:** Are consumer pods configured with `group.instance.id` derived from stable Kubernetes StatefulSet pod names?
 5. **Acknowledgment Semantics:** Is `enable-auto-commit: false` active with manual acknowledgment executed only after batch processing completes?
