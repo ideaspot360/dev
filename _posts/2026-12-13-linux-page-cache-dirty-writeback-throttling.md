@@ -250,8 +250,8 @@ vm.dirty_background_ratio = 0
 To validate behavior under sustained heavy write bursts, we ran an asynchronous write benchmark simulating unbuffered logging and database flushes [Source: Linux Manual Pages - fio(1)](https://man7.org/linux/man-pages/man1/fio.1.html):
 
 ```bash
-# Run 16-thread random write workload generating 20 GiB of data
-fio --name=dirty-test --ioengine=sync --rw=write --bs=64k --size=1250m --numjobs=16 --time_based --runtime=60 --group_reporting
+# Run 16-thread random write workload generating 20 GiB of buffered data to stress page cache
+fio --name=dirty-test --ioengine=sync --buffered=1 --rw=write --bs=64k --size=1250m --numjobs=16 --time_based --runtime=60 --group_reporting
 ```
 
 During execution, we monitored kernel dirty counters and process states:
@@ -281,24 +281,34 @@ groups:
   - name: storage_writeback_alerts
     rules:
       - alert: LinuxDirtyMemoryHigh
-        expr: node_memory_Dirty_bytes > 536870912
+        expr: node_memory_Dirty_bytes > 429496729
         for: 1m
         labels:
           severity: warning
           tier: node
         annotations:
-          summary: "Linux page cache dirty memory exceeded threshold on {{ $labels.instance }}"
-          description: "Dirty memory is at {{ $value | humanizeBytes }} (limit 512 MiB). Background flusher may be falling behind storage write bandwidth."
+          summary: "Linux page cache dirty memory approaching hard limit on {{ $labels.instance }}"
+          description: "Dirty memory is at {{ $value | humanizeBytes }} (exceeding 80% of 512 MiB ceiling). Background flusher may be falling behind storage write bandwidth."
+
+      - alert: LinuxDirtyMemoryThrottlingActive
+        expr: node_memory_Dirty_bytes >= 536870912
+        for: 30s
+        labels:
+          severity: critical
+          tier: node
+        annotations:
+          summary: "Linux dirty memory ceiling reached; balance_dirty_pages throttling active on {{ $labels.instance }}"
+          description: "Dirty memory is at {{ $value | humanizeBytes }} (hard limit 512 MiB reached). Kernel is actively forcing writing processes into D-state sleep."
 
       - alert: LinuxIOWaitSpike
-        expr: rate(node_cpu_seconds_total{mode="iowait"}[2m]) > 0.40
+        expr: avg by (instance) (rate(node_cpu_seconds_total{mode="iowait"}[2m])) > 0.40
         for: 2m
         labels:
           severity: critical
           tier: node
         annotations:
-          summary: "CPU I/O wait spike on {{ $labels.instance }}"
-          description: "System %iowait has exceeded 40% for 2 minutes. Tasks may be stalling in uninterruptible sleep (D state) inside balance_dirty_pages."
+          summary: "Host-wide CPU I/O wait spike on {{ $labels.instance }}"
+          description: "Host average %iowait has exceeded 40% across all cores for 2 minutes. Tasks may be stalling in uninterruptible sleep (D state) inside balance_dirty_pages."
 
       - alert: LinuxBlockedProcessesSpike
         expr: node_procs_blocked > 10
