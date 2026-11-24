@@ -69,8 +69,8 @@ PLEG is an internal subsystem inside the `kubelet` daemon responsible for keepin
 ```
 
 ### 1. Generic PLEG (Polling) vs. Evented PLEG (Streaming)
-1. **Generic PLEG Polling**: By default, generic PLEG invokes `relist()` every 1 second. It queries containerd over the local Unix domain socket using synchronous CRI methods (`ListPodSandbox`, `ListContainers`, and `PodSandboxStatus`) to inspect every container running or stopped on the host. PLEG computes state deltas and posts events (`ContainerStarted`, `ContainerDied`) to the pod worker sync channel.
-2. **Evented PLEG Mechanism**: To eliminate the heavy 1-second polling bottleneck, KEP-3386 (initially proposed under KEP-2727) introduced Evented PLEG. Rather than polling every container sequentially, the kubelet establishes an open CRI streaming gRPC connection (`GetContainerEvents`) with containerd. Containerd pushes discrete lifecycle events directly to kubelet in real-time, reducing background polling relists to infrequent safety syncs (e.g., every 300 seconds) [Source: Kubernetes Evented PLEG Task Guide (https://kubernetes.io/docs/tasks/administer-cluster/evented-pleg/)].
+1. **Generic PLEG Polling**: By default, generic PLEG invokes `relist()` every 1 second. It queries containerd over the local Unix domain socket using synchronous CRI methods (`ListPodSandbox`, `ListContainers`, and `PodSandboxStatus`) to inspect every container running or stopped on the host. PLEG computes state deltas and posts events (`ContainerStarted`, `ContainerDied`) to the pod worker sync channel. When dead container numbers explode, synchronous iteration triggers severe CRI serialization.
+2. **Evented PLEG Mechanism & Version Lifecycle (v1.26 ~ v1.30)**: To eliminate the heavy 1-second polling bottleneck, KEP-3386 (initially explored under KEP-2727) introduced Evented PLEG. Rather than polling every container sequentially, the kubelet establishes an open CRI streaming gRPC connection (`GetContainerEvents`) with containerd. Containerd pushes discrete lifecycle events directly to kubelet in real-time, reducing background polling relists to infrequent safety syncs (e.g., every 300 seconds) [Source: Kubernetes Evented PLEG Task Guide (https://kubernetes.io/docs/tasks/administer-cluster/evented-pleg/)]. However, operational history across Kubernetes releases requires careful note: `EventedPLEG` was introduced as Alpha in v1.26, and targeted for Beta in v1.27/v1.29. Due to critical edge-case regressions—specifically missed lifecycle syncs on static mirror pods and runtime disconnect nil pointer panics—Kubernetes maintainers officially reverted `EventedPLEG` back to Alpha in Kubernetes v1.30. In enterprise production clusters (such as AWS EKS v1.29/v1.30), enabling `EventedPLEG=true` remains disabled by default, meaning engineering teams must fix the underlying Generic PLEG polling performance via cgroup v2 and runtime garbage collection.
 3. **The 3-Minute Health Check**: Regardless of the mode, kubelet runs an internal goroutine checking `pleg.healthy()`. If the duration since the last completed `relist()` cycle exceeds `pleg-unhealthy-threshold` (default: `3m0s`), kubelet marks the `NodeReady` condition to `False` (reason `KubeletNotReady`), prompting the master `node-lifecycle-controller` to initiate pod evictions.
 
 ### 2. Root Cause: High Container Churn and Cgroup v1 Memory Controller Lock Contention
@@ -130,7 +130,9 @@ Apply the following kubelet garbage collection tuning and cgroup driver unificat
 -cgroupDriver: cgroupfs
 ```
 
-Update containerd CRI configuration in `/etc/containerd/config.toml` to enforce `SystemdCgroup` and streamline gRPC execution [Source: Containerd CRI Configuration Guide (https://github.com/containerd/containerd/blob/main/docs/cri/config.md)]:
+Update containerd CRI configuration in `/etc/containerd/config.toml` to enforce `SystemdCgroup` and streamline gRPC execution [Source: Containerd CRI Configuration Guide (https://github.com/containerd/containerd/blob/main/docs/cri/config.md)].
+
+For **containerd v1.7.x** (`version = 2` syntax):
 
 ```diff
 --- /etc/containerd/config.toml.orig
@@ -147,11 +149,29 @@ Update containerd CRI configuration in `/etc/containerd/config.toml` to enforce 
 +      max_container_log_line_size = 262144
 ```
 
+For **containerd v2.0+** (`version = 3` syntax, where the CRI plugin namespace transitioned from `io.containerd.grpc.v1.cri` to `io.containerd.cri.v1.runtime`):
+
+```diff
+--- /etc/containerd/config.toml.orig
++++ /etc/containerd/config.toml
+@@ -1,6 +1,6 @@
+-version = 2
++version = 3
+...
+ [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc]
+   runtime_type = "io.containerd.runc.v2"
+   [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc.options]
+-    SystemdCgroup = false
++    SystemdCgroup = true
+ [plugins."io.containerd.cri.v1.runtime"]
++  max_container_log_line_size = 262144
+```
+
 ---
 
 ## 4. Verification CLI & Live Cluster Diagnostics
 
-Execute the following diagnostic commands to verify cgroup v2 hierarchy, monitor PLEG relist duration, and test CRI socket latency:
+Execute the following diagnostic commands to verify cgroup v2 hierarchy, monitor PLEG relist duration, test systemd D-Bus responsiveness, and benchmark CRI socket latency:
 
 ```bash
 # 1. Verify that the node has booted into unified cgroup v2
@@ -169,15 +189,23 @@ curl -s -v http://127.0.0.1:10248/healthz
 kubectl get nodes -o wide
 kubectl describe node ip-10-0-42-181.ec2.internal | grep -A 5 -E "Conditions|Ready"
 
-# 5. Inspect containerd CRI socket connection latency and verify active containers
+# 5. Verify systemd D-Bus responsiveness and check for daemon serialization delays
+busctl get-property org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager Version
+systemctl show --property=ActiveState,SubState dbus
+
+# 6. Benchmark containerd CRI RPC round-trip execution latency
+time crictl --timeout=5s pods
+time crictl ps -a
+
+# 7. Inspect containerd CRI socket connection latency and verify active containers
 crictl info
 crictl stats
 ss -x -a | grep containerd.sock
 
-# 6. Count remaining dead/exited containers across the node
+# 8. Count remaining dead/exited containers across the node
 crictl ps -a --state Exited | wc -l
 
-# 7. Measure kernel slab and dentry memory cache to ensure no zombie cgroup leaks
+# 9. Measure kernel slab and dentry memory cache to ensure no zombie cgroup leaks
 cat /proc/cgroups
 vmstat 1 5
 ```
