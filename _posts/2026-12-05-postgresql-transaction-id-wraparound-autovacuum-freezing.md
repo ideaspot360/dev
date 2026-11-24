@@ -1,5 +1,6 @@
 ---
 layout: post
+pair_id: pair_20261205
 title: "PostgreSQL Transaction ID Wraparound & Autovacuum Freezing Failure"
 date: 2026-12-05 10:27:14 +0900
 category: "Database & Storage"
@@ -55,7 +56,7 @@ postgres_connections_active{datname="prod_financial_db"} 800
 
 ## Production Specs
 * **Database Engine**: PostgreSQL 16.3 running on Linux 6.6.30 kernel
-* **Instance Hardware**: AWS RDS `db.r6i.4xlarge` (16 vCPUs, 128 GiB RAM, Provisioned 10,000 IOPS gp3)
+* **Instance Hardware**: AWS EC2 `r6i.4xlarge` (Dedicated DB Host / RDS Custom, 16 vCPUs, 128 GiB RAM, Provisioned 10,000 IOPS gp3 EBS)
 * **Storage Footprint**: 1.4 TB primary database volume containing `financial_ledger` (185 million rows, 380 GB relation size including B-tree indexes)
 * **Write Workload**: Continuous 8,500 TPS (75% INSERT, 25% UPDATE) mediated through PgBouncer in transaction pooling mode
 * **Replication Architecture**: 2x asynchronous physical streaming read replicas and 1x CDC logical replication slot for Apache Kafka Debezium streaming
@@ -124,7 +125,7 @@ PostgreSQL enforces hard safety ceilings in `src/backend/access/transam/varsup.c
 In our incident, autovacuum attempted to run anti-wraparound freezing, but the freeze horizon was pinned by three compounding root cause blockades:
 1. **Abandoned CDC Logical Replication Slot**: A Debezium replication slot created three months prior was disconnected, holding `catalog_xmin` at transaction 1,120,440. PostgreSQL cannot advance `datfrozenxid` past the oldest catalog snapshot pinned by an active or inactive slot [Source: PostgreSQL Replication Slots (https://www.postgresql.org/docs/16/view-pg-replication-slots.html)].
 2. **Abandoned Two-Phase Prepared Transactions (`pg_prepared_xacts`)**: An orphaned distributed transaction generated via `PREPARE TRANSACTION 'tx_settlement_8821'` was abandoned without a matching `COMMIT PREPARED` or `ROLLBACK PREPARED`, anchoring the global oldest active transaction horizon [Source: PostgreSQL Prepared Transactions (https://www.postgresql.org/docs/16/view-pg-prepared-xacts.html)].
-3. **Severe Vacuum Throttling**: Default parameters (`autovacuum_vacuum_cost_limit = 200` with `autovacuum_vacuum_cost_delay = 20ms`) capped vacuum I/O to less than 10 MB/s, unable to keep pace with 8,500 continuous write TPS.
+3. **Severe Vacuum Throttling**: Uncalibrated conservative throttling parameters (`autovacuum_vacuum_cost_limit = 200` with legacy `autovacuum_vacuum_cost_delay = 20ms` carried over from PostgreSQL 11 defaults, whereas modern PostgreSQL 12+ defaults to 2ms) capped vacuum I/O to less than 10 MB/s, unable to keep pace with 8,500 continuous write TPS.
 
 ---
 
@@ -154,7 +155,7 @@ To remediate the cluster without table locking and prevent future wraparound sta
 3. Apply aggressive per-table storage options to `financial_ledger`.
 4. Run parallel online non-blocking `VACUUM (FREEZE, VERBOSE)` to advance `relfrozenxid`.
 
-Apply the following unified diff to `postgresql.conf` (or AWS RDS Parameter Group):
+Apply the following unified diff to `postgresql.conf` (or custom parameter group configuration):
 
 ```diff
 --- postgresql.conf.orig
@@ -243,7 +244,9 @@ vacuumdb -U postgres -d prod_financial_db --table='financial_ledger' --freeze --
 # 7. Fallback: Emergency recovery in single-user mode (if postmaster refuses connections)
 # Note: Execute only if normal psql connections are completely locked out
 # sudo systemctl stop postgresql
-# postgres --single -D /var/lib/postgresql/data prod_financial_db
+# Ensure no stale postmaster PID lock exists and execute as postgres system user:
+# sudo -u postgres test ! -f /var/lib/postgresql/data/postmaster.pid || sudo -u postgres rm -f /var/lib/postgresql/data/postmaster.pid
+# sudo -u postgres postgres --single -D /var/lib/postgresql/data prod_financial_db
 # backend> VACUUM (FREEZE, VERBOSE);
 # backend> \q
 # sudo systemctl start postgresql
