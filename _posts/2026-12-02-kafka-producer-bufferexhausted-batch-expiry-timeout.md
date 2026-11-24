@@ -9,6 +9,7 @@ fact_check_sources:
   - "https://kafka.apache.org/documentation/#producer_monitoring"
   - "https://kafka.apache.org/documentation/#design_producer"
   - "https://cwiki.apache.org/confluence/display/KAFKA/KIP-91"
+  - "https://cwiki.apache.org/confluence/display/KAFKA/KIP-145"
   - "https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/clients/producer/internals/BufferPool.java"
   - "https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java"
   - "https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java"
@@ -33,7 +34,7 @@ org.apache.kafka.common.errors.TimeoutException: Failed to allocate memory withi
 	at org.apache.kafka.clients.producer.KafkaProducer.doSend(KafkaProducer.java:1002)
 	at org.apache.kafka.clients.producer.KafkaProducer.send(KafkaProducer.java:947)
 	at com.company.telemetry.ingest.service.EventPublisher.publishEvent(EventPublisher.java:68)
-Caused by: org.apache.kafka.common.errors.BufferExhaustedException: Failed to allocate 16384 bytes within the configured max blocking time 60000 ms.
+Caused by: org.apache.kafka.clients.producer.BufferExhaustedException: Failed to allocate 16384 bytes within the configured max blocking time 60000 ms.
 	... 18 common frames omitted
 ```
 
@@ -173,11 +174,11 @@ public ByteBuffer allocate(int size, long maxTimeToBlockMs) throws InterruptedEx
 }
 ```
 
-The exception `BufferExhaustedException` is a subclass of `TimeoutException` [Source: Apache Kafka Exception Hierarchy (https://kafka.apache.org/documentation/#producerconfigs)]. When `remainingNano <= 0` is reached, `BufferPool` aborts the wait and throws `TimeoutException` wrapping `BufferExhaustedException`.
+The exception `org.apache.kafka.clients.producer.BufferExhaustedException` is a subclass of `org.apache.kafka.common.errors.TimeoutException` [Source: Apache Kafka Exception Hierarchy (https://kafka.apache.org/documentation/#producerconfigs)]. When `remainingNano <= 0` is reached, `BufferPool` aborts the wait and throws `TimeoutException` (or `BufferExhaustedException` in non-blocking append invocations) signaling that memory could not be reclaimed within `max.block.ms`.
 
 ### Compounding Causes of the Memory Collapse
 
-The collapse resulted from four interrelated mechanics:
+The collapse resulted from five interrelated mechanics:
 
 #### 1. Micro-Batching with Zero Linger and No Compression
 With `compression.type=none` and `linger.ms=0`, the producer background `Sender` thread eagerly drained batches as soon as a single record was appended. An average message of 1.2 KB filled only $\approx 7.3\%$ of a 16 KB batch. Producing 55,000 messages/second forced the producer to allocate and dispatch over 4,200 separate micro-batches per second across 24 partitions. Each micro-batch required a dedicated TCP packet and Kafka protocol envelope, creating intense TCP framing and context-switch overhead.
@@ -192,7 +193,7 @@ $$T_{\text{exhaust}} = \frac{\text{buffer.memory}}{R_{\text{in}} - R_{\text{out}
 
 Where:
 * $R_{\text{in}} = 55,000\text{ msgs/s} \times 1.2\text{ KB} \approx 66.0\text{ MB/s}$ (Ingress write rate)
-* $R_{\text{out}} = \frac{N_{\text{in\_flight\_max}} \times \text{Batch Size}}{t_{\text{ack}}} = \frac{24\text{ partitions} \times 5\text{ requests} \times 16\text{ KB}}{0.065\text{ s}} \approx 29.5\text{ MB/s}$ (Constrained egress rate)
+* $R_{\text{out}} = \frac{N_{\text{brokers}} \times N_{\text{in\_flight\_max}} \times N_{\text{partitions/broker}} \times \text{Batch Size}}{t_{\text{ack}}} = \frac{3\text{ brokers} \times 5\text{ requests} \times 8\text{ partitions} \times 16\text{ KB}}{0.065\text{ s}} \approx 29.5\text{ MB/s}$ (Constrained multiplexed egress rate across 24 leader partitions distributed evenly over 3 AWS MSK brokers)
 
 $$T_{\text{exhaust}} = \frac{32\text{ MB}}{66.0\text{ MB/s} - 29.5\text{ MB/s}} = \frac{32\text{ MB}}{36.5\text{ MB/s}} \approx 0.87\text{ seconds}$$
 
@@ -204,6 +205,11 @@ KIP-91 introduced `delivery.timeout.ms` as the definitive upper bound for produc
 $$\text{delivery.timeout.ms} \ge \text{linger.ms} + \text{request.timeout.ms}$$
 
 When batches remained trapped in partition queues waiting for an in-flight socket window, the elapsed time since batch creation surpassed `delivery.timeout.ms` (or `request.timeout.ms` during in-flight retries), causing the `Sender` thread to expire and drop them before broker transmission.
+
+#### 5. Record Header Metadata Inflation (KIP-145) & Batch Splitting Dynamics
+Modern distributed tracing frameworks (OpenTelemetry / W3C Trace Context) leverage Kafka record headers—standardized across connectors and clients via KIP-145 and KIP-82—to propagate `traceparent`, `tracestate`, and correlation metadata [Source: Apache Kafka KIP-145 Specification (https://cwiki.apache.org/confluence/display/KAFKA/KIP-145)]. In our telemetry pipeline, distributed tracing headers injected 240 bytes of metadata per record.
+
+In a default 16 KB (`16384` bytes) batch, serialized record payloads inflated from 1,200 bytes to 1,440 bytes, allowing only $\lfloor 16384 / 1440 \rfloor = 11$ messages per batch. Whenever fluctuating telemetry payloads pushed an individual record past the remaining contiguous bytes of an allocated buffer, `BufferPool.allocate()` was forced into the slow-path allocation of non-pooled `ByteBuffer` instances (`nonPooledAvailableMemory -= size`), inducing memory fragmentation. Furthermore, when uncompressed or poorly compressible batches approached broker size ceilings (`max.message.bytes`), the client sender thread was forced to decompress, split, and re-allocate chunks, driving `batch-split-rate` up and precipitating immediate pool exhaustion.
 
 ---
 
@@ -509,6 +515,7 @@ When designing and tuning distributed microservices publishing high volumes of s
 - [x] **Align Delivery Timeouts with Request Timeouts (KIP-91)**: Ensure $\text{delivery.timeout.ms} \ge \text{linger.ms} + \text{request.timeout.ms}$. Allow sufficient time for transient leader elections while avoiding indefinite client-side queuing.
 - [x] **Fail Fast on Buffer Exhaustion**: Do not raise `max.block.ms` to mask downstream saturation. Keep `max.block.ms` between 10,000ms and 15,000ms and shed excess load via application-level circuit breakers (e.g. Resilience4j) with HTTP 429 status codes.
 - [x] **Size `buffer.memory` Proportionally**: Ensure `buffer.memory` provides headroom for network jitter while remaining within 5% to 10% of total JVM heap allocation to avoid garbage collection thrashing.
+- [x] **Account for Record Header Overhead (KIP-145 / KIP-82)**: Factor distributed tracing and schema registry header byte overhead into `batch.size` calculations. Sizing `batch.size` to 64 KB ensures individual headers do not cause pool fragmentation or premature batch splitting (`batch-split-rate`).
 - [x] **Monitor Core Client JMX Metrics**: Continuously alert on `buffer-exhausted-rate > 0`, `record-queue-time-avg > (linger.ms * 2)`, and `record-retry-rate > 0`.
 
 ---
@@ -519,6 +526,7 @@ When designing and tuning distributed microservices publishing high volumes of s
 * [Apache Kafka Official Documentation: Monitoring Kafka Producer Metrics](https://kafka.apache.org/documentation/#producer_monitoring)
 * [Apache Kafka Official Documentation: Producer Design Overview](https://kafka.apache.org/documentation/#design_producer)
 * [Apache Kafka Improvement Proposal 91 (KIP-91): Provide Intuitive User Timeouts in The Producer](https://cwiki.apache.org/confluence/display/KAFKA/KIP-91)
+* [Apache Kafka Improvement Proposal 145 (KIP-145): Expose Record Headers in Kafka Connect](https://cwiki.apache.org/confluence/display/KAFKA/KIP-145)
 * [Apache Kafka Git Repository: BufferPool.java Implementation](https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/clients/producer/internals/BufferPool.java)
 * [Apache Kafka Git Repository: RecordAccumulator.java Implementation](https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java)
 * [Apache Kafka Git Repository: Sender.java Implementation](https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java)
