@@ -11,6 +11,7 @@ fact_check_sources:
   - "https://grpc.io/docs/guides/flow-control/"
   - "https://github.com/grpc/grpc-go/blob/master/Documentation/concurrency.md"
   - "https://grpc.github.io/grpc-java/javadoc/io/grpc/stub/CallStreamObserver.html"
+  - "https://grpc.github.io/grpc-java/javadoc/io/grpc/stub/ClientResponseObserver.html"
   - "https://grpc.github.io/grpc-java/javadoc/io/grpc/netty/NettyChannelBuilder.html"
   - "https://www.envoyproxy.io/docs/envoy/v1.29.1/api-v3/extensions/filters/network/http_connection_manager/v3/http_connection_manager.proto"
 verification_date: "2026-11-23"
@@ -75,7 +76,11 @@ HTTP/2 mandates credit-based flow control to prevent a sender from overwhelming 
    - **Stream Flow Control Window**: Regulates bytes transmitted on an individual stream (Stream ID $> 0$).
    - **Connection Flow Control Window**: Regulates aggregate bytes transmitted across all concurrent streams multiplexed on the entire TCP connection (Stream ID $= 0$).
    - Crucially, only `DATA` frames are subject to flow control. Control frames (`HEADERS`, `SETTINGS`, `WINDOW_UPDATE`, `PING`, `RST_STREAM`) bypass flow control credits so management signaling cannot be locked out.
-2. **Default Initial Window Size of 65,535 Octets (RFC 9113 Section 6.5.2)**: By default, the initial window size for both individual streams and the overall connection is exactly $65,535$ bytes ($64\text{ KB} - 1\text{ byte}$). This parameter is negotiated via `SETTINGS_INITIAL_WINDOW_SIZE`.
+2. **Initial Stream Window vs Connection Window Mechanics (RFC 9113 Section 6.5.2 & Section 6.9)**:
+   - By default, the initial flow control window for both individual streams and the overall connection starts at exactly $65,535$ bytes ($2^{16} - 1$ octets).
+   - Crucially, the HTTP/2 parameter `SETTINGS_INITIAL_WINDOW_SIZE` (0x04) **only** configures the stream-level flow control window. RFC 9113 Section 6.5.2 explicitly specifies: *"A SETTINGS frame cannot alter the connection flow-control window."*
+   - To expand the connection-level flow control window beyond the default 65,535 octets, an endpoint cannot rely on `SETTINGS`; it must explicitly transmit a `WINDOW_UPDATE` frame on **Stream ID 0** (the connection stream) immediately following connection establishment, granting additional byte credits (e.g., sending an increment of $16,777,216 - 65,535 = 16,711,681$ bytes to establish a 16 MB connection window).
+   - If a client or server scales `SETTINGS_INITIAL_WINDOW_SIZE` to 4 MB without simultaneously emitting a Stream 0 `WINDOW_UPDATE`, individual streams believe they can send 4 MB, but the shared connection credit remains choked at 64 KB!
 3. **Payload Chunk Dynamics vs Window Capacity**: In our ingestion pipeline, individual telemetry chunks ranged from 32 KB to 256 KB. A single 128 KB payload instantly consumed the entire 65,535 byte stream credit and exhausted the connection window simultaneously.
 4. **Bandwidth-Delay Product (BDP) Throttling**: On modern cloud infrastructure, network throughput is governed by the Bandwidth-Delay Product:
    $$\text{BDP} = \text{Bandwidth} \times \text{RTT}$$
@@ -175,7 +180,9 @@ To remediate the deadlock, we adjusted both the initial stream flow control wind
 
 ### Remediation 2: Java Netty Channel Tuning & Asynchronous Reactive Backpressure
 
-In gRPC-Java, setting `flowControlWindow()` on the `NettyChannelBuilder` expands the HTTP/2 frame window, while `CallStreamObserver.setOnReadyHandler()` and `isReady()` prevent outbound buffer bloat [Source: NettyChannelBuilder Flow Control (https://grpc.github.io/grpc-java/javadoc/io/grpc/netty/NettyChannelBuilder.html)]:
+In gRPC-Java, setting `flowControlWindow()` on the `NettyChannelBuilder` expands the HTTP/2 frame window. On the application layer, calling `ClientCallStreamObserver.setOnReadyHandler()` after starting an RPC will trigger `java.lang.IllegalStateException: Cannot setOnReadyHandler after start`. 
+
+To implement reactive backpressure safely, client streaming calls must supply a `ClientResponseObserver<ReqT, RespT>` and register `setOnReadyHandler` inside the `beforeStart()` lifecycle callback before the request stream begins [Source: gRPC Java ClientResponseObserver Javadoc (https://grpc.github.io/grpc-java/javadoc/io/grpc/stub/ClientResponseObserver.html)]:
 
 ```diff
 --- src/main/java/com/telemetry/pipeline/GrpcClientTransport.java.orig
@@ -196,25 +203,47 @@ In gRPC-Java, setting `flowControlWindow()` on the `NettyChannelBuilder` expands
 ```
 
 ```java
-// Reactive non-blocking producer using CallStreamObserver backpressure
-ClientCallStreamObserver<TelemetryChunk> clientCallObserver =
-    (ClientCallStreamObserver<TelemetryChunk>) asyncStub.streamTelemetry(responseObserver);
+// Production-grade reactive backpressure using ClientResponseObserver & CallStreamObserver
+ClientResponseObserver<TelemetryChunk, TelemetryResponse> responseObserver =
+    new ClientResponseObserver<TelemetryChunk, TelemetryResponse>() {
+        @Override
+        public void beforeStart(final ClientCallStreamObserver<TelemetryChunk> requestStream) {
+            // Must be configured in beforeStart prior to call execution to prevent IllegalStateException
+            requestStream.setOnReadyHandler(new Runnable() {
+                @Override
+                public void run() {
+                    // Loop as long as the transport layer has available flow control credits
+                    while (requestStream.isReady() && !chunkQueue.isEmpty()) {
+                        TelemetryChunk chunk = chunkQueue.poll();
+                        if (chunk != null) {
+                            requestStream.onNext(chunk);
+                        }
+                    }
+                    if (chunkQueue.isEmpty() && isIngestComplete) {
+                        requestStream.onCompleted();
+                    }
+                }
+            });
+        }
 
-clientCallObserver.setOnReadyHandler(new Runnable() {
-    @Override
-    public void run() {
-        // Only pump messages when the underlying HTTP/2 stream window is ready
-        while (clientCallObserver.isReady() && chunkQueue.peek() != null) {
-            TelemetryChunk chunk = chunkQueue.poll();
-            if (chunk != null) {
-                clientCallObserver.onNext(chunk);
-            }
+        @Override
+        public void onNext(TelemetryResponse response) {
+            log.debug("Telemetry chunk acknowledged: {}", response.getStatus());
         }
-        if (chunkQueue.isEmpty() && isIngestComplete) {
-            clientCallObserver.onCompleted();
+
+        @Override
+        public void onError(Throwable t) {
+            log.error("Streaming RPC error encountered: {}", t.getMessage(), t);
         }
-    }
-});
+
+        @Override
+        public void onCompleted() {
+            log.info("Telemetry ingest streaming completed successfully");
+        }
+    };
+
+// Initiate bidirectional streaming RPC with registered backpressure handler
+asyncStub.streamTelemetry(responseObserver);
 ```
 
 ### Remediation 3: Envoy Edge Gateway Tuning
@@ -243,8 +272,11 @@ clientCallObserver.setOnReadyHandler(new Runnable() {
 To validate that HTTP/2 flow control windows are operating without credit depletion, run the following diagnostic commands across the telemetry worker fleet:
 
 ```bash
-# 1. Capture HTTP/2 WINDOW_UPDATE frames and TCP flags on port 50051
+# 1. Capture TCP segments with PSH flag asserted (flushed transport segments) or inspect L7 HTTP/2 WINDOW_UPDATE frames (type 8)
 tcpdump -nn -s 0 -i any 'tcp port 50051 and (tcp[13] & 0x08 != 0)' -c 50
+
+# 1-b. Specifically isolate HTTP/2 WINDOW_UPDATE frames (Frame Type 0x08) using tshark
+tshark -nn -i any -f "tcp port 50051" -d tcp.port==50051,http2 -Y "http2.type == 8" -c 20
 
 # 2. Inspect active gRPC TCP socket state, internal send/recv queues, and TCP window scaling
 ss -ti '( sport = :50051 or dport = :50051 )'
@@ -252,11 +284,11 @@ ss -ti '( sport = :50051 or dport = :50051 )'
 # 3. Check Linux TCP statistics for segment drops, retransmits, or buffer collapses
 netstat -s --tcp | grep -E "segments|retransmitted|buffer errors"
 
-# 4. Query Envoy upstream cluster health and HTTP/2 window depletion counters via admin interface
-curl -s http://127.0.0.1:15000/stats | grep -E "upstream_cx_http2_flow_control|upstream_rq_timeout"
+# 4. Query Envoy upstream cluster HTTP/2 flow control metrics and buffer watermarks via admin interface
+curl -s http://127.0.0.1:15000/stats | grep -E "http2\.pending_send_bytes|upstream_flow_control_paused_reading_total|upstream_flow_control_backed_up_total|upstream_rq_timeout"
 
-# 5. Validate end-to-end telemetry ingest rate and gRPC stream throughput
-curl -s http://localhost:8080/metrics | grep -E "grpc_server_handled_total|grpc_transport_flow_control_window_depleted"
+# 5. Validate gRPC service latency distributions and blocked thread counters in Prometheus
+curl -s http://localhost:8080/metrics | grep -E "grpc_server_handled_total|grpc_server_handling_seconds_bucket|go_goroutines"
 ```
 
 ---
@@ -268,7 +300,7 @@ Following the rollout of the 4 MB stream and 16 MB connection flow control windo
 * **Throughput Restoration**: Ingest network throughput scaled from a throttled **524 Mbps up to 9.6 Gbps**, achieving 96% link saturation across the 10 Gbps AWS fabric.
 * **P99 Latency Compression**: Ingestion P99 latency collapsed from **10,000ms+ timeout levels down to 1.8ms**.
 * **Zero Stream Deadlocks**: Monitored over 72 consecutive hours of continuous operation with **zero instances of stream starvation or goroutine deadlocks**.
-* **Backpressure Stability**: With `CallStreamObserver.setOnReadyHandler()` in place, producer threads naturally yielded whenever downstream queues experienced transient micro-delays, eliminating memory ballooning and socket drops.
+* **Backpressure Stability**: With `ClientResponseObserver.beforeStart()` and `requestStream.setOnReadyHandler()` in place, producer threads naturally yielded whenever downstream queues experienced transient micro-delays, eliminating memory ballooning and socket drops.
 
 ---
 
@@ -278,8 +310,8 @@ Following the rollout of the 4 MB stream and 16 MB connection flow control windo
 2. **Maintain Connection-to-Stream Window Ratio**: The connection flow control window must be sized to accommodate aggregate stream concurrency:
    $$\text{Connection Window} \ge \min(\text{Concurrent Streams} \times \text{Stream Window}, \text{BDP} \times 4)$$
    Sizing the connection window at 4x the stream window (e.g., 16 MB connection for 4 MB streams) prevents a single bursting stream from starving multiplexed siblings.
-3. **Employ Reactive Streaming APIs**: Avoid unbounded synchronous `SendMsg()` or `onNext()` loops. Use `CallStreamObserver.isReady()` in Java, or buffered Go channel backpressure with `context.WithTimeout()` guards, to decouple transport write capacity from application logic [Source: gRPC Flow Control Guide (https://grpc.io/docs/guides/flow-control/)].
-4. **Alert on Window Depletion Counters**: Monitor `grpc_transport_flow_control_window_depleted` in Prometheus to detect slow consumer degradation before client RPC deadlines expire.
+3. **Employ Reactive Streaming APIs**: Avoid unbounded synchronous `SendMsg()` or `onNext()` loops. Use `ClientResponseObserver.beforeStart()` with `CallStreamObserver.isReady()` in Java, or buffered Go channel backpressure with `context.WithTimeout()` guards, to decouple transport write capacity from application logic [Source: gRPC Flow Control Guide (https://grpc.io/docs/guides/flow-control/)].
+4. **Alert on Flow Control Pressure**: Monitor Envoy's `http2.pending_send_bytes > 0` and Prometheus `grpc_server_handling_seconds` latency bucket spikes to detect slow consumer degradation before client RPC deadlines expire.
 
 ---
 
@@ -291,5 +323,6 @@ Following the rollout of the 4 MB stream and 16 MB connection flow control windo
 * [Official gRPC Documentation: Flow Control in gRPC Core & Language Runtimes](https://grpc.io/docs/guides/flow-control/)
 * [gRPC Go Official Architecture & Concurrency Model](https://github.com/grpc/grpc-go/blob/master/Documentation/concurrency.md)
 * [gRPC Java Javadoc: CallStreamObserver Flow Control](https://grpc.github.io/grpc-java/javadoc/io/grpc/stub/CallStreamObserver.html)
+* [gRPC Java Javadoc: ClientResponseObserver Lifecycle & Flow Control](https://grpc.github.io/grpc-java/javadoc/io/grpc/stub/ClientResponseObserver.html)
 * [gRPC Java Javadoc: NettyChannelBuilder HTTP/2 Flow Control](https://grpc.github.io/grpc-java/javadoc/io/grpc/netty/NettyChannelBuilder.html)
 * [Envoy Gateway & Proxy: HTTP/2 Protocol Options Specification](https://www.envoyproxy.io/docs/envoy/v1.29.1/api-v3/extensions/filters/network/http_connection_manager/v3/http_connection_manager.proto)
