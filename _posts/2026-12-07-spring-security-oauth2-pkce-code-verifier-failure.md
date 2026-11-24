@@ -23,13 +23,19 @@ Immediately following the cutover of our customer-facing identity gateway from a
 Application telemetry captured thousands of token exchange failures at the Spring Security OAuth 2.0 client layer, emitting cryptographic validation rejections from our Keycloak authorization server [Source: Keycloak OpenID Connect & PKCE Documentation (https://www.keycloak.org/docs/latest/securing_apps/)]:
 
 ```text
-2026-12-07T01:34:58.214Z [http-nio-8080-exec-19] ERROR org.springframework.security.oauth2.client.endpoint.DefaultAuthorizationCodeTokenResponseClient - 
-[invalid_grant] The code verifier does not match the code challenge sent in the authorization request
-org.springframework.security.oauth2.core.OAuth2AuthenticationException: [invalid_grant] Invalid code verifier
+# Log Event 1: Pod-B (Identity Gateway Pod 2) - Round-robin session partition failure
+2026-12-07T01:34:58.216Z [http-nio-8080-exec-12] WARN  org.springframework.security.oauth2.client.web.OAuth2LoginAuthenticationFilter - 
+Authentication request failed: org.springframework.security.oauth2.core.OAuth2AuthenticationException: [authorization_request_not_found] Could not find matching authorization request
+HTTP/1.1 400 Bad Request
+Content-Type: application/json;charset=UTF-8
+{"error":"authorization_request_not_found","error_description":"Could not find matching authorization request"}
+
+# Log Event 2: Pod-A (Identity Gateway Pod 1) - Keycloak PKCE cryptographic verification failure
+2026-12-07T01:35:02.104Z [http-nio-8080-exec-19] ERROR org.springframework.security.oauth2.client.endpoint.DefaultAuthorizationCodeTokenResponseClient - 
+An error occurred while attempting to retrieve the OAuth 2.0 Access Token Response: [invalid_grant] The code verifier does not match the code challenge sent in the authorization request
+org.springframework.security.oauth2.core.OAuth2AuthenticationException: [invalid_grant] The code verifier does not match the code challenge sent in the authorization request
 	at org.springframework.security.oauth2.client.endpoint.DefaultAuthorizationCodeTokenResponseClient.getTokenResponse(DefaultAuthorizationCodeTokenResponseClient.java:128)
 	at org.springframework.security.oauth2.client.oidc.authentication.OidcAuthorizationCodeAuthenticationProvider.authenticate(OidcAuthorizationCodeAuthenticationProvider.java:162)
-2026-12-07T01:34:58.216Z [http-nio-8080-exec-19] WARN  org.springframework.security.oauth2.client.web.OAuth2LoginAuthenticationFilter - 
-Authentication request failed: org.springframework.security.oauth2.core.OAuth2AuthenticationException: [authorization_request_not_found] Could not find matching authorization request
 HTTP/1.1 400 Bad Request
 Content-Type: application/json;charset=UTF-8
 {"error":"invalid_grant","error_description":"PKCE verification failed"}
@@ -38,11 +44,12 @@ Content-Type: application/json;charset=UTF-8
 Audit logs confirmed that while the initial authorization request successfully generated a cryptographically random `code_challenge`, the subsequent `/oauth2/token` POST request either transmitted a mismatched `code_verifier` or failed to locate the original request entirely.
 
 ## Production Specs
-* **Application Framework**: Spring Boot 3.3.1 running on JDK 21
+* **Application Framework**: Spring Boot 3.3.1 running on JDK 21 (Eclipse Temurin LTS)
 * **Security Framework**: Spring Security 6.3.0 (`spring-boot-starter-oauth2-client`)
-* **Identity Provider**: Keycloak 24.0.4 configured with standard OpenID Connect (OIDC) & PKCE
-* **Deployment Architecture**: 6x stateless Gateway pods running on Kubernetes v1.29 behind an AWS Application Load Balancer (ALB)
-* **Client Types**: React 18 SPA (Vite) and mobile native applications invoking authorization code flow with PKCE (`S256`)
+* **Identity Provider**: Keycloak 24.0.4 configured with standard OpenID Connect (OIDC) & PKCE (`S256`)
+* **Deployment Architecture**: 6x stateless Gateway pods running on Kubernetes v1.29 (AWS EKS) behind an AWS Application Load Balancer (ALB)
+* **Distributed Session Store**: AWS ElastiCache for Redis 7.1 cluster (3 shards, Multi-AZ)
+* **Client Types**: React 18 SPA (Vite) and mobile native applications (iOS Swift 5.9, Android Kotlin 2.0) invoking authorization code flow with PKCE (`S256`)
 
 ---
 
@@ -53,7 +60,7 @@ The authentication failures originated from two architectural flaws: **state fra
 ```text
 Browser / Client                 AWS ALB                  Pod A (Pod 1)             Pod B (Pod 2)            Keycloak IdP
        │                            │                           │                         │                       │
-       ├── 1. GET /oauth2/authorize ┼──────────────────────────►│                         │                       │
+       ├── 1. GET /oauth2/authorization/keycloak ──────────────►│                         │                       │
        │   (Generates PKCE Pair)    │                           │ Store code_verifier     │                       │
        │                            │                           │ in LOCAL HttpSession!   │                       │
        │                            │                           │                         │                       │
@@ -76,7 +83,7 @@ Browser / Client                 AWS ALB                  Pod A (Pod 1)         
 
 ### 1. Ingress Round-Robin and Session Partitioning
 1. **The PKCE Mechanism**: RFC 7636 specifies Proof Key for Code Exchange (PKCE) to protect public clients [Source: RFC 7636 (https://datatracker.ietf.org/doc/html/rfc7636)]. The client generates a high-entropy cryptographic secret `code_verifier` (43 to 128 characters) and derives `code_challenge = BASE64URL-ENCODE(SHA256(ASCII(code_verifier)))`.
-2. **Spring Security Default Behavior**: Spring Security's default implementation, `HttpSessionOAuth2AuthorizationRequestRepository`, stores the ongoing `OAuth2AuthorizationRequest` (including the secret `code_verifier`) inside the local in-memory `HttpSession` of the specific JVM pod that handled the initial `/oauth2/authorize` request [Source: Spring Security Authorization Grant Documentation (https://docs.spring.io/spring-security/reference/servlet/oauth2/client/authorization-grants.html)].
+2. **Spring Security Default Behavior**: Spring Security's default implementation, `HttpSessionOAuth2AuthorizationRequestRepository`, stores the ongoing `OAuth2AuthorizationRequest` (including the secret `code_verifier`) inside the local in-memory `HttpSession` of the specific JVM pod that handled the initial `/oauth2/authorization/keycloak` request [Source: Spring Security Authorization Grant Documentation (https://docs.spring.io/spring-security/reference/servlet/oauth2/client/authorization-grants.html)].
 3. **Stateless Load Balancing Incompatibility**: Because the ingress ALB used standard round-robin routing without sticky sessions or distributed session replication, step 1 was processed by Pod A. When Keycloak redirected the client browser back with the authorization code (`/login/oauth2/code/keycloak?code=...`), the ALB routed the request to Pod B.
 4. **Context Loss**: Pod B checked its local in-memory session, found no matching authorization request, and threw `authorization_request_not_found`. In cases where the client attempted to supply the `code_verifier` directly, subtle token serialization mismatches occurred.
 
@@ -105,9 +112,9 @@ During emergency remediation, multiple suboptimal workarounds were attempted:
 ## 3. Production Remediation: Before vs. After Unified Diff
 
 To build a resilient, horizontally scalable OAuth 2.0 PKCE architecture, we implemented [Source: Spring Security 6 Advanced OAuth 2.0 Login (https://docs.spring.io/spring-security/reference/servlet/oauth2/login/advanced.html)]:
-1. **Stateless Encrypted Cookie / Redis Distributed Authorization Request Repository**: Store the authorization request and `code_verifier` in a distributed Redis session store or inside an encrypted HTTP-only cookie [Source: Spring Session with Redis (https://docs.spring.io/spring-session/reference/guides/boot-redis.html)].
-2. **Strict RFC 7636 Base64URL Encoding**: Guarantee zero padding and safe URL characters for the `code_challenge`.
-3. **Spring Security Distributed Configuration**:
+1. **Stateless Encrypted Cookie Authorization Request Repository**: Store the temporary authorization request and `code_verifier` inside an encrypted, `HttpOnly`, `SameSite=Lax` cookie via `HttpCookieOAuth2AuthorizationRequestRepository`, eliminating server-side session dependencies during the redirect handshake.
+2. **Distributed Session Clustering for Authenticated State**: Configure Spring Session with Redis (`@EnableRedisHttpSession`) to share authenticated user sessions (`SecurityContext`) horizontally across all Kubernetes pods [Source: Spring Session with Redis (https://docs.spring.io/spring-session/reference/guides/boot-redis.html)].
+3. **Strict RFC 7636 Base64URL Encoding**: Guarantee zero padding and safe URL characters for the `code_challenge` across web and mobile clients.
 
 Apply the following production patch to configure `HttpCookieOAuth2AuthorizationRequestRepository` and Redis session synchronization:
 
@@ -136,7 +143,7 @@ Apply the following production patch to configure `HttpCookieOAuth2Authorization
              .oauth2Login(oauth2 -> oauth2
 -                // WRONG: Default uses in-memory HttpSession, failing behind round-robin ALBs
 +                .authorizationEndpoint(authorization -> authorization
-+                    .baseUri("/oauth2/authorize")
++                    .baseUri("/oauth2/authorization")
 +                    .authorizationRequestRepository(cookieAuthorizationRequestRepository)
 +                )
 +                .redirectionEndpoint(redirection -> redirection
@@ -147,12 +154,47 @@ Apply the following production patch to configure `HttpCookieOAuth2Authorization
      }
 ```
 
+Implementation outline of `HttpCookieOAuth2AuthorizationRequestRepository`:
+
+```java
+public class HttpCookieOAuth2AuthorizationRequestRepository 
+        implements AuthorizationRequestRepository<OAuth2AuthorizationRequest> {
+
+    public static final String OAUTH2_AUTHORIZATION_REQUEST_COOKIE_NAME = "oauth2_auth_request";
+    private static final int COOKIE_EXPIRE_SECONDS = 180;
+
+    @Override
+    public OAuth2AuthorizationRequest loadAuthorizationRequest(HttpServletRequest request) {
+        return CookieUtils.getCookie(request, OAUTH2_AUTHORIZATION_REQUEST_COOKIE_NAME)
+                .map(cookie -> CookieUtils.deserialize(cookie, OAuth2AuthorizationRequest.class))
+                .orElse(null);
+    }
+
+    @Override
+    public void saveAuthorizationRequest(OAuth2AuthorizationRequest authRequest, 
+            HttpServletRequest request, HttpServletResponse response) {
+        if (authRequest == null) {
+            CookieUtils.deleteCookie(request, response, OAUTH2_AUTHORIZATION_REQUEST_COOKIE_NAME);
+            return;
+        }
+        CookieUtils.addCookie(response, OAUTH2_AUTHORIZATION_REQUEST_COOKIE_NAME, 
+                CookieUtils.serialize(authRequest), COOKIE_EXPIRE_SECONDS);
+    }
+
+    @Override
+    public OAuth2AuthorizationRequest removeAuthorizationRequest(HttpServletRequest request, 
+            HttpServletResponse response) {
+        return this.loadAuthorizationRequest(request);
+    }
+}
+```
+
 Apply the following patch to the client-side cryptographic PKCE utility:
 
 ```diff
 --- utils/PkceUtil.java.orig
 +++ utils/PkceUtil.java
-@@ -12,12 +12,16 @@
+@@ -12,12 +16,21 @@
      public static String generateCodeChallenge(String codeVerifier) throws NoSuchAlgorithmException {
          byte[] bytes = codeVerifier.getBytes(StandardCharsets.US_ASCII);
          MessageDigest messageDigest = MessageDigest.getInstance("SHA-256");
@@ -160,7 +202,11 @@ Apply the following patch to the client-side cryptographic PKCE utility:
 -        // WRONG: Standard Base64 introduces '+', '/', and '=' padding
 -        return Base64.getEncoder().encodeToString(digest);
 +        // Correct: RFC 7636 mandates unpadded Base64URL encoding (S256)
++        // Standard Java 8+ / JDK 21:
 +        return Base64.getUrlEncoder().withoutPadding().encodeToString(digest);
++        // NOTE: On legacy Android SDK < 26 (without desugaring), use:
++        // return android.util.Base64.encodeToString(digest, 
++        //     android.util.Base64.URL_SAFE | android.util.Base64.NO_PADDING | android.util.Base64.NO_WRAP);
      }
 ```
 
@@ -182,7 +228,7 @@ Update Redis Session configuration in `application.yml`:
 
 ## 4. Verification CLI & Live Cluster Diagnostics
 
-Execute the following diagnostic commands to test PKCE token generation, verify Kubernetes pod distribution, inspect Redis session replication across worker nodes, and validate live token exchange:
+Execute the following diagnostic commands to test PKCE token generation, verify Kubernetes pod distribution, inspect stateless cookie headers, verify Redis session replication, and validate live token exchange:
 
 ```bash
 # 1. Verify host active network sockets and ensure Redis session port is reachable
@@ -199,10 +245,13 @@ CODE_CHALLENGE=$(echo -n "$CODE_VERIFIER" | openssl dgst -sha256 -binary | opens
 echo "Verifier:  $CODE_VERIFIER"
 echo "Challenge: $CODE_CHALLENGE"
 
-# 4. Inspect Redis cluster to confirm authorization requests are successfully shared across pods
-redis-cli -h redis.prod.internal -p 6379 KEYS "spring:session:oauth2:*"
+# 4. Verify stateless encrypted cookie generation on initial OAuth2 authorization redirect
+curl -v -k -s "https://gateway.ideaspot360.com/oauth2/authorization/keycloak" -o /dev/null 2>&1 | grep -i "set-cookie"
 
-# 5. Perform an end-to-end token exchange simulation against Keycloak via curl
+# 5. Inspect Redis session store using non-blocking SCAN to verify session synchronization across pods
+redis-cli -h redis.prod.internal -p 6379 --scan --pattern "spring:session:oauth2:sessions:*"
+
+# 6. Perform an end-to-end token exchange simulation against Keycloak via curl
 curl -v -X POST https://idp.ideaspot360.com/realms/production/protocol/openid-connect/token \
   -H "Content-Type: application/x-www-form-urlencoded" \
   -d "grant_type=authorization_code" \
@@ -224,6 +273,7 @@ To prevent recurring OAuth 2.0 PKCE failures across multi-instance cloud environ
 2. **Stateless Authorization Request Storage**: Never permit in-memory `HttpSessionOAuth2AuthorizationRequestRepository` in clustered or autoscaling cloud environments. Enforce encrypted cookie or Redis-backed repositories [Source: Spring Security 6 Reference (https://docs.spring.io/spring-security/reference/servlet/oauth2/login/advanced.html)].
 3. **Strict RFC 7636 S256 Compliance**: Automatically validate that all code challenge generation libraries enforce unpadded Base64URL encoding via automated unit and integration tests.
 4. **IdP Clock Skew Tolerances**: Configure a 30-to-60 second clock skew tolerance in Spring Security (`JwtTimestampValidator`) to prevent transient token expiration during rapid token exchange.
+5. **Legacy Mobile SDK Desugaring**: On Android clients supporting API Level < 26, ensure Java 8+ API desugaring is enabled or use `android.util.Base64` with `URL_SAFE | NO_PADDING | NO_WRAP` flags.
 
 ---
 
