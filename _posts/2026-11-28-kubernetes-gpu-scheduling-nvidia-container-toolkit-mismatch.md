@@ -77,7 +77,7 @@ The affected environment comprised dedicated GPU worker nodes provisioned on AWS
 * **Resident Kernel Driver**: NVIDIA UNIX x86_64 Kernel Module `535.129.03`
 * **Upgraded Userspace Packages**: `nvidia-driver-535`, `nvidia-utils-535`, `libnvidia-compute-535` (`535.161.07-0ubuntu0.22.04.1`)
 * **Container Runtime**: `containerd` v1.7.13 with CRI plugin v1
-* **NVIDIA Container Toolkit**: `nvidia-container-toolkit` v1.15.0-1 (configured via `nvidia-ctk`)
+* **NVIDIA Container Toolkit**: `nvidia-container-toolkit` v1.16.2-1 (configured via `nvidia-ctk`)
 * **Device Plugin**: `nvidia/k8s-device-plugin:v0.15.0` deployed via Helm DaemonSet
 
 ---
@@ -184,7 +184,7 @@ Pin driver packages to exact production-tested versions and blacklist NVIDIA rep
 +
 +# 1. Install explicit, pinned versions of NVIDIA driver and container toolkit
 +DRIVER_VERSION="535.161.07-0ubuntu0.22.04.1"
-+TOOLKIT_VERSION="1.15.0-1"
++TOOLKIT_VERSION="1.16.2-1"
 +
 +apt-get install -y \
 +    nvidia-driver-535=${DRIVER_VERSION} \
@@ -205,7 +205,8 @@ Pin driver packages to exact production-tested versions and blacklist NVIDIA rep
  
  # Configure containerd runtime for NVIDIA Container Toolkit
 -nvidia-ctk runtime configure --runtime=containerd
-+nvidia-ctk runtime configure --runtime=containerd --set-as-default
++nvidia-ctk runtime configure --runtime=containerd --set-as-default --cdi.enabled
++nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
 +systemctl restart containerd
 ```
 
@@ -216,12 +217,13 @@ Modern container architectures leverage Container Device Interface (CDI) specifi
 ```diff
 --- /etc/containerd/config.toml.orig
 +++ /etc/containerd/config.toml
-@@ -35,8 +35,21 @@
+@@ -32,10 +32,23 @@
+   [plugins."io.containerd.grpc.v1.cri"]
++    # Enable Container Device Interface (CDI) spec parsing in containerd CRI
++    enable_cdi = true
++    cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]
      [plugins."io.containerd.grpc.v1.cri".containerd]
        default_runtime_name = "nvidia"
-+      # Enable Container Device Interface (CDI) spec parsing in containerd
-+      enable_cdi = true
-+      cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]
        [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
            runtime_type = "io.containerd.runc.v2"
@@ -235,13 +237,13 @@ Modern container architectures leverage Container Device Interface (CDI) specifi
 +            SystemdCgroup = true
 ```
 
-### Unified Diff 3: NVIDIA Device Plugin Helm Configuration (`deploy/helm/nvidia-device-plugin/values.yaml`)
+### Unified Diff 3: NVIDIA Device Plugin Helm Configuration (`deployments/helm/nvidia-device-plugin/values.yaml`)
 
 Configure the Device Plugin to validate NVML health on startup, support CDI device discovery, and define explicit tolerations for GPU node taints [Source: NVIDIA k8s-device-plugin Documentation (https://github.com/NVIDIA/k8s-device-plugin)]:
 
 ```diff
---- deploy/helm/nvidia-device-plugin/values.yaml.orig
-+++ deploy/helm/nvidia-device-plugin/values.yaml
+--- deployments/helm/nvidia-device-plugin/values.yaml.orig
++++ deployments/helm/nvidia-device-plugin/values.yaml
 @@ -8,9 +8,17 @@
    failOnInitError: true
    passDeviceSpecs: true
@@ -249,8 +251,6 @@ Configure the Device Plugin to validate NVML health on startup, support CDI devi
 +  # Leverage CDI annotations for modern containerd CRI device injection
 +  deviceListStrategy: "cdi-annotations"
 +  cdiAnnotationPrefix: "cdi.k8s.io/"
-+  # Automatic node remediation: fail liveness probe when NVML detects driver mismatch
-+  devicePluginPath: "/var/lib/kubelet/device-plugins"
  tolerations:
    - key: "nvidia.com/gpu"
      operator: "Exists"
@@ -268,7 +268,7 @@ Configure the Device Plugin to validate NVML health on startup, support CDI devi
 
 ## 6. Field Diagnostic & Verification CLI Commands
 
-Execute the following commands on the affected Kubernetes nodes and control plane to diagnose version mismatches, verify runtime hooks, and confirm GPU allocatable registration:
+Execute the following commands on the affected Kubernetes nodes and control plane to diagnose version mismatches, verify runtime hooks via `crictl`, and confirm GPU allocatable registration:
 
 ```bash
 # 1. Inspect kernel logs for NVRM API mismatch signatures
@@ -292,14 +292,22 @@ nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
 sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
 sudo nvidia-ctk cdi list
 
-# 7. Restart containerd and uncordon the node
+# 7. Verify containerd CRI configuration and CDI discovery directories via crictl
+sudo crictl info | jq '.config.enableCDI, .config.cdiSpecDirs'
+
+# 8. Check for crashed containers and inspect container pre-start hook error logs via CRI
+sudo crictl ps -a --state Exited
+# If any container failed during pre-start hook:
+# sudo crictl inspect <container-id> | jq '.status.reason, .status.message'
+
+# 9. Restart containerd and uncordon the node
 sudo systemctl restart containerd
 kubectl uncordon ip-10-0-45-12.ec2.internal
 
-# 8. Verify that Kubelet registers allocatable nvidia.com/gpu resources
+# 10. Verify that Kubelet registers allocatable nvidia.com/gpu resources
 kubectl describe node ip-10-0-45-12.ec2.internal | grep -A 8 "Allocatable:"
 
-# 9. Deploy a verification GPU test pod to validate end-to-end container execution
+# 11. Deploy a verification GPU test pod to validate end-to-end container execution
 cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: Pod
@@ -329,6 +337,7 @@ kubectl delete pod gpu-smoke-test
 Following the deployment of pinned package templates, CDI configuration, and coordinated node reboots, the GPU cluster demonstrated complete operational restoration:
 
 * **Kernel and Userspace Alignment**: After the node reboot, `cat /proc/driver/nvidia/version` reported driver `535.161.07`, matching `nvidia-smi` and userspace `libnvidia-ml.so` without any `NVRM: API mismatch` errors in `dmesg`.
+* **CRI Runtime and CDI Verification**: Executing `crictl info` confirmed that containerd was actively running with `enableCDI: true` and successfully resolved CDI devices under `/etc/cdi/nvidia.yaml`.
 * **Kubernetes Allocatable Restoration**: Within 18 seconds of node uncordoning, Kubelet's device plugin registration completed. `kubectl get node ip-10-0-45-12.ec2.internal -o jsonpath='{.status.allocatable}'` reflected `nvidia.com/gpu: 8`.
 * **Pod Scheduling & Hook Execution**: The `gpu-smoke-test` pod was assigned to the recovered node within 1.4 seconds, successfully passed the containerd CDI runtime hook without exit code 128, and printed full GPU telemetry from inside the container.
 * **Unattended Upgrade Isolation**: Verification with `unattended-upgrades --dry-run --debug` confirmed that all `nvidia-driver-*` and `libnvidia-*` packages were skipped by the upgrade engine, guaranteeing that silent background updates will not desynchronize kernel modules in production.
