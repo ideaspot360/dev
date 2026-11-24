@@ -10,7 +10,9 @@ fact_check_sources:
   - "https://man7.org/linux/man-pages/man7/tcp.7.html"
   - "https://www.kernel.org/doc/Documentation/networking/ip-sysctl.rst"
   - "https://github.com/torvalds/linux/blob/master/net/ipv4/tcp_ipv4.c"
+  - "https://github.com/torvalds/linux/blob/master/net/ipv4/tcp_input.c"
   - "https://github.com/torvalds/linux/blob/master/include/net/sock.h"
+  - "https://github.com/torvalds/linux/blob/master/include/net/tcp.h"
   - "https://man7.org/linux/man-pages/man8/ss.8.html"
 verification_date: "2026-11-24"
 ---
@@ -108,16 +110,38 @@ Client                              Linux Kernel Network Stack                  
 ```
 
 #### 1. The SYN Queue (Half-Open Sockets / `SYN_RECV`)
-When a client sends an initial `SYN` packet, the kernel creates a lightweight `request_sock` data structure and assigns the socket to the `SYN_RECV` state within the SYN queue. The ceiling of this queue is governed by:
-* `net.ipv4.tcp_max_syn_backlog` (Historically defaulted to 128 or 1024) [Source: Linux Kernel IP Sysctl Documentation](https://www.kernel.org/doc/Documentation/networking/ip-sysctl.rst).
+When a client sends an initial `SYN` packet, the kernel creates a lightweight `request_sock` data structure and assigns the socket to the `SYN_RECV` state within the SYN queue. While commonly assumed to depend solely on `net.ipv4.tcp_max_syn_backlog`, the Linux kernel (`net/core/request_sock.c`) bounds the SYN queue capacity by both the application backlog and OS limits:
+
+$$\text{nr\_table\_entries} = \min(\min(\text{backlog}, \text{net.core.somaxconn}), \text{net.ipv4.tcp\_max\_syn\_backlog})$$
+$$\text{Final SYN Queue Capacity} = \text{roundup\_pow\_of\_two}(\max(\text{nr\_table\_entries}, 8) + 1)$$
+
+Consequently, if `somaxconn` or the application socket backlog remains clamped at 100, the kernel will limit the SYN queue to 128 entries regardless of how large `tcp_max_syn_backlog` is tuned [Source: Linux Kernel IP Sysctl Documentation](https://www.kernel.org/doc/Documentation/networking/ip-sysctl.rst).
 
 #### 2. The Accept Queue (Fully Established Sockets / `ESTABLISHED`)
 When the client replies with the final `ACK` packet completing the three-way handshake, the kernel moves the connection from the SYN queue into the Accept Queue (`icsk_accept_queue`). The socket enters the `ESTABLISHED` state, awaiting the user-space process to invoke `accept()` or `accept4()`. The maximum depth of this queue is:
-* `min(net.core.somaxconn, backlog_parameter_in_listen_syscall)`
+* $\min(\text{net.core.somaxconn}, \text{backlog})$
 * The default `net.core.somaxconn` on older Linux kernels was 128, and on modern distributions is 4096.
 
-### Deep Dive into Kernel Source Code (`net/ipv4/tcp_ipv4.c`)
+### Deep Dive into Kernel Source Code: Dual-Gate Drop Enforcement
 
+The Linux kernel enforces `sk_acceptq_is_full(sk)` as a dual-gate protective barrier at two distinct stages of the connection lifecycle:
+
+#### Gate A: Early SYN Ingress Check (`net/ipv4/tcp_input.c: tcp_conn_request()`)
+When a new connection request arrives, the kernel checks whether the listener's Accept Queue is already saturated before attempting to allocate a half-open socket [Source: Linux Kernel Source net/ipv4/tcp_input.c](https://github.com/torvalds/linux/blob/master/net/ipv4/tcp_input.c):
+
+```c
+/* TW buckets are converted to full sockets without
+ * going through the queue, but that does not matter.
+ */
+if (sk_acceptq_is_full(sk)) {
+    NET_INC_STATS(sock_net(sk), LINUX_MIB_LISTENOVERFLOWS);
+    goto drop;
+}
+```
+
+If `sk_acceptq_is_full(sk)` evaluates to true, the kernel jumps to `drop:`, invokes `tcp_listendrop(sk)` which increments `LINUX_MIB_LISTENDROPS`, and silently discards the incoming `SYN` packet. This dual-gate behavior directly accounts for the `142982 SYNs to LISTEN sockets dropped` reported in `netstat -s`.
+
+#### Gate B: Handshake Completion ACK Check (`net/ipv4/tcp_ipv4.c: tcp_v4_syn_recv_sock()`)
 When the final ACK arrives, the kernel invokes `tcp_v4_syn_recv_sock()` to transition the socket into the Accept Queue [Source: Linux Kernel Source net/ipv4/tcp_ipv4.c](https://github.com/torvalds/linux/blob/master/net/ipv4/tcp_ipv4.c):
 
 ```c
@@ -141,7 +165,19 @@ exit_overflow:
     NET_INC_STATS(sock_net(sk), LINUX_MIB_LISTENOVERFLOWS);
 exit_nonewsk:
     dst_release(dst);
+exit:
+    tcp_listendrop(sk);
     return NULL;
+}
+```
+
+Inside `include/net/tcp.h`, `tcp_listendrop(sk)` increments both the socket atomic drop counter and the global SNMP metric [Source: Linux Kernel Source include/net/tcp.h](https://github.com/torvalds/linux/blob/master/include/net/tcp.h):
+
+```c
+static inline void tcp_listendrop(const struct sock *sk)
+{
+    sk_drops_inc((struct sock *)sk);
+    __NET_INC_STATS(sock_net(sk), LINUX_MIB_LISTENDROPS);
 }
 ```
 
@@ -154,11 +190,12 @@ static inline bool sk_acceptq_is_full(const struct sock *sk)
 }
 ```
 
-When `sk_ack_backlog` (unaccepted connections) exceeds `sk_max_ack_backlog` (`min(somaxconn, backlog)`), the kernel:
-1. Skips child socket creation.
+Notice that Linux uses strict inequality (`>`): the queue is permitted to hold up to `sk_max_ack_backlog + 1` entries before drops occur. When `sk_ack_backlog` (unaccepted connections) exceeds `sk_max_ack_backlog` ($\min(\text{somaxconn}, \text{backlog})$), the kernel:
+1. Skips child socket creation and jumps to `exit_overflow`.
 2. Increments `LINUX_MIB_LISTENOVERFLOWS` (exported as `TcpExtListenOverflows`).
-3. Silently discards the ACK packet (unless `tcp_abort_on_overflow=1`).
-4. Forces the client to retransmit the ACK after exponential backoff intervals (1s, 3s, 9s), directly causing upstream proxy gateway timeouts.
+3. Falls through to `tcp_listendrop(sk)`, incrementing `LINUX_MIB_LISTENDROPS` (exported as `TcpExtListenDrops`).
+4. Silently discards the ACK packet (unless `tcp_abort_on_overflow=1`).
+5. Forces the client to retransmit the ACK after exponential backoff intervals (1s, 3s, 9s), directly causing upstream proxy gateway timeouts.
 
 ---
 
@@ -394,5 +431,7 @@ Preventing connection queue starvation requires proactive architectural practice
 * [Linux Manual Pages: tcp(7) - TCP Protocol Configuration and Sysctl Flags](https://man7.org/linux/man-pages/man7/tcp.7.html)
 * [Linux Kernel IP Sysctl Documentation: somaxconn and tcp_max_syn_backlog](https://www.kernel.org/doc/Documentation/networking/ip-sysctl.rst)
 * [Linux Kernel Source: net/ipv4/tcp_ipv4.c - tcp_v4_syn_recv_sock Implementation](https://github.com/torvalds/linux/blob/master/net/ipv4/tcp_ipv4.c)
+* [Linux Kernel Source: net/ipv4/tcp_input.c - tcp_conn_request Accept Queue Full Drop Logic](https://github.com/torvalds/linux/blob/master/net/ipv4/tcp_input.c)
 * [Linux Kernel Source: include/net/sock.h - sk_acceptq_is_full Socket Queue Helpers](https://github.com/torvalds/linux/blob/master/include/net/sock.h)
+* [Linux Kernel Source: include/net/tcp.h - tcp_listendrop Drop Counter Implementation](https://github.com/torvalds/linux/blob/master/include/net/tcp.h)
 * [Linux Manual Pages: ss(8) - Another Utility to Investigate Sockets](https://man7.org/linux/man-pages/man8/ss.8.html)
