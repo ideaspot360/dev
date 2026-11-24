@@ -84,16 +84,18 @@ Querying the kernel network softnet statistics via `cat /proc/net/softnet_stat` 
 
 ```bash
 $ cat /proc/net/softnet_stat
-00075a32 0001a418 00004b21 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
-00012490 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
-00013110 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+00075a32 0001a418 00004b21 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+00012490 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+00013110 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
 ...
 ```
 
-The format of `/proc/net/softnet_stat` is defined directly in `net/core/dev.c`:
+The format of `/proc/net/softnet_stat` is defined in the Linux kernel (`net/core/net-procfs.c` and `net/core/dev.c` via `softnet_seq_show`):
 * **Column 1 (`processed`)**: Total network frames processed through NAPI polling (`sd->processed`).
 * **Column 2 (`dropped`)**: Packets dropped because the per-CPU input backlog queue overflowed (`sd->dropped`, controlled by `net.core.netdev_max_backlog`).
 * **Column 3 (`time_squeeze`)**: The number of times `net_rx_action()` ran out of its NAPI budget or time quota (`net.core.netdev_budget` or `net.core.netdev_budget_usecs`) while additional packets remained in the queue.
+* **Column 9 (`received_rps`)**: The number of times this CPU was woken up via an Inter-Processor Interrupt (IPI) by another CPU to process packets through RPS.
+* **Column 11 (`input_qlen`)**: The current backlog packet queue length on this CPU core.
 
 ### Driver-Specific RX Drop Metric Signatures
 
@@ -101,7 +103,7 @@ Depending on the underlying virtualization and hardware NIC architecture, packet
 
 | NIC Driver & Hardware | Hardware Drop Counter | Backlog/SoftIRQ Drop Counter | Primary Root Cause Indicator |
 | :--- | :--- | :--- | :--- |
-| **Intel ice / ixgbe (Bare-Metal)** | `rx_no_buffer_count`, `rx_missed_errors` | `rx_dropped`, softnet col 2/3 | RX ring descriptor buffer exhaustion |
+| **Intel ice / ixgbe (Bare-Metal)** | `rx_no_buffer_count`, `rx_missed_errors`, `rx_dropped.nic` | `rx_dropped`, softnet col 2/3 | RX ring descriptor buffer exhaustion |
 | **AWS ENA (EC2 Nitro Instances)** | `rx_overruns`, `ena_hw_stats/rx_drops` | `rx_queue_0_drops`, softnet col 2 | Elastic Network Adapter queue exhaustion |
 | **Virtio_net (KVM / QEMU / Cloud)** | `rx_drop`, `rx_reset` | `rx_queue_0_drops`, softnet col 3 | Guest vCPU ksoftirqd scheduling latency |
 
@@ -120,6 +122,8 @@ Depending on the underlying virtualization and hardware NIC architecture, packet
 Because clients logged TCP connection resets and timeouts, the on-call SRE suspected that the TCP listen queue was overflowing. They expanded `net.core.somaxconn` to `65535`, `net.ipv4.tcp_max_syn_backlog` to `32768`, and boosted `net.core.rmem_max` to 64 MiB.
 
 This had zero impact on the packet drops. In Linux network architecture, listen backlogs reside inside the TCP socket layer (L4). The packets being dropped in this incident never made it past the physical network interface driver. Because the NIC RX ring buffer was exhausted and the SoftIRQ subsystem was throttled, the kernel discarded incoming Ethernet frames before the TCP three-way handshake (`SYN`) could ever be parsed [Source: Linux Kernel Source - net/core/dev.c](https://github.com/torvalds/linux/blob/master/net/core/dev.c).
+
+Furthermore, outdated tuning guides often suggest enabling `net.ipv4.tcp_tw_recycle` to aggressively reclaim sockets. However, `tcp_tw_recycle` was completely removed in Linux 4.12 due to severe connection drops and broken TCP timestamp behavior behind NAT environments [Source: Linux Kernel Commit 4396e461]. Modern Linux kernels do not recognize the parameter, and L4 transport-layer adjustments cannot prevent hardware descriptor queue exhaustion at L2.
 
 ### Misstep 2: Increasing Application Worker Threads
 The application engineering team observed elevated P99 latency in gateway logs and suspected worker thread pool starvation. They increased Envoy's `concurrency` setting from 16 to 64.
@@ -260,8 +264,10 @@ RPS CPU masks are represented as comma-separated 32-bit hex words:
 echo "ffffffff,ffffffff" > /sys/class/net/eth0/queues/rx-0/rps_cpus
 
 # Sizing RFS global flow table and per-queue flow entries
+# According to Linux Documentation/networking/scaling.rst:
+# rps_flow_cnt = rps_sock_flow_entries / N (where N is the number of queues, here 8)
 sysctl -w net.core.rps_sock_flow_entries=65536
-echo 32768 > /sys/class/net/eth0/queues/rx-0/rps_flow_cnt
+echo 8192 > /sys/class/net/eth0/queues/rx-0/rps_flow_cnt
 
 # Configure XPS (Transmit Packet Steering) for TX queue 0
 echo "ffffffff,ffffffff" > /sys/class/net/eth0/queues/tx-0/xps_cpus
@@ -383,14 +389,34 @@ ethtool -L "${INTERFACE}" combined "${COMBINED_QUEUES}" || true
 echo "[+] Balancing IRQs across CPU cores..."
 systemctl stop irqbalance 2>/dev/null || true
 
+for ((i=0; i<COMBINED_QUEUES; i++)); do
+    # Locate IRQ number for eth0 combined queue i
+    IRQ=$(grep -E "${INTERFACE}-(TxRx|rx|tx)-?${i}|${INTERFACE}-${i}" /proc/interrupts | awk -F: '{print $1}' | tr -d ' ' | head -n 1 || true)
+    if [ -n "${IRQ}" ] && [ -d "/proc/irq/${IRQ}" ]; then
+        MASK=$(printf "%x" $((1 << i)))
+        echo "${MASK}" > "/proc/irq/${IRQ}/smp_affinity"
+        echo "[+] Assigned IRQ ${IRQ} (queue ${i}) to CPU mask 0x${MASK}"
+    fi
+done
+
+# 4. Configure RPS, RFS, and XPS
+echo "[+] Configuring RPS, RFS, and XPS packet steering..."
 QUEUES=$(ls -d /sys/class/net/"${INTERFACE}"/queues/rx-* 2>/dev/null | wc -l)
+GLOBAL_FLOW_ENTRIES=65536
+PER_QUEUE_FLOW=$((GLOBAL_FLOW_ENTRIES / (QUEUES > 0 ? QUEUES : 1)))
+
 for ((i=0; i<QUEUES; i++)); do
-    # Configure RPS if virtual interface or low queue count
+    # Configure RPS if virtual interface or multi-core distribution is enabled
     if [ -f "/sys/class/net/${INTERFACE}/queues/rx-${i}/rps_cpus" ]; then
         echo "ffffffff,ffffffff" > "/sys/class/net/${INTERFACE}/queues/rx-${i}/rps_cpus"
     fi
+    # Configure per-queue RFS flow table size based on Documentation/networking/scaling.rst
     if [ -f "/sys/class/net/${INTERFACE}/queues/rx-${i}/rps_flow_cnt" ]; then
-        echo 4096 > "/sys/class/net/${INTERFACE}/queues/rx-${i}/rps_flow_cnt"
+        echo "${PER_QUEUE_FLOW}" > "/sys/class/net/${INTERFACE}/queues/rx-${i}/rps_flow_cnt"
+    fi
+    # Configure XPS across all 64 cores for transmit queues
+    if [ -f "/sys/class/net/${INTERFACE}/queues/tx-${i}/xps_cpus" ]; then
+        echo "ffffffff,ffffffff" > "/sys/class/net/${INTERFACE}/queues/tx-${i}/xps_cpus"
     fi
 done
 
@@ -441,7 +467,8 @@ groups:
           description: "Incoming packet rate exceeds net.core.netdev_max_backlog on {{ $labels.instance }}."
 
       - alert: NodeSoftnetTimeSqueezeHigh
-        expr: sum(rate(node_softnet_timesqueeze_total[2m])) by (instance) > 50
+        expr: sum(rate(node_softnet_times_squeezed_total[2m])) by (instance) > 50
+          or sum(rate(node_softnet_timesqueeze_total[2m])) by (instance) > 50
           or sum(rate(node_netstat_softnet_timesqueeze[2m])) by (instance) > 50
         for: 2m
         labels:
