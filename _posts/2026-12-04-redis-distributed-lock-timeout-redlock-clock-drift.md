@@ -134,12 +134,13 @@ The second contributing failure was host clock instability on one of the 5 Redis
 3. **Premature Key Invalidation**: Redis evaluates key expiration against the host system monotonic and wall-clock times. The abrupt 3.2-second forward jump caused Redis on `redis-node-03` to expire active lock keys 3.2 seconds ahead of schedule.
 4. **Quorum Inversion**: This allowed Client 2 to secure votes from `redis-node-01`, `redis-node-02`, and `redis-node-03` while Client 1 was still executing on `redis-node-04` and `redis-node-05`, breaking mutual exclusion guarantees.
 
-### 3.4 The Missing Fencing Token Dilemma
+### 3.4 The Missing Fencing Token Dilemma & The Redlock Deprecation Context
 
 Martin Kleppmann proved that a distributed lock cannot guarantee storage consistency unless the storage layer actively participates in enforcing access rights [Source: Martin Kleppmann, 'How to do distributed locking' (https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)]:
 
 * A lock service is fundamentally an advisory mechanism. Even if a lock algorithm were theoretically perfect, network packet delays between the client and the storage engine can cause writes from an expired client to arrive *after* writes from a new client.
 * Without a **monotonically increasing fencing token** attached to every lock acquisition and verified atomically by the storage engine (`WHERE fencing_token > last_fencing_token`), stale writes from delayed or suspended clients cannot be rejected.
+* **The Industry Deprecation of Redlock**: Following the Kleppmann-Sanfilippo debate, the distributed systems community recognized that relying on multi-node clock synchrony without fencing is brittle. Notably, the Redisson project officially deprecated `RedissonRedLock` (in v3.19.0+) [Source: Redisson GitHub Repository (https://github.com/redisson/redisson)]. Redisson instead introduced `RFencedLock`, shifting architectural best practice toward single/cluster locks combined with first-class, monotonically increasing fencing tokens that downstream datastores must validate.
 
 ---
 
@@ -171,17 +172,17 @@ During emergency incident remediation, the engineering team attempted three naiv
 To establish absolute correctness across asynchronous boundaries, we implemented a three-tier remediation architecture [Source: Martin Kleppmann, 'How to do distributed locking' (https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)]:
 
 1. **Redisson Automatic Watchdog Renewal**: Eliminate hardcoded `leaseTime` parameters. By omitting `leaseTime` (or passing `-1`), Redisson engages its background Watchdog mechanism. The Watchdog automatically extends the lock TTL to 30,000 ms every 10,000 ms (`lockWatchdogTimeout / 3`) as long as the worker thread is alive [Source: Redisson Distributed Locks Architecture (https://redisson.pro/)].
-2. **Monotonic Fencing Tokens at the Storage Boundary**: Every lock acquisition atomically increments a monotonic 64-bit counter in Redis (`INCR token:merchant:{id}`). Aurora PostgreSQL enforces optimistic fencing checks (`WHERE last_fencing_token < #{fencingToken}`), rejecting any write carrying an obsolete token.
-3. **Strict Slew-Only NTP Synchronization via Chrony**: Configure Linux host time daemons across all Redis and worker instances to disable clock stepping (`makestep 0 0`) and restrict frequency adjustments to gradual slewing (`maxslewrate 500`) [Source: Chrony Configuration Documentation (https://chrony-project.org/doc/4.5/chrony.conf.html)].
+2. **Native Monotonic Fencing Tokens via `RFencedLock`**: Rather than maintaining a separate decoupled counter, utilize Redisson's native `RFencedLock` (`lock.tryLockAndGetToken(...)`). `RFencedLock` atomically issues a monotonic 64-bit token inside Redis upon lock grant. Aurora PostgreSQL enforces optimistic fencing checks (`WHERE last_fencing_token < #{fencingToken}`), rejecting any write carrying an obsolete token with an immediate update count of 0 [Source: Redisson Distributed Locks Architecture (https://redisson.pro/)].
+3. **Strict Slew-Only NTP Synchronization via Chrony**: Configure Linux host time daemons across all Redis and worker instances to completely eliminate clock stepping (removing/commenting out `makestep`) and restrict frequency adjustments to gradual slewing (`maxslewrate 500`) [Source: Chrony Configuration Documentation (https://chrony-project.org/doc/4.5/chrony.conf.html)].
 
 ### 5.1 Java Service Layer Remediation
 
-Apply the following patch to the settlement locking service:
+Apply the following patch to the settlement locking service to transition from naive locks to `RFencedLock` with optimistic fencing validation:
 
 ```diff
 --- service/SettlementLockManager.java.orig
 +++ service/SettlementLockManager.java
-@@ -15,25 +15,48 @@
+@@ -15,25 +15,52 @@
  @Service
  @Slf4j
  public class SettlementLockManager {
@@ -190,35 +191,32 @@ Apply the following patch to the settlement locking service:
      private RedissonClient redissonClient;
  
 -    public boolean processWithLock(String merchantId, Runnable task) {
-+    @Autowired
-+    private StringRedisTemplate redisTemplate;
-+
-+    public boolean processWithFencedLock(String merchantId, Consumer<Long> task) {
++    public boolean processWithFencedLock(String merchantId, Function<Long, Integer> task) {
          String lockKey = "lock:settlement:merchant:" + merchantId;
-+        String tokenKey = "token:settlement:merchant:" + merchantId;
-         RLock lock = redissonClient.getLock(lockKey);
- 
+-        RLock lock = redissonClient.getLock(lockKey);
++        // Use Redisson's native RFencedLock to atomically acquire lock and monotonic fencing token
++        RFencedLock lock = redissonClient.getFencedLock(lockKey);
          try {
 -            // WRONG: Hardcoded leaseTime (10000ms) disables Redisson Watchdog!
 -            // If GC pause or DB stall exceeds 10s, lock auto-expires while thread runs.
 -            boolean acquired = lock.tryLock(3000, 10000, TimeUnit.MILLISECONDS);
 +            // Correct: Omit leaseTime to activate background Watchdog auto-renewal.
-+            // Watchdog renews lock every 10s (lockWatchdogTimeout / 3) until thread releases it.
-+            boolean acquired = lock.tryLock(5000, TimeUnit.MILLISECONDS);
-             if (!acquired) {
-                 log.warn("Failed to acquire distributed lock for merchant {}", merchantId);
-                 return false;
-             }
++            // tryLockAndGetToken atomically returns the monotonic token and starts Watchdog.
++            Long fencingToken = lock.tryLockAndGetToken(5000, TimeUnit.MILLISECONDS);
++            if (fencingToken == null) {
++                log.warn("Failed to acquire fenced distributed lock for merchant {}", merchantId);
++                return false;
++            }
 -            task.run();
 +
-+            // Generate strictly monotonic fencing token from Redis
-+            Long fencingToken = redisTemplate.opsForValue().increment(tokenKey);
-+            if (fencingToken == null) {
-+                throw new IllegalStateException("Failed to generate monotonic fencing token for " + merchantId);
++            // Execute mutation passing token to storage layer; validate optimistic fencing
++            Integer affectedRows = task.apply(fencingToken);
++            if (affectedRows == null || affectedRows == 0) {
++                log.error("Fencing collision: stale write rejected by storage layer for merchant {}", merchantId);
++                throw new StaleFencingTokenException(
++                    "Stale write rejected: higher fencing token already committed in storage"
++                );
 +            }
-+
-+            // Execute critical section passing fencing token to storage layer
-+            task.accept(fencingToken);
              return true;
          } catch (InterruptedException e) {
              Thread.currentThread().interrupt();
@@ -235,7 +233,7 @@ Apply the following patch to the settlement locking service:
 
 ### 5.2 Aurora PostgreSQL Storage Fencing Schema & SQL Remediation
 
-Update the database schema and MyBatis XML mapper to validate the monotonic fencing token:
+Update the database schema and MyBatis mapper to validate the monotonic fencing token and reject stale writes:
 
 ```diff
 --- schema/V2__add_fencing_token_to_merchant_ledger.sql.orig
@@ -258,7 +256,7 @@ Update the database schema and MyBatis XML mapper to validate the monotonic fenc
 +            last_fencing_token = #{fencingToken},
              updated_at = NOW()
          WHERE merchant_id = #{merchantId}
-+          -- Reject write if another client has already applied a higher fencing token
++          -- Reject write if another client has already applied an equal or higher fencing token
 +          AND last_fencing_token < #{fencingToken}
      </update>
 ```
@@ -274,10 +272,11 @@ Update `/etc/chrony/chrony.conf` across all 5 Redis hosts and Kubernetes worker 
  # Amazon Time Sync Service link-local IP
  server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4
  
--# DANGEROUS: Stepping clock forwards or backwards breaks distributed lock TTL
---makestep 1.0 3
-+# Disable clock stepping entirely under all operational circumstances
-+makestep 0 0
+-# Step the clock but only in the first three updates if the offset is larger than 1 second.
+-makestep 1.0 3
++# Disable clock stepping entirely to protect distributed lock lease validity.
++# Omitting makestep enforces 100% slew-only clock synchronization across all nodes.
++# (makestep directive removed)
 +
 +# Restrict maximum clock frequency adjustment to gradual slewing (500 ppm)
 +maxslewrate 500
@@ -299,7 +298,7 @@ chronyc tracking
 # Expected Output:
 # Reference ID    : A9FEA97B (169.254.169.123)
 # Stratum         : 3
-# Ref time (UTC)  : Mon Nov 23 04:12:08 2026
+# Ref time (UTC)  : Fri Dec 04 01:25:40 2026
 # System time     : 0.000012410 seconds slow of NTP time
 # Last offset     : -0.000008124 seconds
 # RMS offset      : 0.000015940 seconds
