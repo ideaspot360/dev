@@ -53,7 +53,7 @@ The catalog ingestion pipeline halted, preventing new inventory updates and caus
 
 The root cause was **InnoDB's structural requirement to store at least two rows per clustered index leaf page**, combined with the legacy **`COMPACT` row format inline prefix storage** [Source: MySQL 8.0 Reference Manual: InnoDB Row Formats](https://dev.mysql.com/doc/refman/8.0/en/innodb-row-format.html).
 
-### The Mathematical 8,126-Byte Limit
+### The Mathematical 8,126-Byte Limit & Page Size Variations
 In InnoDB, all table data is stored inside a B+Tree clustered index organized into fixed-size pages (default 16KB = 16,384 bytes). The physical page contains mandatory framing structures:
 * **FIL Header**: 38 bytes (page checksum, page number, previous/next page pointers, LSN, page type)
 * **Page Header**: 56 bytes (directory slots, heap top, record count, garbage space)
@@ -67,8 +67,43 @@ $$\text{Max In-Page Row Size} \approx \frac{\text{Page Size} - \text{Overhead}}{
 
 If any single record exceeds 8,126 bytes on-page, InnoDB refuses to insert or modify the row because splitting the page would violate the B-tree invariant [Source: MySQL 8.0 Reference Manual: InnoDB Limits](https://dev.mysql.com/doc/refman/8.0/en/innodb-limits.html).
 
+#### Row Size Limits Across `innodb_page_size` Configurations
+When running non-default page sizes (configured via `innodb_page_size` at instance initialization), the maximum allowable in-page row size scales proportionally:
+
+| Configured `innodb_page_size` | Usable Page Payload | Max In-Page Row Size Limit | Clustered Leaf Min Invariant |
+| :--- | :--- | :--- | :--- |
+| **4KB (4,096 bytes)** | ~3,964 bytes | **~1,982 bytes** | Minimum 2 rows/page |
+| **8KB (8,192 bytes)** | ~8,060 bytes | **~3,982 bytes** | Minimum 2 rows/page |
+| **16KB (16,384 bytes, Default)** | ~16,252 bytes | **8,126 bytes** | Minimum 2 rows/page |
+| **32KB (32,768 bytes)** | ~32,636 bytes | **~16,334 bytes** | Minimum 2 rows/page |
+| **64KB (65,536 bytes)** | ~65,404 bytes | **~32,718 bytes** | Minimum 2 rows/page |
+
+*Operational Note*: On clusters tuned with 4KB or 8KB page sizes for SSD flash-block alignment or low-latency point reads, Error 1118 triggers much earlier (at ~1,982 or ~3,982 bytes). Even under `ROW_FORMAT=DYNAMIC`, if the sum of fixed-width columns, null bitmaps, and 20-byte pointers exceeds these reduced limits, transactions fail immediately [Source: MySQL 8.0 Reference Manual: innodb_page_size](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_page_size).
+
+### InnoDB Row Formats Comparison: REDUNDANT vs COMPACT vs DYNAMIC
+
+InnoDB supports three primary uncompressed physical record layouts across MySQL releases:
+
+1. **`REDUNDANT` (Legacy MySQL 3.23 - 4.1)**:
+   * Record header: 6 bytes, containing an explicit 1-byte or 2-byte offset array and null bit for every field.
+   * Overflow handling: Variable-length columns exceeding page bounds store a **768-byte prefix inline** on the clustered leaf page, followed by a 20-byte pointer.
+2. **`COMPACT` (MySQL 5.0 - 5.6 Default, Antelope)**:
+   * Record header: 5 bytes, storing a compact null bitmap and variable-length field length array ahead of the record.
+   * Overhead: Reduces physical row header space by ~20% compared to `REDUNDANT`.
+   * Overflow handling: Still mandates storing a **768-byte prefix inline** for each off-page LOB column [Source: MySQL 8.0 Reference Manual: InnoDB Row Formats](https://dev.mysql.com/doc/refman/8.0/en/innodb-row-format.html).
+3. **`DYNAMIC` (MySQL 5.7+ Default, Barracuda)**:
+   * Record header: 5 bytes, modern variable-length layout.
+   * Overflow handling: Avoids storing any inline payload prefix for off-page columns. It retains **strictly a 20-byte pointer** on the clustered index page, offloading 100% of the column payload into dedicated overflow pages.
+
+#### Anatomy of the 20-Byte Off-Page Overflow Pointer
+The 20-byte reference pointer embedded within clustered leaf records has the following byte-level structure:
+* **Space ID** (4 bytes): Identifies the tablespace containing the overflow page chain.
+* **First Overflow Page Number** (4 bytes): Physical 32-bit page number of the initial overflow page.
+* **Byte Offset within First Page** (4 bytes): Offset where the LOB payload segment begins.
+* **Total Payload Length** (8 bytes): 4 bytes of flags/metadata + 4 bytes representing total byte size of the external data.
+
 ```text
-COMPACT Row Format (Legacy Antelope):
+COMPACT / REDUNDANT Row Format (Legacy Antelope):
 ┌───────────────────────────┬───────────────────────────────────────┬──────────────────────┐
 │ In-Page Fixed/Var Columns │ 768-Byte Prefix of Column 1 (Inline!) │ 20-Byte Pointer to   │
 │ (IDs, Numbers, Varchars)  │ 768-Byte Prefix of Column 2 (Inline!) │ Off-Page LOB Pages   │
@@ -81,7 +116,8 @@ COMPACT Row Format (Legacy Antelope):
 DYNAMIC Row Format (Modern Barracuda):
 ┌───────────────────────────┬──────────────────────────────────────────────────────────────┐
 │ In-Page Fixed/Var Columns │ 20-Byte Pointer 1 │ 20-Byte Pointer 2 │ 20-Byte Pointer 3    │
-│ (IDs, Numbers, Varchars)  │ (Entire LOB stored Off-Page in Overflow Pages!)              │
+│ (IDs, Numbers, Varchars)  │ [SpaceID:4B | PageNo:4B | Offset:4B | TotalLen:8B]           │
+│                           │ (Entire LOB stored Off-Page in Overflow Pages!)              │
 └───────────────────────────┴──────────────────────────────────────────────────────────────┘
    ▲
    └── Only 20 bytes consumed per LOB column on the primary clustered index page!
@@ -135,8 +171,8 @@ Alternatively, direct online DDL was executed on staging:
 ```diff
 --- a/deploy/migrations/V14__alter_product_variants_row_format.sql
 +++ b/deploy/migrations/V14__alter_product_variants_row_format.sql
-@@ -1,5 +1,12 @@
---- Migration: Modernize product_variants row format to DYNAMIC
+@@ -1,4 +1,11 @@
+--- Legacy schema alter migration
 +-- Step 1: Ensure innodb_strict_mode is enforced to prevent corrupt writes
 +SET SESSION innodb_strict_mode = ON;
 +
@@ -285,7 +321,7 @@ FSP_HDR / IBUF / INODE            88      2.3%
 ```
 
 ### Prometheus Alertmanager Rules
-To detect row lock wait spikes and clustered index page split contention early, the following Prometheus alert rules were deployed:
+To detect row lock wait spikes and clustered index page split contention early, the following Prometheus alert rules were deployed (requiring `mysqld_exporter` with `collect.info_schema.innodb_metrics=true` and MySQL `SET GLOBAL innodb_monitor_enable = 'module_index'`):
 
 ```yaml
 groups:
@@ -301,13 +337,13 @@ groups:
           description: "Instance {{ $labels.instance }} has row lock wait rate of {{ $value | printf '%.2f' }}/sec."
 
       - alert: MySQLInnoDBPageSplitContention
-        expr: rate(mysql_global_status_innodb_page_splits[5m]) > 250
+        expr: rate(mysql_info_schema_innodb_metrics_index_page_splits_total[5m]) > 250 or rate(mysql_global_status_innodb_pages_created[5m]) > 500
         for: 3m
         labels:
           severity: critical
         annotations:
           summary: "MySQL InnoDB clustered index page split contention"
-          description: "B-Tree page split rate on {{ $labels.instance }} exceeded 250 splits/sec due to wide row allocations."
+          description: "B-Tree index page split rate on {{ $labels.instance }} exceeded threshold due to wide inline row allocation pressure."
 ```
 
 ### Performance & Metric Comparison
@@ -326,10 +362,11 @@ Production telemetry results over 48 hours:
 
 ## 5. Production Lessons & Best Practices
 
-1. **Verify Legacy Table Formats in MySQL 8**: Tables migrated from MySQL 5.6 or created without explicit options may still carry `ROW_FORMAT=COMPACT`. Always audit your tablespaces using `SELECT TABLE_NAME, ROW_FORMAT FROM INFORMATION_SCHEMA.TABLES` [Source: MySQL 8.0 Reference Manual: InnoDB Row Formats](https://dev.mysql.com/doc/refman/8.0/en/innodb-row-format.html).
-2. **Understand the 20-Byte vs 768-Byte Difference**: `DYNAMIC` stores only a 20-byte pointer inline for off-page columns, whereas `COMPACT` consumes 768 bytes inline per overflow column. For tables with multiple text/varchar columns, `DYNAMIC` is mandatory [Source: MySQL 8.0 Reference Manual: Limits on Table Column Count and Row Size](https://dev.mysql.com/doc/refman/8.0/en/column-count-limit.html).
-3. **Never Disable `innodb_strict_mode`**: Bypassing strict mode does not fix the physical 8,126-byte B-tree limitation. It merely delays failure until runtime DML transactions, risking silent index corruption and random query failures [Source: MySQL 8.0 Reference Manual: innodb_strict_mode](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_strict_mode).
-4. **Vertically Partition Bloated Schemas**: Just because a row can technically fit does not mean it should. Keeping clustered index leaf pages slim (under 1KB per row) maximizes buffer pool caching efficiency and minimizes I/O overhead [Source: MySQL 8.0 Reference Manual: InnoDB Limits](https://dev.mysql.com/doc/refman/8.0/en/innodb-limits.html).
+1. **Audit for Both COMPACT and REDUNDANT Formats**: Tables migrated from MySQL 5.5/5.6 or legacy dumps may still carry `ROW_FORMAT=COMPACT` or `ROW_FORMAT=REDUNDANT`. Both formats enforce a 768-byte inline prefix for every off-page column. Run `SELECT TABLE_NAME, ROW_FORMAT FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '...'` to verify [Source: MySQL 8.0 Reference Manual: InnoDB Row Formats](https://dev.mysql.com/doc/refman/8.0/en/innodb-row-format.html).
+2. **Account for `innodb_page_size` Scaling**: When instances use 4KB or 8KB page sizes, the maximum in-page row limit drops from 8,126 bytes down to ~1,982 bytes or ~3,982 bytes. Even with `DYNAMIC` row format, schemas with dozens of fixed-width columns (`INT`, `BIGINT`, `CHAR`) can breach this lower ceiling [Source: MySQL 8.0 Reference Manual: innodb_page_size](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_page_size).
+3. **Understand the 20-Byte vs 768-Byte Difference**: `DYNAMIC` stores only a 20-byte pointer (SpaceID 4B + PageNo 4B + Offset 4B + Length 8B) inline for off-page columns, whereas `COMPACT` and `REDUNDANT` consume 768 bytes inline per overflow column [Source: MySQL 8.0 Reference Manual: Limits on Table Column Count and Row Size](https://dev.mysql.com/doc/refman/8.0/en/column-count-limit.html).
+4. **Never Disable `innodb_strict_mode`**: Bypassing strict mode does not fix the physical B-tree limitation. It merely delays failure until runtime DML transactions, risking silent index corruption and random query failures [Source: MySQL 8.0 Reference Manual: innodb_strict_mode](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_strict_mode).
+5. **Vertically Partition Bloated Schemas**: Just because a row can technically fit does not mean it should. Keeping clustered index leaf pages slim (under 1KB per row) maximizes buffer pool caching efficiency and minimizes I/O overhead [Source: MySQL 8.0 Reference Manual: InnoDB Limits](https://dev.mysql.com/doc/refman/8.0/en/innodb-limits.html).
 
 ---
 
