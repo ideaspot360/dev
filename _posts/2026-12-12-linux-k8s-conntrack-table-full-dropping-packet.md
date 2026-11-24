@@ -9,6 +9,7 @@ fact_check_sources:
   - "https://github.com/torvalds/linux/blob/master/net/netfilter/nf_conntrack_core.c"
   - "https://github.com/torvalds/linux/blob/master/net/netfilter/nf_conntrack_proto_tcp.c"
   - "https://github.com/torvalds/linux/blob/master/include/net/netfilter/nf_conntrack.h"
+  - "https://github.com/torvalds/linux/blob/master/include/linux/list_nulls.h"
   - "https://www.kernel.org/doc/Documentation/networking/nf_conntrack-sysctl.rst"
   - "https://man7.org/linux/man-pages/man8/conntrack.8.html"
   - "https://kubernetes.io/docs/reference/config-api/kube-proxy-config.v1alpha1/"
@@ -90,27 +91,55 @@ The Linux Netfilter connection tracking subsystem (`conntrack`) tracks the state
 ![Netfilter Conntrack Table Architecture](/assets/images/diagram_conntrack_table_architecture.png)
 
 ### 1. Hash Table Layout & Linked-List Buckets
-The conntrack state table is implemented as an in-kernel hash table array consisting of `nf_conntrack_buckets` slots. Each slot points to a doubly-linked list (`hlist_nulls_head`) of connection tracking entries (`struct nf_conn`) [Source: Linux Kernel Netfilter Core - nf_conntrack_core.c](https://github.com/torvalds/linux/blob/master/net/netfilter/nf_conntrack_core.c).
+The conntrack state table is implemented as an in-kernel hash table array consisting of `nf_conntrack_buckets` slots. Each slot points to an RCU-protected hash list (`struct hlist_nulls_head`) of connection tracking entries (`struct nf_conn`) [Source: Linux Kernel Netfilter Core - nf_conntrack_core.c](https://github.com/torvalds/linux/blob/master/net/netfilter/nf_conntrack_core.c) and [Source: Linux Kernel List Nulls Header - list_nulls.h](https://github.com/torvalds/linux/blob/master/include/linux/list_nulls.h).
 
 When a packet arrives at the network interface:
-1. The kernel calculates a Jenkins hash (`jhash`) over the packet's 5-tuple:
-   $$\text{Hash} = \text{jhash}(\text{Src IP}, \text{Dst IP}, \text{Src Port}, \text{Dst Port}, \text{Protocol})$$
-2. The hash modulo bucket count yields the target bucket index:
-   $$\text{Bucket Index} = \text{Hash} \pmod{\text{nf\_conntrack\_buckets}}$$
-3. The kernel walks the linked list at that bucket index, verifying if an existing `struct nf_conn` matches the tuple.
-4. If no matching entry exists and the packet represents a new flow, the kernel invokes `__nf_conntrack_alloc()` to allocate an entry:
+1. The kernel calculates a hash (`hash_conntrack_raw`) over the packet's 5-tuple and netns zone ID using `siphash` (with a randomized per-netns key to thwart hash collision attacks):
+   $$\text{Hash} = \text{hash\_conntrack\_raw}(\text{Src IP}, \text{Dst IP}, \text{Src Port}, \text{Dst Port}, \text{Protocol}, \text{Zone})$$
+2. Instead of utilizing an expensive integer modulo division instruction (`IDIV` requiring 20 to 80 clock cycles on x86_64 fast paths), the kernel performs fast reciprocal scaling via `reciprocal_scale(hash, size)`:
+   $$\text{Bucket Index} = \text{reciprocal\_scale}(\text{Hash}, \text{nf\_conntrack\_buckets}) = \left\lfloor \frac{\text{Hash} \times \text{nf\_conntrack\_buckets}}{2^{32}} \right\rfloor$$
+3. The kernel traverses the `hlist_nulls` linked list at that bucket under RCU protection, verifying if an existing `struct nf_conn` matches the tuple. If a concurrent writer modifies the chain during traversal, the reader detects an altered `nulls` marker and restarts the search (incrementing the `search_restart` metric visible in `conntrack -S`).
+4. If no matching entry exists and the packet represents a new flow, the kernel invokes `__nf_conntrack_alloc()` in `net/netfilter/nf_conntrack_core.c` to allocate an entry:
 
 ```c
 /* In net/netfilter/nf_conntrack_core.c */
-atomic_inc(&net->ct.count);
-if (nf_conntrack_max && unlikely(atomic_read(&net->ct.count) > nf_conntrack_max)) {
-    if (!early_drop(net, hash)) {
-        atomic_dec(&net->ct.count);
-        net_warn_ratelimited("nf_conntrack: table full, dropping packet\n");
-        return ERR_PTR(-ENOMEM);
+static struct nf_conn *
+__nf_conntrack_alloc(struct net *net,
+                     const struct nf_conntrack_zone *zone,
+                     const struct nf_conntrack_tuple *orig,
+                     const struct nf_conntrack_tuple *repl,
+                     gfp_t gfp, u32 hash)
+{
+    struct nf_conntrack_net *cnet = nf_ct_pernet(net);
+    unsigned int ct_count;
+    struct nf_conn *ct;
+
+    /* Prevent race conditions at early drop stage */
+    ct_count = atomic_inc_return(&cnet->count);
+
+    if (unlikely(ct_count > nf_conntrack_max)) {
+        if (!early_drop(net, hash)) {
+            atomic_dec(&cnet->count);
+            net_warn_ratelimited("nf_conntrack: table full, dropping packet\n");
+            return ERR_PTR(-ENOMEM);
+        }
     }
+    /* ... slab allocation from nf_conntrack_cachep ... */
 }
 ```
+
+#### The `early_drop()` Eviction Mechanism and Why Drops Surge with `early_drop=0`
+When `cnet->count > nf_conntrack_max`, the kernel executes `early_drop(net, hash)`. This routine scans a sliding window of `NF_CT_EVICTION_RANGE` (8 consecutive buckets) starting from `reciprocal_scale(hash, hsize)`.
+
+Crucially, `early_drop()` only reclaims unconfirmed or low-priority connections lacking the `IPS_ASSURED` flag:
+```c
+/* Inside early_drop_list() */
+if (test_bit(IPS_ASSURED_BIT, &tmp->status))
+    continue;
+```
+In high-throughput Kubernetes production clusters with long-running microservice HTTP and gRPC keep-alive pools, virtually all active tracked connections possess the `IPS_ASSURED` bit. Because no unconfirmed entries exist within the 8 scanned buckets, `early_drop()` returns `0` (false). As a direct consequence:
+* `conntrack -S` records `early_drop=0` while `insert_failed` and `drop` skyrocket past hundreds of thousands.
+* The allocator logs `nf_conntrack: table full, dropping packet` and returns `-ENOMEM`, immediately terminating the packet flow.
 
 ### 2. Sizing Formula & Memory Overhead
 The maximum capacity of the tracking table is governed by `net.netfilter.nf_conntrack_max`. The ideal ratio between capacity and hash buckets is:
@@ -119,12 +148,12 @@ $$\text{nf\_conntrack\_max} = \text{nf\_conntrack\_buckets} \times 4 \quad (\tex
 
 On a 64-bit Linux architecture:
 * `sizeof(struct nf_conn)` $\approx$ 320 bytes (slab cache `nf_conntrack`)
-* `sizeof(struct hlist_nulls_head)` $\approx$ 16 bytes per bucket
+* `sizeof(struct hlist_nulls_head)` = 8 bytes per bucket (a single 64-bit pointer `struct hlist_nulls_node *first` defined in `include/linux/list_nulls.h`) [Source: Linux Kernel List Nulls Header - list_nulls.h](https://github.com/torvalds/linux/blob/master/include/linux/list_nulls.h)
 
 If `nf_conntrack_max` is set to 1,048,576 and `nf_conntrack_buckets` is set to 262,144:
-$$\text{Memory} \approx (1{,}048{,}576 \times 320\text{ B}) + (262{,}144 \times 16\text{ B}) \approx 335.54\text{ MB} + 4.19\text{ MB} \approx 339.73\text{ MB}$$
+$$\text{Memory} = (1{,}048{,}576 \times 320\text{ B}) + (262{,}144 \times 8\text{ B}) = 335{,}544{,}320\text{ B} + 2{,}097{,}152\text{ B} \approx 335.54\text{ MB} + 2.10\text{ MB} \approx 337.64\text{ MB}$$
 
-For modern worker nodes with 32 GiB to 128 GiB of RAM, reserving ~340 MB of non-swappable kernel slab memory to support 1 million concurrent tracked connections consumes less than 0.5% of total memory [Source: Linux Kernel Netfilter Core - nf_conntrack_core.c](https://github.com/torvalds/linux/blob/master/net/netfilter/nf_conntrack_core.c).
+For modern worker nodes with 32 GiB to 128 GiB of RAM, reserving ~338 MB of non-swappable kernel slab memory to support 1 million concurrent tracked connections consumes approximately 0.5% of total memory [Source: Linux Kernel Netfilter Core - nf_conntrack_core.c](https://github.com/torvalds/linux/blob/master/net/netfilter/nf_conntrack_core.c).
 
 ### 3. Connection Accumulation via Ephemeral UDP and Long TCP Timeouts
 In Kubernetes clusters, two primary factors accelerate conntrack table exhaustion:
@@ -214,14 +243,44 @@ Ensure `kube-proxy` does not overwrite kernel parameters with lower values by co
 +  tcpCloseWaitTimeout: 15s
 ```
 
+### Step 4: DaemonSet Safe Raw Table Bypass Rules (`daemonset-conntrack-bypass.yaml`)
+
+To safely exempt high-frequency, non-NAT local traffic (such as Prometheus node-exporter metrics scraping on port 9100 or NodeLocal DNSCache queries on link-local IP `169.254.20.10`) from conntrack table overhead without disrupting Kubernetes Service VIP translation, deploy an init/network tuning DaemonSet:
+
+```diff
+--- daemonset-conntrack-bypass.yaml.orig
++++ daemonset-conntrack-bypass.yaml
+@@ -20,6 +20,20 @@
+       initContainers:
+         - name: raw-table-notrack-tuning
+           image: alpine:3.19
+           securityContext:
+             privileged: true
+           command:
+             - /bin/sh
+             - -c
+             - |
++              # Safely exempt non-NAT local endpoints from conntrack overhead
++              # 1. Bypass Prometheus node-exporter scraping (port 9100)
++              iptables -t raw -C PREROUTING -p tcp --dport 9100 -j NOTRACK 2>/dev/null || \
++                iptables -t raw -A PREROUTING -p tcp --dport 9100 -j NOTRACK
++              iptables -t raw -C OUTPUT -p tcp --sport 9100 -j NOTRACK 2>/dev/null || \
++                iptables -t raw -A OUTPUT -p tcp --sport 9100 -j NOTRACK
++              # 2. Bypass NodeLocal DNSCache link-local queries (169.254.20.10)
++              iptables -t raw -C PREROUTING -d 169.254.20.10 -j NOTRACK 2>/dev/null || \
++                iptables -t raw -A PREROUTING -d 169.254.20.10 -j NOTRACK
++              iptables -t raw -C OUTPUT -s 169.254.20.10 -j NOTRACK 2>/dev/null || \
++                iptables -t raw -A OUTPUT -s 169.254.20.10 -j NOTRACK
+```
+
 ---
 
 ## 5. Verification & Monitoring Runbook
 
 After applying configuration updates, verify host parameters and monitor connection tracking health using Linux CLI utilities.
 
-### 1. Host Conntrack Sizing & Table Health Verification
-Verify that both hash buckets and maximum entry limits are active:
+### 1. Host Conntrack Sizing, Table Health & Network Stats Verification
+Verify that both hash buckets and maximum entry limits are active, check conntrack drop counters, and verify kernel network drop counters via `nstat`:
 
 ```bash
 # Verify maximum capacity and current active tracked connections
@@ -233,6 +292,12 @@ cat /sys/module/nf_conntrack/parameters/hashsize
 
 # Verify packet drop counters are zero
 conntrack -S | grep -E "drop|insert_failed"
+
+# Verify network drop and overflow counters via nstat
+nstat -az | grep -E "TcpExtListenOverflows|TcpExtListenDrops|IpExtInDiscards|IpExtInNoRoutes"
+
+# Verify kernel ring buffer for absence of conntrack saturation drops
+dmesg -T | grep -i "nf_conntrack: table full"
 ```
 
 Expected output:
@@ -243,6 +308,10 @@ net.netfilter.nf_conntrack_max = 1048576
 262144
 cpu=0   found=3419820 invalid=0 insert=0 insert_failed=0 drop=0 early_drop=0 error=0 search_restart=0
 cpu=1   found=3398102 invalid=0 insert=0 insert_failed=0 drop=0 early_drop=0 error=0 search_restart=0
+IpExtInNoRoutes                 0                  0.0
+IpExtInDiscards                 0                  0.0
+TcpExtListenOverflows           0                  0.0
+TcpExtListenDrops               0                  0.0
 ```
 
 ### 2. Inspect Active Protocol Distributions
@@ -340,6 +409,7 @@ Preventing connection tracking bottlenecks requires architectural foresight beyo
 * [Linux Kernel Source: net/netfilter/nf_conntrack_core.c - __nf_conntrack_alloc and early_drop Implementation](https://github.com/torvalds/linux/blob/master/net/netfilter/nf_conntrack_core.c)
 * [Linux Kernel Source: net/netfilter/nf_conntrack_proto_tcp.c - TCP State Timeouts and Conntrack Transitions](https://github.com/torvalds/linux/blob/master/net/netfilter/nf_conntrack_proto_tcp.c)
 * [Linux Kernel Source: include/net/netfilter/nf_conntrack.h - struct nf_conn and Tracking Architecture](https://github.com/torvalds/linux/blob/master/include/net/netfilter/nf_conntrack.h)
+* [Linux Kernel Source: include/linux/list_nulls.h - struct hlist_nulls_head and Lockless Traversal Markers](https://github.com/torvalds/linux/blob/master/include/linux/list_nulls.h)
 * [Linux Kernel Documentation: Documentation/networking/nf_conntrack-sysctl.rst - Sysctl Parameters](https://www.kernel.org/doc/Documentation/networking/nf_conntrack-sysctl.rst)
 * [Linux Manual Pages: conntrack(8) - Connection Tracking Command-Line Tool](https://man7.org/linux/man-pages/man8/conntrack.8.html)
 * [Kubernetes Reference Documentation: KubeProxyConfiguration (v1alpha1) - conntrack Settings](https://kubernetes.io/docs/reference/config-api/kube-proxy-config.v1alpha1/)
