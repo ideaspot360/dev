@@ -103,12 +103,14 @@ Before identifying client-side connection pooling as the primary bottleneck, two
 The permanent fix required restructuring the Spring AMQP client connection pool to enforce connection reuse with channel multiplexing, accompanied by broker-side TCP connection backlog tuning and Linux network parameter optimization.
 
 ### Step 1: Reconfiguring Spring AMQP `CachingConnectionFactory`
-The client configuration was modified to enable `CacheMode.CONNECTION`, maintain an active pool of long-lived connections, and pre-allocate warm channel pools with adequate checkout timeouts [Source: Spring AMQP Reference Guide](https://docs.spring.io/spring-amqp/reference/amqp/connections.html):
+The client configuration was modified to enable `CacheMode.CONNECTION`, enforce a hard connection ceiling via `connectionLimit`, maintain an active pool of long-lived connections, and pre-allocate warm channel pools with adequate checkout timeouts [Source: Spring AMQP Reference Guide](https://docs.spring.io/spring-amqp/reference/amqp/connections.html).
+
+Crucially, in Spring AMQP, `connectionCacheSize` only dictates how many *idle* connections are kept in cache; without configuring `connectionLimit`, concurrent publisher bursts still instantiate unbounded ad-hoc TCP connections that are torn down upon return. Setting `connectionLimit(10)` ensures callers block up to `channelCheckoutTimeout(5000)` instead of spawning ephemeral connections:
 
 ```diff
 --- a/src/main/java/com/enterprise/order/config/RabbitMqClientConfig.java
 +++ b/src/main/java/com/enterprise/order/config/RabbitMqClientConfig.java
-@@ -10,18 +10,26 @@ import org.springframework.context.annotation.Configuration;
+@@ -10,18 +10,27 @@ import org.springframework.context.annotation.Configuration;
  
  @Configuration
  public class RabbitMqClientConfig {
@@ -125,9 +127,10 @@ The client configuration was modified to enable `CacheMode.CONNECTION`, maintain
 -        // causes threads to create standalone ad-hoc connections when channels contend
 -        factory.setCacheMode(CachingConnectionFactory.CacheMode.CHANNEL);
 -        factory.setChannelCacheSize(25);
-+        // FIXED: Enforce CONNECTION cache mode with pre-allocated pooled channels
++        // FIXED: Enforce CONNECTION cache mode with strict connectionLimit and pooled channels
 +        factory.setCacheMode(CachingConnectionFactory.CacheMode.CONNECTION);
 +        factory.setConnectionCacheSize(10);
++        factory.setConnectionLimit(10);
 +        factory.setChannelCacheSize(100);
 +        factory.setChannelCheckoutTimeout(5000);
 +        factory.setPublisherConfirmType(CachingConnectionFactory.ConfirmType.CORRELATED);
@@ -284,7 +287,7 @@ Active telemetry comparison before and after deploying client-side connection po
 
 1. **Connections Are Heavy, Channels Are Light**: Treat AMQP connections as expensive, long-lived resources. Establish connections during application startup and multiplex message streams through pooled channels [Source: RabbitMQ Channels Documentation](https://www.rabbitmq.com/docs/channels).
 2. **Always Enable SSL Session Resumption**: When AMQP over TLS is required, enable session caching (`ssl_options.reuse_sessions = true`) on the broker to eliminate repetitive cryptographic handshakes [Source: RabbitMQ Networking Guide](https://www.rabbitmq.com/docs/networking).
-3. **Set `channelCheckoutTimeout` Appropriately**: When using channel pooling, always configure a finite checkout timeout (e.g., 3,000ms - 5,000ms). Without a timeout, threads will block indefinitely if a channel leak occurs in application code [Source: Spring AMQP Reference Guide](https://docs.spring.io/spring-amqp/reference/amqp/connections.html).
+3. **Enforce `connectionLimit` and Handle `AmqpTimeoutException` Gracefully**: When running in `CacheMode.CONNECTION`, always pair `connectionCacheSize` with `setConnectionLimit` to prevent unpooled bursts under concurrency. Configure a finite `channelCheckoutTimeout` (e.g., 5,000ms), and ensure client services catch `AmqpTimeoutException` to trigger transactional fallbacks (e.g., local Outbox pattern or transactional dead-letter queues) rather than dropping user checkouts [Source: Spring AMQP Reference Guide](https://docs.spring.io/spring-amqp/reference/amqp/connections.html).
 4. **Monitor `erlang_processes` and Connection Churn Rate**: Alert on high connection churn rates (`rabbitmq_connections_opened_total` vs `rabbitmq_connections_closed_total`) in Prometheus to detect rogue microservices failing to pool connections before cluster stability degrades [Source: RabbitMQ Runtime Tuning Guide](https://www.rabbitmq.com/docs/runtime).
 
 ---
