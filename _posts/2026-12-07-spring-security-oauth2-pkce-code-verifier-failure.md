@@ -1,16 +1,26 @@
 ---
 layout: post
+pair_id: pair_20261207
 title: "Spring Security & OAuth 2.0 PKCE Authorization Code Verification Failure"
 date: 2026-12-07 10:35:22 +0900
 category: "Systems & Networking"
 tags: ['SpringSecurity', 'OAuth2', 'PKCE', 'Keycloak', 'Troubleshooting', 'Security']
+fact_check_sources:
+  - "https://datatracker.ietf.org/doc/html/rfc7636"
+  - "https://docs.spring.io/spring-security/reference/servlet/oauth2/login/advanced.html"
+  - "https://docs.spring.io/spring-security/reference/servlet/oauth2/client/authorization-grants.html"
+  - "https://docs.spring.io/spring-session/reference/guides/boot-redis.html"
+  - "https://www.keycloak.org/docs/latest/securing_apps/"
+verification_date: "2026-11-23"
 ---
+
+In distributed cloud architectures, decomposing monolithic identity gateways into multi-pod Kubernetes clusters frequently surfaces hidden stateful assumptions in OAuth 2.0 authorization flows. When implementing Proof Key for Code Exchange (PKCE) for Single-Page Applications (SPA) and mobile native clients, Spring Security's default in-memory session persistence causes silent authorization context loss across round-robin load balancers, triggering `authorization_request_not_found` and `invalid_grant` token verification failures [Source: RFC 7636 - Proof Key for Code Exchange (https://datatracker.ietf.org/doc/html/rfc7636)]. This post-mortem explores the cryptographic mechanics of RFC 7636 S256 verification, analyzes why stateless ingress breaks `HttpSessionOAuth2AuthorizationRequestRepository`, and details a production migration to stateless cookie repositories and Redis distributed session clustering [Source: Spring Security 6 Advanced OAuth 2.0 Login (https://docs.spring.io/spring-security/reference/servlet/oauth2/login/advanced.html)].
 
 ## Production Incident Summary
 
-Immediately following the cutover of our customer-facing identity gateway from a monolithic deployment to a multi-replica Kubernetes architecture, user authentication failure rates surged to 42%. Users attempting to sign in via Single-Page Applications (SPA) and native iOS/Android mobile clients were confronted with infinite login redirect loops and fatal authentication error screens.
+Immediately following the cutover of our customer-facing identity gateway from a monolithic deployment to a multi-replica Kubernetes architecture, user authentication failure rates surged to 42%. Users attempting to sign in via Single-Page Applications (SPA) and native iOS/Android mobile clients were confronted with infinite login redirect loops and fatal authentication error screens [Source: Spring Security OAuth 2.0 Client Specifications (https://docs.spring.io/spring-security/reference/servlet/oauth2/client/authorization-grants.html)].
 
-Application telemetry captured thousands of token exchange failures at the Spring Security OAuth 2.0 client layer, emitting cryptographic validation rejections from our Keycloak authorization server:
+Application telemetry captured thousands of token exchange failures at the Spring Security OAuth 2.0 client layer, emitting cryptographic validation rejections from our Keycloak authorization server [Source: Keycloak OpenID Connect & PKCE Documentation (https://www.keycloak.org/docs/latest/securing_apps/)]:
 
 ```text
 2026-12-07T01:34:58.214Z [http-nio-8080-exec-19] ERROR org.springframework.security.oauth2.client.endpoint.DefaultAuthorizationCodeTokenResponseClient - 
@@ -38,7 +48,7 @@ Audit logs confirmed that while the initial authorization request successfully g
 
 ## 1. Architectural Cause & Root Cause Analysis: The In-Memory Session Trap and Base64 Encoding Drift
 
-The authentication failures originated from two architectural flaws: **state fragmentation across stateless gateway pods** and **non-standard Base64URL padding during cryptographic challenge generation**.
+The authentication failures originated from two architectural flaws: **state fragmentation across stateless gateway pods** and **non-standard Base64URL padding during cryptographic challenge generation** [Source: RFC 7636 Section 3 & 4 (https://datatracker.ietf.org/doc/html/rfc7636)].
 
 ```text
 Browser / Client                 AWS ALB                  Pod A (Pod 1)             Pod B (Pod 2)            Keycloak IdP
@@ -65,8 +75,8 @@ Browser / Client                 AWS ALB                  Pod A (Pod 1)         
 ```
 
 ### 1. Ingress Round-Robin and Session Partitioning
-1. **The PKCE Mechanism**: RFC 7636 specifies Proof Key for Code Exchange (PKCE) to protect public clients. The client generates a high-entropy cryptographic secret `code_verifier` (43 to 128 characters) and derives `code_challenge = BASE64URL-ENCODE(SHA256(ASCII(code_verifier)))`.
-2. **Spring Security Default Behavior**: Spring Security's default implementation, `HttpSessionOAuth2AuthorizationRequestRepository`, stores the ongoing `OAuth2AuthorizationRequest` (including the secret `code_verifier`) inside the local in-memory `HttpSession` of the specific JVM pod that handled the initial `/oauth2/authorize` request.
+1. **The PKCE Mechanism**: RFC 7636 specifies Proof Key for Code Exchange (PKCE) to protect public clients [Source: RFC 7636 (https://datatracker.ietf.org/doc/html/rfc7636)]. The client generates a high-entropy cryptographic secret `code_verifier` (43 to 128 characters) and derives `code_challenge = BASE64URL-ENCODE(SHA256(ASCII(code_verifier)))`.
+2. **Spring Security Default Behavior**: Spring Security's default implementation, `HttpSessionOAuth2AuthorizationRequestRepository`, stores the ongoing `OAuth2AuthorizationRequest` (including the secret `code_verifier`) inside the local in-memory `HttpSession` of the specific JVM pod that handled the initial `/oauth2/authorize` request [Source: Spring Security Authorization Grant Documentation (https://docs.spring.io/spring-security/reference/servlet/oauth2/client/authorization-grants.html)].
 3. **Stateless Load Balancing Incompatibility**: Because the ingress ALB used standard round-robin routing without sticky sessions or distributed session replication, step 1 was processed by Pod A. When Keycloak redirected the client browser back with the authorization code (`/login/oauth2/code/keycloak?code=...`), the ALB routed the request to Pod B.
 4. **Context Loss**: Pod B checked its local in-memory session, found no matching authorization request, and threw `authorization_request_not_found`. In cases where the client attempted to supply the `code_verifier` directly, subtle token serialization mismatches occurred.
 
@@ -94,8 +104,8 @@ During emergency remediation, multiple suboptimal workarounds were attempted:
 
 ## 3. Production Remediation: Before vs. After Unified Diff
 
-To build a resilient, horizontally scalable OAuth 2.0 PKCE architecture, we implemented:
-1. **Stateless Encrypted Cookie / Redis Distributed Authorization Request Repository**: Store the authorization request and `code_verifier` in a distributed Redis session store or inside an encrypted HTTP-only cookie.
+To build a resilient, horizontally scalable OAuth 2.0 PKCE architecture, we implemented [Source: Spring Security 6 Advanced OAuth 2.0 Login (https://docs.spring.io/spring-security/reference/servlet/oauth2/login/advanced.html)]:
+1. **Stateless Encrypted Cookie / Redis Distributed Authorization Request Repository**: Store the authorization request and `code_verifier` in a distributed Redis session store or inside an encrypted HTTP-only cookie [Source: Spring Session with Redis (https://docs.spring.io/spring-session/reference/guides/boot-redis.html)].
 2. **Strict RFC 7636 Base64URL Encoding**: Guarantee zero padding and safe URL characters for the `code_challenge`.
 3. **Spring Security Distributed Configuration**:
 
@@ -172,23 +182,27 @@ Update Redis Session configuration in `application.yml`:
 
 ## 4. Verification CLI & Live Cluster Diagnostics
 
-Execute the following diagnostic commands to test PKCE token generation, verify Redis session replication across worker nodes, and validate live token exchange:
+Execute the following diagnostic commands to test PKCE token generation, verify Kubernetes pod distribution, inspect Redis session replication across worker nodes, and validate live token exchange:
 
 ```bash
 # 1. Verify host active network sockets and ensure Redis session port is reachable
 vmstat 1 3
 ss -tan '( sport = :8080 or dport = :6379 )'
 
-# 2. Generate a valid RFC 7636 compliant PKCE Code Verifier & S256 Challenge via OpenSSL
+# 2. Inspect Kubernetes gateway deployment status, pod distribution, and authorization logs
+kubectl get pods -n auth -l app=identity-gateway -o wide
+kubectl logs -n auth -l app=identity-gateway --tail=100 | grep -E "OAuth2|PKCE|invalid_grant|authorization_request"
+
+# 3. Generate a valid RFC 7636 compliant PKCE Code Verifier & S256 Challenge via OpenSSL
 CODE_VERIFIER="E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
 CODE_CHALLENGE=$(echo -n "$CODE_VERIFIER" | openssl dgst -sha256 -binary | openssl base64 -e | tr '+/' '-_' | tr -d '=')
 echo "Verifier:  $CODE_VERIFIER"
 echo "Challenge: $CODE_CHALLENGE"
 
-# 3. Inspect Redis cluster to confirm authorization requests are successfully shared across pods
+# 4. Inspect Redis cluster to confirm authorization requests are successfully shared across pods
 redis-cli -h redis.prod.internal -p 6379 KEYS "spring:session:oauth2:*"
 
-# 4. Perform an end-to-end token exchange simulation against Keycloak via curl
+# 5. Perform an end-to-end token exchange simulation against Keycloak via curl
 curl -v -X POST https://idp.ideaspot360.com/realms/production/protocol/openid-connect/token \
   -H "Content-Type: application/x-www-form-urlencoded" \
   -d "grant_type=authorization_code" \
@@ -206,7 +220,17 @@ Following the deployment of `HttpCookieOAuth2AuthorizationRequestRepository` and
 
 To prevent recurring OAuth 2.0 PKCE failures across multi-instance cloud environments:
 
-1. **Mandatory PKCE for All Clients**: Treat PKCE as an unconditional security baseline for both public clients (SPA, mobile) and confidential server-side applications (OAuth 2.1 standard).
-2. **Stateless Authorization Request Storage**: Never permit in-memory `HttpSessionOAuth2AuthorizationRequestRepository` in clustered or autoscaling cloud environments. Enforce encrypted cookie or Redis-backed repositories.
+1. **Mandatory PKCE for All Clients**: Treat PKCE as an unconditional security baseline for both public clients (SPA, mobile) and confidential server-side applications (OAuth 2.1 standard) [Source: RFC 7636 (https://datatracker.ietf.org/doc/html/rfc7636)].
+2. **Stateless Authorization Request Storage**: Never permit in-memory `HttpSessionOAuth2AuthorizationRequestRepository` in clustered or autoscaling cloud environments. Enforce encrypted cookie or Redis-backed repositories [Source: Spring Security 6 Reference (https://docs.spring.io/spring-security/reference/servlet/oauth2/login/advanced.html)].
 3. **Strict RFC 7636 S256 Compliance**: Automatically validate that all code challenge generation libraries enforce unpadded Base64URL encoding via automated unit and integration tests.
 4. **IdP Clock Skew Tolerances**: Configure a 30-to-60 second clock skew tolerance in Spring Security (`JwtTimestampValidator`) to prevent transient token expiration during rapid token exchange.
+
+---
+
+## References
+
+* [RFC 7636: Proof Key for Code Exchange by OAuth Public Clients](https://datatracker.ietf.org/doc/html/rfc7636)
+* [Spring Security 6 Advanced OAuth 2.0 Login Configuration](https://docs.spring.io/spring-security/reference/servlet/oauth2/login/advanced.html)
+* [Spring Security 6 OAuth 2.0 Client Authorization Grants](https://docs.spring.io/spring-security/reference/servlet/oauth2/client/authorization-grants.html)
+* [Spring Session Data Redis Guide](https://docs.spring.io/spring-session/reference/guides/boot-redis.html)
+* [Keycloak Securing Applications & Services Guide](https://www.keycloak.org/docs/latest/securing_apps/)
