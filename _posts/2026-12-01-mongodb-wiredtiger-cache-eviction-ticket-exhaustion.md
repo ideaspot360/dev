@@ -12,6 +12,7 @@ fact_check_sources:
   - "https://www.mongodb.com/docs/manual/reference/command/serverStatus/#mongodb-serverstatus-serverstatus.wiredtiger"
   - "https://www.mongodb.com/docs/database-tools/mongostat/"
   - "https://source.wiredtiger.com/develop/tune_cache.html"
+  - "https://docs.kernel.org/admin-guide/sysctl/vm.html"
 verification_date: "2026-11-23"
 ---
 
@@ -98,7 +99,7 @@ The instance was explicitly pinned to 45 GiB (`cacheSizeGB: 45`) to preserve rem
 
 WiredTiger regulates internal concurrency and memory pressure using two interconnected systems:
 
-1. **Concurrency Tickets**: MongoDB enforces admission control through concurrency tickets [Source: MongoDB Server Parameters (https://www.mongodb.com/docs/manual/reference/parameters/#mongodb-parameter-param.wiredTigerConcurrentWriteTransactions)]. In MongoDB 6.0 (and as an upper bound in MongoDB 7.0 dynamic scheduling), the engine allocates **128 read tickets** and **128 write tickets**. Every operation executing inside WiredTiger must check out a ticket from `wiredTiger.concurrentTransactions.write` or `read`. When an operation completes, the ticket is immediately returned to the pool.
+1. **Concurrency Tickets**: MongoDB enforces admission control through concurrency tickets [Source: MongoDB Server Parameters (https://www.mongodb.com/docs/manual/reference/parameters/#mongodb-parameter-param.wiredTigerConcurrentWriteTransactions)]. In MongoDB 6.0 (and as an upper bound in MongoDB 7.0 dynamic scheduling), the engine allocates **128 read tickets** and **128 write tickets** by default. In MongoDB 7.0+, an adaptive algorithm dynamically scales tickets between a lower baseline and 128 depending on throughput; however, in MongoDB 6.0, tickets are static. Every operation executing inside WiredTiger must check out a ticket from `wiredTiger.concurrentTransactions.write` or `read`. When an operation completes, the ticket is immediately returned to the pool.
 2. **Eviction Thresholds & Watermarks**: WiredTiger regulates cache fullness and dirty data via four core watermarks [Source: WiredTiger Cache Tuning (https://source.wiredtiger.com/develop/tune_cache.html)]:
    * `eviction_target` (Default: **80%**): Cache fullness percentage that background eviction worker threads strive to maintain.
    * `eviction_trigger` (Default: **95%**): Cache fullness threshold. If total cache usage hits 95%, application threads are forced to assist background workers in evicting clean and dirty pages.
@@ -201,7 +202,7 @@ db.adminCommand({
 
 ### Step 2: Linux Kernel Dirty Writeback Calibration
 
-Linux default `vm.dirty_ratio` (20%) and `vm.dirty_background_ratio` (10%) allow huge bursts of dirty pages in the OS page cache before pdflush/flush threads activate. On a 96 GiB host, 20% represents nearly 19 GiB of buffered writes, triggering OS-level sync pauses. We tuned the kernel to flush continuously [Source: Linux Kernel Virtual Memory Documentation (https://docs.kernel.org)]:
+Linux default `vm.dirty_ratio` (20%) and `vm.dirty_background_ratio` (10%) allow huge bursts of dirty pages in the OS page cache before pdflush/flush threads activate. On a 96 GiB host, 20% represents nearly 19 GiB of buffered writes, triggering OS-level sync pauses. We tuned the kernel to flush continuously [Source: Linux Kernel Virtual Memory Documentation (https://docs.kernel.org/admin-guide/sysctl/vm.html)]:
 
 ```diff
 --- /etc/sysctl.d/99-mongodb.conf.orig	2026-11-23 09:15:00.000000000 +0000
@@ -242,7 +243,7 @@ To prevent thousands of application worker threads from overwhelming the 128 sto
 Execute the following commands on the database host to inspect active ticket utilization, application thread eviction counters, and kernel memory flush behavior:
 
 ```bash
-# 1. Measure real-time WiredTiger ticket availability and dirty cache state
+# 1. Measure real-time WiredTiger ticket availability, dirty cache state, and checkpoint duration
 mongosh --quiet --eval '
   const status = db.serverStatus();
   const wt = status.wiredTiger;
@@ -252,6 +253,7 @@ mongosh --quiet --eval '
   print("Read Tickets Available:    " + wt.concurrentTransactions.read.available);
   print("Tracked Dirty Bytes:       " + (wt.cache["tracked dirty bytes in the cache"] / 1024 / 1024).toFixed(2) + " MB");
   print("App Threads Evicting:      " + wt.cache["pages evicted by application threads"]);
+  print("Last Checkpoint Duration:  " + (wt.transaction ? wt.transaction["checkpoint most recent time (msecs)"] + " ms" : "N/A"));
 '
 
 # 2. Inspect active mongostat feed to verify queue backlog (qr|qw) and dirty percentage
@@ -270,8 +272,8 @@ iostat -xkz 1 5
 # 6. Check active MongoDB incoming TCP socket connection queues and backlog
 ss -ti '( sport = :27017 or dport = :27017 )'
 
-# 7. Check administrative health endpoint and active tickets via curl
-curl -s http://127.0.0.1:28017/serverStatus | grep -A 10 "concurrentTransactions" || true
+# 7. Check Prometheus mongodb_exporter metrics for active WiredTiger concurrency tickets via curl
+curl -s http://127.0.0.1:9216/metrics | grep -E "wiredtiger_concurrent_transactions|wt_concurrentTransactions"
 ```
 
 ---
@@ -291,7 +293,7 @@ Following the deployment of the calibrated eviction watermarks and kernel sysctl
 
 1. **Tighten Dirty Watermarks Early**: Never leave `eviction_dirty_trigger` at the default 20% on large-memory instances ($>32\text{ GiB}$). Configure `eviction_dirty_target: 3` and `eviction_dirty_trigger: 10` so dedicated workers flush continuously [Source: WiredTiger Cache Tuning Architecture (https://source.wiredtiger.com/develop/tune_cache.html)].
 2. **Scale Eviction Worker Threads**: Set `configString: "eviction=(threads_min=4,threads_max=8)"` in `mongod.conf` to provide sufficient background worker capacity for multi-core systems.
-3. **Align Linux Kernel Page Cache Ratios**: Set `vm.dirty_background_ratio = 3` and `vm.dirty_ratio = 8` to synchronize OS writeback with storage engine flush cadences [Source: Linux Kernel Virtual Memory Documentation (https://docs.kernel.org)].
+3. **Align Linux Kernel Page Cache Ratios**: Set `vm.dirty_background_ratio = 3` and `vm.dirty_ratio = 8` to synchronize OS writeback with storage engine flush cadences [Source: Linux Kernel Virtual Memory Documentation (https://docs.kernel.org/admin-guide/sysctl/vm.html)].
 4. **Constrain Application Connection Pools**: Maintain strict client connection caps (e.g., maximum 50 connections per replica) to prevent client stampedes during scheduled storage checkpoints.
 5. **Monitor Eviction Telemetry**: Trigger PagerDuty alerts whenever `pages evicted by application threads > 0` or `wiredTiger.concurrentTransactions.write.available < 20` for more than 5 consecutive seconds.
 
@@ -306,4 +308,4 @@ Following the deployment of the calibrated eviction watermarks and kernel sysctl
 * [MongoDB Manual: Database Command serverStatus - WiredTiger Metrics](https://www.mongodb.com/docs/manual/reference/command/serverStatus/#mongodb-serverstatus-serverstatus.wiredtiger)
 * [MongoDB Database Tools Documentation: mongostat](https://www.mongodb.com/docs/database-tools/mongostat/)
 * [WiredTiger Storage Engine Official Source Documentation: Tuning Cache Eviction](https://source.wiredtiger.com/develop/tune_cache.html)
-* [Linux Kernel Documentation: Documentation for /proc/sys/vm/](https://docs.kernel.org)
+* [Linux Kernel Documentation: Documentation for /proc/sys/vm/](https://docs.kernel.org/admin-guide/sysctl/vm.html)
