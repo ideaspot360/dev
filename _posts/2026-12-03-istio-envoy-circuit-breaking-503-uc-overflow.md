@@ -31,7 +31,7 @@ Under a steady ingress load of 3,500 RPS distributed across 40 upstream service 
 HTTP/1.1 503 Service Unavailable
 date: Thu, 03 Dec 2026 02:39:14 GMT
 server: envoy
-content-length: 95
+content-length: 48
 content-type: text/plain
 upstream_reset_before_response_started{overflow}
 
@@ -40,7 +40,7 @@ upstream_reset_before_response_started{overflow}
 HTTP/1.1 503 Service Unavailable
 date: Thu, 03 Dec 2026 02:39:14 GMT
 server: envoy
-content-length: 109
+content-length: 63
 content-type: text/plain
 upstream_reset_before_response_started{connection_termination}
 ```
@@ -146,11 +146,12 @@ Under 3,500 RPS distributed across 40 upstream pods, each pod receives approxima
 
 With all active sockets busy handling in-flight requests, subsequent requests enter Envoy's pending queue. Because the queue capacity is constrained to 1, the second concurrent pending request trips the circuit breaker threshold. Envoy immediately terminates the request locally, incrementing `upstream_rq_pending_overflow` and returning `503 UO`.
 
-### 3.3 Connection Churn and Idle Timeout Mismatches (503 UC)
+### 3.3 Connection Churn, maxRequestsPerConnection, and Idle Timeout Mismatches (503 UC)
 
-Simultaneously, the target Go application runtime used an HTTP server `IdleTimeout` of 15 seconds, while client Envoy sidecars maintained upstream connection pool idle timeouts of 60 seconds (`idleTimeout: 60s`). 
+The secondary symptom—the surge in `503 UC` responses—stemmed from intense socket churn combined with keepalive idle timeout discrepancies [Source: Envoy Upstream Architecture (https://www.envoyproxy.io/docs/envoy/v1.30.2/intro/arch_overview/upstream/circuit_breaking)]:
 
-When an upstream Go process closed an idle TCP connection after 15 seconds by sending a `FIN` packet, a client-side Envoy proxy concurrently attempted to reuse that socket for an incoming transaction before processing the `FIN`. The upstream kernel responded with a TCP `RST`, causing Envoy to log `503 UC` (`upstream_reset_before_response_started{connection_termination}`).
+1. **The `maxRequestsPerConnection: 1` Penalty**: The legacy DestinationRule had set `trafficPolicy.connectionPool.http.maxRequestsPerConnection: 1`. Under this setting, Envoy explicitly closed every upstream TCP socket after completing a single HTTP transaction by injecting `Connection: close`. At 3,500 RPS across 40 backend pods, the client proxy initiated and tore down over 3,500 TCP handshakes every second, exhausting local ephemeral ports and flooding the kernel's conntrack table.
+2. **Idle Timeout Race Conditions**: Simultaneously, the upstream Go application runtime configured an HTTP server `IdleTimeout` of 15 seconds, while client Envoy sidecars operated with an upstream connection pool idle timeout of 60 seconds (`idleTimeout: 60s`). When upstream Go backend processes closed an idle connection after 15 seconds by sending a `FIN` packet, a client-side Envoy proxy concurrently attempted to dispatch a new request over that socket before processing the inbound `FIN`. The upstream kernel responded with a TCP `RST`, prompting Envoy to terminate the request locally and log `503 UC` (`upstream_reset_before_response_started{connection_termination}`).
 
 ---
 
@@ -186,7 +187,7 @@ Apply the following production patch:
 ```diff
 --- istio/destinationrule-order-service.yaml.orig
 +++ istio/destinationrule-order-service.yaml
-@@ -1,13 +1,38 @@
+@@ -1,14 +1,31 @@
  apiVersion: networking.istio.io/v1
  kind: DestinationRule
  metadata:
@@ -197,6 +198,10 @@ Apply the following production patch:
    trafficPolicy:
      loadBalancer:
        simple: LEAST_REQUEST
+-    connectionPool:
+-      http:
+-        http1MaxPendingRequests: 1
+-        maxRequestsPerConnection: 1
 +    connectionPool:
 +      tcp:
 +        maxConnections: 2048
@@ -216,16 +221,13 @@ Apply the following production patch:
 +      interval: 10s
 +      baseEjectionTime: 30s
 +      maxEjectionPercent: 50
--    connectionPool:
--      http:
--        http1MaxPendingRequests: 1
--        maxRequestsPerConnection: 1
 ```
 
 ### 5.1 Parameter Breakdown and Operational Mechanics
 
 * **`http1MaxPendingRequests: 2048`**: Allocates queue capacity for pending transactions during downstream latency fluctuations, preventing instantaneous local resets [Source: Istio DestinationRule Reference (https://istio.io/latest/docs/reference/config/networking/destination-rule/)].
 * **`tcp.maxConnections: 2048`**: Ensures that Envoy can scale its concurrent socket count across all endpoints in the cluster during traffic spikes.
+* **`maxRequestsPerConnection: 512`**: Reuses TCP connections across 512 HTTP/1.1 transactions, eliminating the massive per-request TCP handshake churn and port exhaustion caused by the legacy `maxRequestsPerConnection: 1`.
 * **`tcpKeepalive.time: 30s`**: Emits TCP keepalive probes to prevent intermediate stateful firewalls and NAT gateways from silently pruning idle connections.
 * **`http.idleTimeout: 10s`**: Ensures the client Envoy proxy terminates idle connections before the upstream application server's 15-second idle timeout, eliminating race conditions that manifest as `503 UC`.
 * **`outlierDetection.consecutiveGatewayErrors: 2`**: Ejects an individual upstream host if it returns 2 consecutive 502, 503, or 504 errors, isolating degraded pods without impacting healthy endpoints [Source: Envoy Outlier Detection Architecture (https://www.envoyproxy.io/docs/envoy/v1.30.2/intro/arch_overview/upstream/outlier)].
@@ -238,7 +240,7 @@ Execute the following diagnostic commands to verify the applied circuit breaker 
 
 ```bash
 # 1. Query the compiled Envoy cluster configuration to confirm circuit breaker thresholds
-istioctl proxy-config cluster deploy/order-client.prod \
+istioctl proxy-config cluster deployment/order-client.prod \
   --fqdn order-service.prod.svc.cluster.local -o json | \
   jq '.[] | {name: .name, circuit_breakers: .circuit_breakers}'
 
@@ -272,8 +274,8 @@ kubectl exec -n prod deploy/order-client -c istio-proxy -- \
 kubectl exec -n prod deploy/order-client -c istio-proxy -- \
   ss -tan '( sport = :8080 or dport = :8080 )' | head -n 20
 
-# 5. Execute an end-to-end benchmark using Fortio to validate under 3,500 RPS load
-kubectl exec -n prod deploy/order-client -c istio-proxy -- \
+# 5. Execute an end-to-end benchmark using a dedicated Fortio load generator to validate under 3,500 RPS load
+kubectl exec -n prod deploy/fortio-loadgen -c fortio -- \
   fortio load -c 64 -qps 3500 -t 60s \
   -H "Content-Type: application/json" \
   -payload '{"client_id":"perf-check","batch_size":100}' \
@@ -348,14 +350,23 @@ spec:
             summary: "Envoy pending request queue overflow detected"
             description: "Cluster {{ $labels.cluster_name }} in namespace {{ $labels.namespace }} is dropping requests due to circuit breaking."
 
-        - alert: IstioEnvoyUpstreamConnectionReset
+        - alert: IstioEnvoyUpstreamConnectionTermination
+          expr: sum by (cluster_name, namespace) (rate(envoy_cluster_upstream_cx_destroy_remote_with_active_rq[1m])) > 0
+          for: 30s
+          labels:
+            severity: warning
+          annotations:
+            summary: "Envoy upstream connection termination detected"
+            description: "Cluster {{ $labels.cluster_name }} in namespace {{ $labels.namespace }} is experiencing premature remote socket closures with active requests (503 UC)."
+
+        - alert: IstioEnvoyUpstreamConnectionFailure
           expr: sum by (cluster_name, namespace) (rate(envoy_cluster_upstream_cx_connect_fail[1m])) > 5
           for: 1m
           labels:
             severity: warning
           annotations:
-            summary: "Envoy upstream connection resets elevated"
-            description: "Cluster {{ $labels.cluster_name }} is experiencing connection terminations (503 UC)."
+            summary: "Envoy upstream connection failures elevated"
+            description: "Cluster {{ $labels.cluster_name }} in namespace {{ $labels.namespace }} is failing initial TCP/TLS handshakes (503 UF)."
 ```
 
 ---
