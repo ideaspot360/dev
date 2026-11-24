@@ -18,10 +18,10 @@ Deploying transformer-based computer vision and deep learning models with the ON
 During the canary rollout of an optimized Vision Transformer (`google/vit-base-patch16-224`) model serving cluster on AWS EC2 `g5.2xlarge` instances equipped with NVIDIA A10G GPUs, inference worker pods crashed immediately during container startup:
 
 ```text
-[E:onnxruntime:Default, tensorrt_execution_provider.h:74] [TensorRT] ERROR: 4: [builder.cpp::buildSerializedNetwork::751] Error Code 4: Internal Error
+[E:onnxruntime:Default, tensorrt_execution_provider.h:74] [TensorRT] ERROR: 4: [builder.cpp::buildSerializedNetwork::751] Error Code 4: Internal Error (Network has dynamic or shape inputs, but no optimization profile has been defined.)
 [ONNXRuntimeError] : 1 : FAIL : TensorRT dynamic shape profile mismatch for input 'pixel_values'. 
 Specified min/opt/max shapes do not match runtime model graph bounds:
-Model expected dynamic batch dimension for input 'pixel_values' [-1, 3, 224, 224], but no profile was configured.
+Model expected dynamic batch dimension for input 'pixel_values' [-1, 3, 224, 224], but no optimization profile was configured.
 ```
 
 Kubernetes marked the inference pods as unready. Because the container process terminated before binding its HTTP/gRPC socket, the Kubernetes `startupProbe` reached its failure threshold, placing the deployment into `CrashLoopBackOff` and halting automated canary promotion [Source: ONNX Runtime TensorRT Execution Provider Documentation (https://onnxruntime.ai/docs/execution-providers/TensorRT-ExecutionProvider.html)]:
@@ -175,6 +175,9 @@ To establish a resilient, high-performance serving architecture, we implemented 
  
  session = ort.InferenceSession(
      "models/vit-base.onnx",
++    sess_options=session_options,
++    providers=providers,
+ )
 ```
 
 ### Unified Diff 2: Triton Inference Server Dynamic Batching (`model_repository/vit_base/config.pbtxt`)
@@ -212,17 +215,19 @@ To establish a resilient, high-performance serving architecture, we implemented 
 +
 +optimization {
 +  execution_accelerators {
-+    gpu_execution_accelerator {
-+      name: "tensorrt"
-+      parameters { key: "device_id" value: "0" }
-+      parameters { key: "trt_max_workspace_size_bytes" value: "4294967296" }
-+      parameters { key: "trt_fp16_enable" value: "true" }
-+      parameters { key: "trt_engine_cache_enable" value: "true" }
-+      parameters { key: "trt_engine_cache_path" value: "/var/cache/trt_engines" }
-+      parameters { key: "trt_profile_min_shapes" value: "pixel_values:1x3x224x224" }
-+      parameters { key: "trt_profile_opt_shapes" value: "pixel_values:8x3x224x224" }
-+      parameters { key: "trt_profile_max_shapes" value: "pixel_values:32x3x224x224" }
-+    }
++    gpu_execution_accelerator : [
++      {
++        name: "tensorrt"
++        parameters { key: "device_id" value: "0" }
++        parameters { key: "precision_mode" value: "FP16" }
++        parameters { key: "max_workspace_size_bytes" value: "4294967296" }
++        parameters { key: "trt_engine_cache_enable" value: "1" }
++        parameters { key: "trt_engine_cache_path" value: "/var/cache/trt_engines" }
++        parameters { key: "trt_profile_min_shapes" value: "pixel_values:1x3x224x224" }
++        parameters { key: "trt_profile_opt_shapes" value: "pixel_values:8x3x224x224" }
++        parameters { key: "trt_profile_max_shapes" value: "pixel_values:32x3x224x224" }
++      }
++    ]
 +  }
 +}
 ```
@@ -278,16 +283,16 @@ trtexec --onnx=models/vit-base.onnx \
 
 # 2. Inspect active container pods and verify persistent cache directory contents
 kubectl get pods -n ml-serving -l app=vit-inference -o wide
-kubectl exec -it -n ml-serving deploy/vit-inference -c inference -- ls -lh /var/cache/trt_engines
+kubectl exec -it -n ml-serving deploy/vit-inference -c inference-server -- ls -lh /var/cache/trt_engines
 
 # 3. Inspect container logs for TensorRT execution provider initialization and engine cache hit
-kubectl logs -n ml-serving deploy/vit-inference -c inference --tail=50 | grep -E "TensorrtExecutionProvider|engine cache|Profile"
+kubectl logs -n ml-serving deploy/vit-inference -c inference-server --tail=50 | grep -E "TensorrtExecutionProvider|engine cache|Profile"
 
 # 4. Query Triton Inference Server health endpoints and send dynamic-batch inference request
 curl -v -s -X GET http://vit-inference.ml-serving.svc.cluster.local:8000/v2/health/ready
 curl -s -X POST http://vit-inference.ml-serving.svc.cluster.local:8000/v2/models/vit_base/infer \
     -H "Content-Type: application/json" \
-    -d @sample_batch8_payload.json | jq '.outputs[0].data | length'
+    -d @sample_batch8_payload.json | jq '.outputs[0].shape'
 ```
 
 ---
