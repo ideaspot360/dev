@@ -188,7 +188,7 @@ However, when an unbuffered channel (`dataqsiz == 0`) has **no active receiver**
 The notification service wrapped downstream vendor HTTP requests with a 500ms `context.WithTimeout`:
 
 ```
-Client Request -> [sendWithTimeout]
+Client Request -> [SendWithTimeout]
                         │
                         ├─► Starts Worker Goroutine (ch <- dispatchVendor)
                         │
@@ -198,7 +198,7 @@ Client Request -> [sendWithTimeout]
        [select case <-ctx.Done()]
                         │
                         ├─► Caller exits function, returns HTTP 504
-                        │   `sendWithTimeout` stack frame destroyed
+                        │   `SendWithTimeout` stack frame destroyed
                         │   `ch` reference dropped from parent scope
                         │
                   (520ms Elapsed)
@@ -283,9 +283,9 @@ runtime.chansend(0xc004128060, 0xc00624bf68, 0x1, 0x0)
     /usr/local/go/src/runtime/chan.go:315 +0x475
 runtime.chansend1(0xc004128060, 0xc00624bf68)
     /usr/local/go/src/runtime/chan.go:145 +0x25
-internal/dispatcher.sendWithTimeout.func1()
+internal/dispatcher.SendWithTimeout.func1()
     /app/internal/dispatcher/worker.go:58 +0x6a
-created by internal/dispatcher.sendWithTimeout in goroutine 18204
+created by internal/dispatcher.SendWithTimeout in goroutine 18204
     /app/internal/dispatcher/worker.go:54 +0x145
 ```
 
@@ -307,7 +307,7 @@ Time: Nov 18, 2026 at 11:42pm (UTC)
 Showing nodes accounting for 9331829, 100% of 9331829 total
       flat  flat%   sum%        cum   cum%
    9331802 100.0% 100.0%    9331802 100.0%  runtime.gopark
-         0   0.0% 100.0%    9331802 100.0%  internal/dispatcher.sendWithTimeout.func1
+         0   0.0% 100.0%    9331802 100.0%  internal/dispatcher.SendWithTimeout.func1
          0   0.0% 100.0%    9331802 100.0%  runtime.chansend
          0   0.0% 100.0%    9331802 100.0%  runtime.chansend1
 ```
@@ -316,13 +316,13 @@ Inspecting function disassembly and source mapping:
 
 ```bash
 go tool pprof http://localhost:6060/debug/pprof/goroutine
-(pprof) list sendWithTimeout
+(pprof) list SendWithTimeout
 ```
 
 ```text
-ROUTINE ======================== internal/dispatcher.sendWithTimeout.func1 in /app/internal/dispatcher/worker.go
+ROUTINE ======================== internal/dispatcher.SendWithTimeout.func1 in /app/internal/dispatcher/worker.go
          0    9331802 (flat, cum) 100.0% of Total
-         .          .     53: func sendWithTimeout(ctx context.Context, payload []byte) error {
+         .          .     53: func SendWithTimeout(ctx context.Context, payload []byte) error {
          .          .     54:     ch := make(chan error)
          .          .     55: 
          .          .     56:     go func() {
@@ -368,12 +368,11 @@ package dispatcher
 
 import (
 	"context"
-	"time"
 )
 
 // ANTIPATTERN: Unbuffered channel causes silent permanent goroutine leak
 // whenever ctx reaches its deadline before dispatchExternalVendor completes.
-func sendWithTimeout(ctx context.Context, payload []byte) error {
+func SendWithTimeout(ctx context.Context, payload []byte) error {
 	ch := make(chan error) // Unbuffered: capacity is 0
 
 	go func() {
@@ -405,18 +404,18 @@ By changing `make(chan error)` to `make(chan error, 1)`, the channel buffer has 
 ```diff
 --- a/internal/dispatcher/worker.go
 +++ b/internal/dispatcher/worker.go
-@@ -51,12 +51,13 @@ package dispatcher
- func sendWithTimeout(ctx context.Context, payload []byte) error {
+@@ -51,15 +51,17 @@ package dispatcher
+ func SendWithTimeout(ctx context.Context, payload []byte) error {
 -	ch := make(chan error)
 +	// Buffered channel with capacity 1 ensures sender never blocks
 +	// even if the caller context times out and abandons this receiver.
 +	ch := make(chan error, 1)
-
+ 
  	go func() {
  		err := dispatchExternalVendor(payload)
  		ch <- err
  	}()
-
+ 
  	select {
  	case err := <-ch:
  		return err
@@ -546,11 +545,11 @@ When tested against the unbuffered implementation, `goleak` halts the build and 
 ```text
 --- FAIL: TestSendWithTimeout_LeakDetection (0.06s)
     goleak.go:132: found unexpected goroutines:
-        [Goroutine 19 in state chan send, with internal/dispatcher.sendWithTimeout.func1 on top of the stack:
+        [Goroutine 19 in state chan send, with internal/dispatcher.SendWithTimeout.func1 on top of the stack:
         goroutine 19 [chan send]:
-        internal/dispatcher.sendWithTimeout.func1()
+        internal/dispatcher.SendWithTimeout.func1()
             /app/internal/dispatcher/worker.go:58 +0x6a
-        created by internal/dispatcher.sendWithTimeout in goroutine 7
+        created by internal/dispatcher.SendWithTimeout in goroutine 7
             /app/internal/dispatcher/worker.go:54 +0x145
         ]
 FAIL

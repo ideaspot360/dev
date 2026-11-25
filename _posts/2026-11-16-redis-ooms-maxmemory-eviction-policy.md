@@ -279,13 +279,12 @@ Update `/etc/redis/redis.conf` to optimize memory bounds, background lazy freein
 ```diff
 --- /etc/redis/redis.conf.orig	2026-11-16 01:20:00.000000000 +0000
 +++ /etc/redis/redis.conf	2026-11-16 01:25:00.000000000 +0000
-@@ -998,15 +998,28 @@
+@@ -998,12 +998,26 @@
  # Limit Redis logical memory to 6.0 GB on a 16 GB host (37.5% memory budget)
  # This preserves ample headroom for jemalloc slabs, client output buffers, and COW forks.
 -maxmemory 8gb
--maxmemory-policy noeviction
 +maxmemory 6442450944
-+maxmemory-policy volatile-ttl
+ maxmemory-policy volatile-ttl
 +
 +# Increase eviction pool sampling precision from 5 to 10
 +maxmemory-samples 10

@@ -3,6 +3,7 @@ layout: post
 title: "Linux TCP TIME_WAIT Saturation & EADDRNOTAVAIL: Why tcp_tw_recycle Fails and How tcp_tw_reuse Solves Port Exhaustion"
 date: 2026-11-07 07:18:43 +0900
 category: "Systems & Networking"
+categories: ["Systems & Networking"]
 tags: [linux, networking, tcp-ip, troubleshooting, high-throughput, microservices]
 author: "IdeaSpot360 Engineering Notes"
 excerpt: "When high-throughput microservices flood upstream internal APIs, rapid TCP connection turnover triggers catastrophic TIME_WAIT ephemeral port exhaustion with EADDRNOTAVAIL. Here is why the deprecated tcp_tw_recycle breaks behind NAT, why tcp_fin_timeout does not shorten TIME_WAIT, and how net.ipv4.tcp_tw_reuse combined with client-side connection pooling solves port saturation."
@@ -21,14 +22,14 @@ fact_check_sources:
 When high-throughput microservice clusters communicate across internal HTTP/REST or gRPC endpoints, sudden spikes in outbound connection churn can completely paralyze the underlying Linux host [Source: Linux Programmer's Manual — tcp(7) Ephemeral Ports and TIME_WAIT](https://man7.org/linux/man-pages/man7/tcp.7.html). Instead of gracefully queueing requests, application runtimes crash with an immediate OS-level error:
 
 ```text
-dial tcp 10.0.4.15:8080: connect: cannot assign requested address
-    at net.Dialer.DialContext (dial.go:587)
-    at net/http.(*Transport).dial (transport.go:1178)
-    at net/http.(*Transport).dialConn (transport.go:1614)
-    at net/http.(*Transport).roundTrip (transport.go:872)
-    at net/http.(*Client).send (client.go:253)
-    at net/http.(*Client).Do (client.go:616)
-    at main.callDownstreamService (worker.go:142)
+Post "http://10.0.4.15:8080/v1/dispatch": dial tcp 10.0.4.15:8080: connect: cannot assign requested address
+goroutine 412 [running]:
+net.(*Dialer).DialContext(0xc0001a2000, {0x104a8c0, 0xc0002b4000}, {0xe2a110, 0x3}, {0xc0003c0120, 0xf})
+	/usr/local/go/src/net/dial.go:587 +0x4a5
+net/http.(*Transport).dial(0xc0001c8000, {0x104a8c0, 0xc0002b4000}, {0xe2a110, 0x3}, {0xc0003c0120, 0xf})
+	/usr/local/go/src/net/http/transport.go:1178 +0xda
+main.callDownstreamService({0x104a8c0, 0xc0002b4000}, {0xc00039a000, 0x42})
+	/app/cmd/dispatcher/worker.go:142 +0x128
 ```
 
 In Java and Spring Boot runtimes, this manifests as:
@@ -89,13 +90,13 @@ ss -s
 
 ```text
 Total: 31204
-TCP:   29410 (estab 980, closed 28232, orphaned 0, timewait 28232)
+TCP:   29410 (estab 980, closed 198, orphaned 0, timewait 28232)
 
 Transport Total     IP        IPv6
 RAW	      1         1         0
 UDP	      14        10        4
-TCP	      1178      1140      38
-INET	  1193      1151      42
+TCP	      29410     29372     38
+INET	  29425     29383     42
 FRAG	  0         0         0
 ```
 
@@ -210,8 +211,8 @@ Reducing `tcp_fin_timeout` from 60 to 15 seconds will clean up orphaned `FIN_WAI
 When searching historical internet guides, engineers frequently encounter advice to enable the deprecated and removed parameter `net.ipv4.tcp_tw_recycle`:
 
 ```ini
-# DANGEROUS / DEPRECATED: Permanently removed in Linux 4.12+ (Do NOT use)
-net.ipv4.tcp_tw_recycle = 1  # deprecated and removed
+# ANTI-PATTERN / DEPRECATED: Permanently removed in Linux 4.12+ (Do NOT use)
+net.ipv4.tcp_tw_recycle = 1  # deprecated anti-pattern, removed in 4.12
 ```
 
 ### The Architectural Failure Under NAT
@@ -459,16 +460,16 @@ try (CloseableHttpResponse response = httpClient.execute(request)) {
 During sustained 4,200 RPS benchmark load, socket status was monitored via `nstat`:
 
 ```bash
-nstat -z | grep -i tw
+nstat -az TcpExtTW* TcpExtTCPTimeWaitOverflow
 ```
 
 ```text
-TcpTimeWait                      142                 0.0
-TcpTimeWaitOverflow              0                   0.0
-TcpTimeWaitRecycled              384912              0.0
+TcpExtTW                         142                 0.0
+TcpExtTCPTimeWaitOverflow        0                   0.0
+TcpExtTWRecycled                 384912              0.0
 ```
 
-Notice the key counter: `TcpTimeWaitRecycled` incremented dynamically. When an outbound socket needed to open against `10.0.4.15:8080`, the Linux kernel safely reused ports in `TIME_WAIT` without triggering `EADDRNOTAVAIL`.
+Notice the key counter: `TcpExtTWRecycled` incremented dynamically. When an outbound socket needed to open against `10.0.4.15:8080`, the Linux kernel safely reused ports in `TIME_WAIT` without triggering `EADDRNOTAVAIL`.
 
 ### B. Before vs. After Production Benchmark Comparison
 

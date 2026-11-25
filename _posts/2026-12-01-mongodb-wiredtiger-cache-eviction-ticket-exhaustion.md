@@ -3,6 +3,7 @@ layout: post
 title: "Troubleshooting MongoDB WiredTiger Cache Eviction Starvation & Read/Write Ticket Depletion"
 date: 2026-12-01 10:38:19 +0900
 category: "Database & Storage"
+categories: ["Database & Storage"]
 tags: ['MongoDB', 'WiredTiger', 'Database', 'CacheEviction', 'Performance', 'Troubleshooting']
 fact_check_sources:
   - "https://www.mongodb.com/docs/manual/core/wiredtiger-storage-engine/"
@@ -173,7 +174,7 @@ We tuned `eviction_dirty_target` down to 3%, `eviction_dirty_trigger` down to 10
 ```diff
 --- /etc/mongod.conf.orig	2026-11-23 09:12:00.000000000 +0000
 +++ /etc/mongod.conf	2026-11-23 09:45:00.000000000 +0000
-@@ -28,8 +28,15 @@
+@@ -28,7 +28,14 @@
  storage:
    dbPath: /var/lib/mongodb
    journal:
@@ -207,7 +208,7 @@ Linux default `vm.dirty_ratio` (20%) and `vm.dirty_background_ratio` (10%) allow
 ```diff
 --- /etc/sysctl.d/99-mongodb.conf.orig	2026-11-23 09:15:00.000000000 +0000
 +++ /etc/sysctl.d/99-mongodb.conf	2026-11-23 09:48:00.000000000 +0000
-@@ -1,5 +1,8 @@
+@@ -1,4 +1,6 @@
  fs.file-max = 64000
  vm.max_map_count = 262144
 -vm.dirty_ratio = 20
@@ -225,15 +226,12 @@ To prevent thousands of application worker threads from overwhelming the 128 sto
 ```diff
 --- src/main/resources/application.yml.orig	2026-11-23 09:20:00.000000000 +0000
 +++ src/main/resources/application.yml	2026-11-23 09:50:00.000000000 +0000
-@@ -12,7 +12,11 @@
+@@ -12,3 +12,4 @@
    data:
      mongodb:
-       uri: mongodb://cluster-primary:27017,cluster-sec01:27017/orders?replicaSet=rs0
-+      # Constrain client connection pool to prevent ticket acquisition stampedes
-+      max-connection-pool-size: 50
-+      min-connection-pool-size: 10
-+      max-wait-time-ms: 2000
-+      socket-timeout-ms: 5000
+-      uri: mongodb://cluster-primary:27017,cluster-sec01:27017/orders?replicaSet=rs0
++      # Constrain client connection pool via official MongoDB URI parameters
++      uri: mongodb://cluster-primary:27017,cluster-sec01:27017/orders?replicaSet=rs0&maxPoolSize=50&minPoolSize=10&waitQueueTimeoutMS=2000&socketTimeoutMS=5000
 ```
 
 ---

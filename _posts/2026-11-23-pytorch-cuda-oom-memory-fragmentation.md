@@ -3,6 +3,7 @@ layout: post
 title: "Fixing PyTorch CUDA OOM: Allocator Memory Fragmentation & max_split_size_mb Tuning"
 date: 2026-11-23 10:14:00 +0900
 category: "Systems & Networking"
+categories: ["Systems & Networking"]
 tags: ['PyTorch', 'CUDA', 'DeepLearning', 'GPU', 'OutOfMemory', 'Troubleshooting']
 fact_check_sources:
   - "https://pytorch.org/docs/stable/notes/cuda.html#memory-management"
@@ -17,7 +18,7 @@ verification_date: "2026-11-23"
 During the distributed fine-tuning of an 8B-parameter open LLM on an 80GB NVIDIA A100 GPU cluster, the PyTorch worker abruptly crashed with a fatal CUDA Out of Memory (OOM) error during the backward pass:
 
 ```text
-RuntimeError: CUDA out of memory. Tried to allocate 512.00 MiB (GPU 0; 79.15 GiB total capacity; 68.42 GiB already allocated; 486.25 MiB free; 9.74 GiB reserved in total by PyTorch) If reserved memory is >> allocated memory try setting max_split_size_mb to avoid fragmentation. See documentation for Memory Management and PYTORCH_CUDA_ALLOC_CONF
+RuntimeError: CUDA out of memory. Tried to allocate 512.00 MiB (GPU 0; 79.15 GiB total capacity; 68.42 GiB already allocated; 486.25 MiB free; 78.16 GiB reserved in total by PyTorch) If reserved memory is >> allocated memory try setting max_split_size_mb to avoid fragmentation. See documentation for Memory Management and PYTORCH_CUDA_ALLOC_CONF
 Traceback (most recent call last):
   File "/workspace/train.py", line 184, in <module>
     loss.backward()
@@ -25,10 +26,10 @@ Traceback (most recent call last):
     torch.autograd.backward(self, gradient, retain_graph, create_graph, inputs=inputs)
   File "/opt/conda/lib/python3.10/site-packages/torch/autograd/__init__.py", line 267, in backward
     _engine_run_backward(
-torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 512.00 MiB (GPU 0; 79.15 GiB total capacity; 68.42 GiB already allocated; 486.25 MiB free; 9.74 GiB reserved in total by PyTorch)
+torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 512.00 MiB (GPU 0; 79.15 GiB total capacity; 68.42 GiB already allocated; 486.25 MiB free; 78.16 GiB reserved in total by PyTorch)
 ```
 
-The error report displays an apparent paradox: `79.15 GiB total capacity`, `68.42 GiB already allocated`, and `9.74 GiB reserved` by PyTorch's caching allocator. Mathematically, over 10 GiB of GPU physical VRAM remained available (9.74 GiB reserved + 486.25 MiB unreserved), yet an allocation request for just 512.00 MiB failed catastrophically [Source: PyTorch Documentation - CUDA Semantics & Memory Management (https://pytorch.org/docs/stable/notes/cuda.html#memory-management)].
+The error report displays an apparent paradox: `79.15 GiB total capacity`, `68.42 GiB already allocated`, and `78.16 GiB reserved` by PyTorch's caching allocator (leaving `9.74 GiB` of unallocated cached blocks inside the reserved pool). Mathematically, over 10 GiB of GPU physical VRAM remained available (9.74 GiB unallocated cached + 486.25 MiB unreserved), yet an allocation request for just 512.00 MiB failed catastrophically [Source: PyTorch Documentation - CUDA Semantics & Memory Management (https://pytorch.org/docs/stable/notes/cuda.html#memory-management)].
 
 ## Production Specs
 * **PyTorch Version**: 2.3.1+cu121
@@ -97,7 +98,7 @@ A critical architectural pitfall in production PyTorch tuning is attempting to c
 ```diff
 --- deploy/helm/trainer/values.yaml.orig
 +++ deploy/helm/trainer/values.yaml
-@@ -14,6 +14,12 @@
+@@ -14,7 +14,12 @@
      image: pytorch/pytorch:2.3.1-cuda12.1-cudnn8-devel
      env:
        - name: NCCL_DEBUG
@@ -117,7 +118,7 @@ A critical architectural pitfall in production PyTorch tuning is attempting to c
 ```diff
 --- train.py.orig
 +++ train.py
-@@ -1,5 +1,18 @@
+@@ -1,5 +1,12 @@
  import os
  import sys
 +# Configure allocator BEFORE importing torch or initializing CUDA runtime

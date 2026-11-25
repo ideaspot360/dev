@@ -4,6 +4,7 @@ pair_id: pair_20261206
 title: "Kubernetes Node NotReady & PLEG (Pod Lifecycle Event Generator) Is Not Healthy"
 date: 2026-12-06 10:14:48 +0900
 category: "Cloud & DevOps"
+categories: ["Cloud & DevOps"]
 tags: ['Kubernetes', 'Kubelet', 'PLEG', 'Containerd', 'Troubleshooting', 'DevOps']
 fact_check_sources:
   - "https://kubernetes.io/docs/tasks/administer-cluster/evented-pleg/"
@@ -108,7 +109,7 @@ Apply the following kernel and OS boot parameters via GRUB to enforce cgroup v2:
 ```diff
 --- /etc/default/grub.orig
 +++ /etc/default/grub
-@@ -8,4 +8,6 @@
+@@ -8,1 +8,1 @@
 -GRUB_CMDLINE_LINUX="console=tty1 console=ttyS0 nvme_core.io_timeout=4294967295"
 +GRUB_CMDLINE_LINUX="console=tty1 console=ttyS0 nvme_core.io_timeout=4294967295 systemd.unified_cgroup_hierarchy=1 cgroup_no_v1=all"
 ```
@@ -118,14 +119,13 @@ Apply the following kubelet garbage collection tuning and cgroup driver unificat
 ```diff
 --- /var/lib/kubelet/config.yaml.orig
 +++ /var/lib/kubelet/config.yaml
-@@ -24,6 +24,14 @@
+@@ -24,1 +24,7 @@
 +imageGCHighThresholdPercent: 75
 +imageGCLowThresholdPercent: 60
-+maximumDeadContainers: 100
-+maximumDeadContainersPerContainer: 1
-+minimumGCAge: 2m
 +containerLogMaxSize: 50Mi
 +containerLogMaxFiles: 3
++evictionHard:
++  memory.available: "500Mi"
 +cgroupDriver: systemd
 -cgroupDriver: cgroupfs
 ```
@@ -137,7 +137,7 @@ For **containerd v1.7.x** (`version = 2` syntax):
 ```diff
 --- /etc/containerd/config.toml.orig
 +++ /etc/containerd/config.toml
-@@ -18,6 +18,12 @@
+@@ -18,4 +18,8 @@
      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
        runtime_type = "io.containerd.runc.v2"
        [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
@@ -154,10 +154,10 @@ For **containerd v2.0+** (`version = 3` syntax, where the CRI plugin namespace t
 ```diff
 --- /etc/containerd/config.toml.orig
 +++ /etc/containerd/config.toml
-@@ -1,6 +1,6 @@
+@@ -1,7 +1,8 @@
 -version = 2
 +version = 3
-...
+ 
  [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc]
    runtime_type = "io.containerd.runc.v2"
    [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc.options]
@@ -219,6 +219,6 @@ Following the migration to cgroup v2 with `SystemdCgroup = true` and dead contai
 To prevent recurring node degradation in high-density Kubernetes clusters:
 
 1. **Mandatory Cgroup v2 Migration**: Upgrade all Kubernetes AMI baseline images to kernel versions supporting unified cgroup v2. Cgroup v2's unified resource model fundamentally prevents memory controller dentry leakage.
-2. **Aggressive Dead Container Trimming**: Never leave `maximumDeadContainers` unconfigured on nodes running ephemeral batch workloads. Enforce `maximumDeadContainers: 100` and `maximumDeadContainersPerContainer: 1`.
+2. **Proactive Image GC & Eviction Thresholds**: Never leave `imageGCHighThresholdPercent` or `evictionHard` unconfigured on nodes running ephemeral batch workloads. Enforce `imageGCHighThresholdPercent: 75`, `imageGCLowThresholdPercent: 60`, and `evictionHard: { memory.available: "500Mi" }` in `KubeletConfiguration`.
 3. **PLEG Latency Alerting**: Instate Prometheus alerts on `histogram_quantile(0.99, sum(rate(kubelet_pleg_relist_duration_seconds_bucket[5m])) by (le, instance)) > 5.0` to detect CRI degradation hours before the 3-minute hard failure threshold trips.
 4. **Runtime Socket Isolation**: Configure dedicated disk partitions for `/var/lib/containerd` and `/var/log/pods` to prevent container disk saturation from freezing the runtime domain socket.

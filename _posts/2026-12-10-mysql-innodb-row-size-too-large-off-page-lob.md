@@ -3,6 +3,7 @@ layout: post
 title: "Resolving MySQL InnoDB Error 1118: Row Size Too Large (> 8126) and Off-Page Storage Contention"
 date: 2026-12-10 10:39:18 +0900
 category: "Database & Storage"
+categories: ["Database & Storage"]
 tags: ['MySQL', 'InnoDB', 'Database', 'Performance', 'Troubleshooting', 'SQL']
 fact_check_sources:
   - "https://dev.mysql.com/doc/refman/8.0/en/innodb-row-format.html"
@@ -73,12 +74,12 @@ When running non-default page sizes (configured via `innodb_page_size` at instan
 | Configured `innodb_page_size` | Usable Page Payload | Max In-Page Row Size Limit | Clustered Leaf Min Invariant |
 | :--- | :--- | :--- | :--- |
 | **4KB (4,096 bytes)** | ~3,964 bytes | **~1,982 bytes** | Minimum 2 rows/page |
-| **8KB (8,192 bytes)** | ~8,060 bytes | **~3,982 bytes** | Minimum 2 rows/page |
+| **8KB (8,192 bytes)** | ~8,060 bytes | **~4,030 bytes** | Minimum 2 rows/page |
 | **16KB (16,384 bytes, Default)** | ~16,252 bytes | **8,126 bytes** | Minimum 2 rows/page |
-| **32KB (32,768 bytes)** | ~32,636 bytes | **~16,334 bytes** | Minimum 2 rows/page |
-| **64KB (65,536 bytes)** | ~65,404 bytes | **~32,718 bytes** | Minimum 2 rows/page |
+| **32KB (32,768 bytes)** | ~32,636 bytes | **~16,318 bytes** | Minimum 2 rows/page |
+| **64KB (65,536 bytes)** | ~65,404 bytes | **~32,702 bytes** | Minimum 2 rows/page |
 
-*Operational Note*: On clusters tuned with 4KB or 8KB page sizes for SSD flash-block alignment or low-latency point reads, Error 1118 triggers much earlier (at ~1,982 or ~3,982 bytes). Even under `ROW_FORMAT=DYNAMIC`, if the sum of fixed-width columns, null bitmaps, and 20-byte pointers exceeds these reduced limits, transactions fail immediately [Source: MySQL 8.0 Reference Manual: innodb_page_size](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_page_size).
+*Operational Note*: On clusters tuned with 4KB or 8KB page sizes for SSD flash-block alignment or low-latency point reads, Error 1118 triggers much earlier (at ~1,982 or ~4,030 bytes). Even under `ROW_FORMAT=DYNAMIC`, if the sum of fixed-width columns, null bitmaps, and 20-byte pointers exceeds these reduced limits, transactions fail immediately [Source: MySQL 8.0 Reference Manual: innodb_page_size](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_page_size).
 
 ### InnoDB Row Formats Comparison: REDUNDANT vs COMPACT vs DYNAMIC
 
@@ -171,8 +172,8 @@ Alternatively, direct online DDL was executed on staging:
 ```diff
 --- a/deploy/migrations/V14__alter_product_variants_row_format.sql
 +++ b/deploy/migrations/V14__alter_product_variants_row_format.sql
-@@ -1,4 +1,11 @@
---- Legacy schema alter migration
+@@ -1,1 +1,8 @@
+- -- Legacy schema alter migration (Before)
 +-- Step 1: Ensure innodb_strict_mode is enforced to prevent corrupt writes
 +SET SESSION innodb_strict_mode = ON;
 +
@@ -189,7 +190,7 @@ To ensure that all future tables and implicit temporary tables inherit modern de
 ```diff
 --- a/etc/mysql/my.cnf
 +++ b/etc/mysql/my.cnf
-@@ -42,6 +42,9 @@ innodb_buffer_pool_size = 96G
+@@ -42,2 +42,5 @@ innodb_buffer_pool_size = 96G
  innodb_buffer_pool_instances = 16
  innodb_log_file_size = 4G
 +innodb_default_row_format = dynamic
@@ -203,7 +204,7 @@ To prevent off-page LOB pointer bloat and avoid unnecessary pointer lookups duri
 ```diff
 --- a/src/main/resources/schema/tables.sql
 +++ b/src/main/resources/schema/tables.sql
-@@ -18,12 +18,22 @@ CREATE TABLE marketplace.product_variants (
+@@ -18,9 +18,17 @@ CREATE TABLE marketplace.product_variants (
      price DECIMAL(12, 2) NOT NULL,
      sku VARCHAR(64) NOT NULL,
 -    extended_specs TEXT,
@@ -233,10 +234,10 @@ Refactoring the JPA entity to eliminate heavy inline strings and load heavy meta
 ```diff
 --- a/src/main/java/com/marketplace/domain/ProductVariant.java
 +++ b/src/main/java/com/marketplace/domain/ProductVariant.java
-@@ -24,9 +24,11 @@ public class ProductVariant {
+@@ -24,6 +24,5 @@ public class ProductVariant {
      @Column(name = "price", nullable = false)
      private BigDecimal price;
-
+ 
 -    @Lob
 -    @Column(name = "extended_specs")
 -    private String extendedSpecs;
@@ -363,7 +364,7 @@ Production telemetry results over 48 hours:
 ## 5. Production Lessons & Best Practices
 
 1. **Audit for Both COMPACT and REDUNDANT Formats**: Tables migrated from MySQL 5.5/5.6 or legacy dumps may still carry `ROW_FORMAT=COMPACT` or `ROW_FORMAT=REDUNDANT`. Both formats enforce a 768-byte inline prefix for every off-page column. Run `SELECT TABLE_NAME, ROW_FORMAT FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '...'` to verify [Source: MySQL 8.0 Reference Manual: InnoDB Row Formats](https://dev.mysql.com/doc/refman/8.0/en/innodb-row-format.html).
-2. **Account for `innodb_page_size` Scaling**: When instances use 4KB or 8KB page sizes, the maximum in-page row limit drops from 8,126 bytes down to ~1,982 bytes or ~3,982 bytes. Even with `DYNAMIC` row format, schemas with dozens of fixed-width columns (`INT`, `BIGINT`, `CHAR`) can breach this lower ceiling [Source: MySQL 8.0 Reference Manual: innodb_page_size](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_page_size).
+2. **Account for `innodb_page_size` Scaling**: When instances use 4KB or 8KB page sizes, the maximum in-page row limit drops from 8,126 bytes down to ~1,982 bytes or ~4,030 bytes. Even with `DYNAMIC` row format, schemas with dozens of fixed-width columns (`INT`, `BIGINT`, `CHAR`) can breach this lower ceiling [Source: MySQL 8.0 Reference Manual: innodb_page_size](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_page_size).
 3. **Understand the 20-Byte vs 768-Byte Difference**: `DYNAMIC` stores only a 20-byte pointer (SpaceID 4B + PageNo 4B + Offset 4B + Length 8B) inline for off-page columns, whereas `COMPACT` and `REDUNDANT` consume 768 bytes inline per overflow column [Source: MySQL 8.0 Reference Manual: Limits on Table Column Count and Row Size](https://dev.mysql.com/doc/refman/8.0/en/column-count-limit.html).
 4. **Never Disable `innodb_strict_mode`**: Bypassing strict mode does not fix the physical B-tree limitation. It merely delays failure until runtime DML transactions, risking silent index corruption and random query failures [Source: MySQL 8.0 Reference Manual: innodb_strict_mode](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_strict_mode).
 5. **Vertically Partition Bloated Schemas**: Just because a row can technically fit does not mean it should. Keeping clustered index leaf pages slim (under 1KB per row) maximizes buffer pool caching efficiency and minimizes I/O overhead [Source: MySQL 8.0 Reference Manual: InnoDB Limits](https://dev.mysql.com/doc/refman/8.0/en/innodb-limits.html).

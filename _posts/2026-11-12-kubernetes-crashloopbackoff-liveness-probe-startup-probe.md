@@ -3,6 +3,7 @@ layout: post
 title: "Troubleshooting Kubernetes CrashLoopBackOff: Liveness Probe Misconfiguration & Startup Probes"
 date: 2026-11-12 10:46:38 +0900
 category: "Cloud & DevOps"
+categories: ["Cloud & DevOps"]
 tags: [kubernetes, crashloopbackoff, liveness-probe, startup-probe, spring-boot, devops, microservices]
 author: "IdeaSpot360 Engineering Notes"
 excerpt: "When heavy Spring Boot and gRPC microservices enter Kubernetes CrashLoopBackOff during cold starts, aggressive liveness probes repeatedly kill initializing containers. Here is how Kubelet probe workers evaluate health in pkg/kubelet/prober/worker.go, the mathematics of CrashLoopBackOff exponential backoff, native gRPC vs HTTP probe execution in pkg/probe/grpc/grpc.go, why pointing liveness to deep dependencies causes cluster restart storms, and how to configure dedicated startupProbes for zero-downtime rollouts."
@@ -141,14 +142,14 @@ The HTTP connector on port 8080 opens early in this sequence. However, until the
 
 The total time window allocated by Kubernetes before the kubelet kills the initializing container is strictly determined by:
 
-$$T_{\text{liveness\_budget}} = \text{initialDelaySeconds} + (\text{failureThreshold} \times \text{periodSeconds})$$
+$$T_{\text{liveness\_budget}} = \text{initialDelaySeconds} + ((\text{failureThreshold} - 1) \times \text{periodSeconds})$$
 
 Under the initial production configuration:
 * `initialDelaySeconds = 15`
 * `periodSeconds = 10`
 * `failureThreshold = 3`
 
-$$T_{\text{liveness\_budget}} = 15 + (3 \times 10) = 45\text{ seconds}$$
+$$T_{\text{liveness\_budget}} = 15 + ((3 - 1) \times 10) = 35\text{ seconds}$$
 
 Because cold boot requires **52 seconds**, the failure timeline unfolds predictably:
 * **$t = 0\text{s}$**: Container starts, JVM initializes.
@@ -452,7 +453,7 @@ func (w *worker) doProbe(ctx context.Context) bool {
 
 With `startupProbe`:
 * Max startup budget is configured generously: $10\text{s} + (30 \times 5\text{s}) = 160\text{ seconds}$.
-* If the application finishes bootstrapping at second 32, the startup probe succeeds on probe attempt 5 ($10\text{s} + [5 \times 5\text{s}] = 35\text{s}$).
+* If the application finishes bootstrapping at second 32, the startup probe succeeds on probe attempt 6 ($10\text{s} + [(6 - 1) \times 5\text{s}] = 35\text{s}$).
 * The startup worker immediately calls `w.setContainerStarted()` and exits its loop (`return false`).
 * The `livenessProbe` and `readinessProbe` workers activate immediately.
 * **Result**: Zero wasted seconds. The pod enters active service 125 seconds faster than it would with a naive `initialDelaySeconds: 160` configuration.
@@ -471,7 +472,7 @@ kubectl get pods -n production -l app=order-service -w
 kubectl describe pod -n production -l app=order-service | grep -E "(Startup|Liveness|Readiness):|Events:" -A 15
 
 # 3. Query kubelet prober metrics from Prometheus to detect flaky probes
-# Metric: kubelet_container_probe_total{probe_type="Startup", result="successful"}
+# Metric: prober_probe_total{probe_type="Startup", result="successful"}
 kubectl exec -n production deploy/order-service -- curl -s http://localhost:8080/actuator/health/liveness
 kubectl exec -n production deploy/order-service -- curl -s http://localhost:8080/actuator/health/readiness
 
@@ -514,7 +515,7 @@ Zero container kills occurred during the cold-start phase. The pod transitioned 
 3. **Use Readiness Probes for External Dependencies**: If a required database connection pool drops, fail the `readinessProbe` to remove the container from Kubernetes Service endpoints. Keep the container alive so it can reconnect when the database recovers.
 4. **Adhere to gRPC Health Checking Protocol Standards**: When configuring native `grpc` probes, implement `grpc.health.v1.Health`, always specify numeric port values (`port: 9090` instead of named ports), and leverage decoupled service names (`service: "liveness"` vs `service: "readiness"`).
 5. **Configure Graceful Termination**: Ensure `terminationGracePeriodSeconds` (default: 30s) exceeds the application's internal shutdown timeout (e.g., `spring.lifecycle.timeout-per-shutdown-phase: 20s`) to allow in-flight HTTP and RPC requests to drain before the kubelet executes `SIGKILL`.
-6. **Monitor Kubelet Probe Metrics**: Alert on high values of `kubelet_container_probe_failures_total` in Prometheus to catch regressions in JVM initialization time before they breach production thresholds.
+6. **Monitor Kubelet Probe Metrics**: Alert on high values of `prober_probe_total{result="failed"}` in Prometheus to catch regressions in JVM initialization time before they breach production thresholds.
 
 ---
 

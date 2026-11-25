@@ -177,6 +177,10 @@ int tcp_twsk_unique(struct sock *sk, struct sock *sktw, void *twp)
 
     if (tcptw->tw_ts_recent_stamp &&
         (!twp || (reuse && (ktime_get_seconds() - tcptw->tw_ts_recent_stamp > 1)))) {
+        /* Safe atomic refcount acquisition to prevent hashdance race (CVE-2024-36904) */
+        if (unlikely(!refcount_inc_not_zero(&sktw->sk_refcnt)))
+            return 0;
+
         /* Advance sequence number beyond max unscaled window (65535) + 2 */
         u32 seq = tcptw->tw_snd_nxt + 65535 + 2;
 
@@ -185,10 +189,6 @@ int tcp_twsk_unique(struct sock *sk, struct sock *sktw, void *twp)
         WRITE_ONCE(tp->write_seq, seq);
         tp->rx_opt.ts_recent = tcptw->tw_ts_recent;
         tp->rx_opt.ts_recent_stamp = tcptw->tw_ts_recent_stamp;
-
-        /* Safe atomic refcount acquisition to prevent hashdance race (CVE-2024-36904) */
-        if (unlikely(!refcount_inc_not_zero(&sktw->sk_refcnt)))
-            return 0;
         return 1;
     }
     return 0;
@@ -255,7 +255,7 @@ Expand ephemeral port availability, enable global `tcp_tw_reuse = 1`, and ensure
 ```diff
 --- /etc/sysctl.d/99-networking.conf.orig	2026-11-18 01:30:00.000000000 +0900
 +++ /etc/sysctl.d/99-networking.conf	2026-11-18 01:45:00.000000000 +0900
-@@ -12,6 +12,14 @@
+@@ -12,2 +12,12 @@
 -# Default Linux ephemeral port allocation range (28,232 ports)
 -net.ipv4.ip_local_port_range = 32768 60999
 +# Expanded ephemeral port allocation range (55,296 usable source ports)
@@ -285,7 +285,7 @@ The primary architectural fix is eliminating short-lived connection turnover by 
 ```diff
 --- /etc/nginx/conf.d/upstream.conf.orig	2026-11-18 01:30:00.000000000 +0900
 +++ /etc/nginx/conf.d/upstream.conf	2026-11-18 01:45:00.000000000 +0900
-@@ -1,9 +1,14 @@
+@@ -1,12 +1,23 @@
  upstream order_backend {
      server 10.244.3.45:8080 max_fails=3 fail_timeout=10s;
 +
@@ -294,11 +294,11 @@ The primary architectural fix is eliminating short-lived connection turnover by 
 +    keepalive_requests 20000;
 +    keepalive_timeout 65s;
  }
-
+ 
  server {
      listen 80;
      server_name api.internal.svc;
-
+ 
      location / {
          proxy_pass http://order_backend;
 +
@@ -318,7 +318,7 @@ For microservices communicating over HTTP, Go's default `http.Transport` caps id
 ```diff
 --- client/transport.go.orig	2026-11-18 01:30:00.000000000 +0900
 +++ client/transport.go	2026-11-18 01:45:00.000000000 +0900
-@@ -10,8 +10,14 @@
+@@ -10,9 +10,16 @@
  func NewBackendHTTPClient() *http.Client {
  	return &http.Client{
  		Transport: &http.Transport{
@@ -358,7 +358,7 @@ For Envoy mesh sidecars, configure idle connection timeouts and maximum requests
 ```diff
 --- envoy-cluster.yaml.orig	2026-11-18 01:30:00.000000000 +0900
 +++ envoy-cluster.yaml	2026-11-18 01:45:00.000000000 +0900
-@@ -10,6 +10,14 @@
+@@ -10,6 +10,10 @@
      dns_lookup_family: V4_ONLY
      lb_policy: ROUND_ROBIN
      typed_extension_protocol_options:
@@ -387,7 +387,7 @@ ss -s
 
 ```text
 Total: 3120
-TCP:   1420 (estab 890, closed 210, orphaned 0, timewait 118)
+TCP:   1210 (estab 890, closed 202, orphaned 0, timewait 118)
 
 Transport Total     IP        IPv6
 RAW	      1         1         0
@@ -429,9 +429,9 @@ TcpExtTCPTimeWaitOverflow           0                  0.0
 Verify that sequential HTTP requests to the upstream backend reuse the identical underlying TCP connection:
 
 ```bash
-curl -Iv --http1.1 http://10.244.3.45:8080/v1/orders/validate \
+curl -v -X POST --http1.1 http://10.244.3.45:8080/v1/orders/validate \
   -H "Connection: keep-alive" \
-  --next http://10.244.3.45:8080/v1/orders/validate
+  --next -X POST http://10.244.3.45:8080/v1/orders/validate
 ```
 
 ```text

@@ -3,6 +3,7 @@ layout: post
 title: "Fixing Redis OOM: 'command not allowed when used memory > maxmemory' - Eviction Policies and jemalloc Fragmentation"
 date: 2026-11-04 11:27:43 +0900
 category: "Database & Storage"
+categories: ["Database & Storage"]
 tags: [redis, caching, backend, devops, database, troubleshooting]
 author: "IdeaSpot360 Engineering Notes"
 excerpt: "When Redis throws 'OOM command not allowed', increasing instance RAM often triggers catastrophic latency spikes during BGSAVE. Here is how jemalloc memory fragmentation, client output buffers, and maxmemory-policy actually interact under heavy write load."
@@ -83,7 +84,7 @@ In an environment where total system RAM is 32 GiB, this naive modification trig
 1. **Copy-on-Write (COW) Amplification during BGSAVE:**  
    Redis creates snapshot backups (`dump.rdb`) and compacts Append-Only Files (`BGREWRITEAOF`) by executing a `fork()` system call [Source: Linux Kernel Documentation - VM Sysctl](https://docs.kernel.org/admin-guide/sysctl/vm.html). Under Linux Copy-on-Write semantics, the parent and child processes share the same physical pages until a write occurs. When Redis was allocated 26 GiB of `maxmemory` on a 32 GiB host under heavy write traffic (18,000 ops/sec), page duplication forced total host memory consumption past 32 GiB.
 2. **Transparent Huge Pages (THP) Memory Multiplication:**  
-   Because the host kernel had Transparent Huge Pages enabled (`/sys/kernel/mm/transparent_hugepage/enabled = always`), modifying a single 64-byte Redis key forced the Linux kernel to copy an entire **2 MiB huge page** rather than a standard 4 KiB page [Source: Linux Kernel Documentation - Transparent Hugepage Support](https://docs.kernel.org/admin-guide/mm/transhuge.html). This amplified memory consumption by a factor of 500, exhausting all physical memory and swap.
+   Because the host kernel had Transparent Huge Pages enabled (`/sys/kernel/mm/transparent_hugepage/enabled = always`), modifying a single 64-byte Redis key forced the Linux kernel to copy an entire **2 MiB huge page** rather than a standard 4 KiB page [Source: Linux Kernel Documentation - Transparent Hugepage Support](https://docs.kernel.org/admin-guide/mm/transhuge.html). This amplified memory consumption by a factor of 512, exhausting all physical memory and swap.
 3. **Kernel Out-of-Memory Killer Invocation:**  
    With `vm.overcommit_memory = 1` active and memory exhausted, the Linux kernel Out-of-Memory killer (`mm/oom_kill.c`) selected the Redis primary process due to its disproportionate badness score and dispatched `SIGKILL`:
 
@@ -409,7 +410,9 @@ Biggest string found 'session:token:941205' has 14290 bytes
 Biggest list found 'audit:events:queue' has 25410 items
 Biggest hash found 'cart:snapshot:41201' has 512 fields
 
-2451920 strings with 161029410 bytes (100.00% of keys, avg size 65.67)
+2451420 strings with 161029410 bytes (99.98% of keys, avg size 65.69)
+380 lists with 1842100 bytes (0.02% of keys)
+120 hashes with 412000 bytes (<0.01% of keys)
 ```
 
 Maintaining explicit `maxmemory` boundaries with ~31% system headroom ($22\text{ GiB}$ on a $32\text{ GiB}$ host), enforcing atomic key expirations, and enabling active `jemalloc` defragmentation guarantees that Redis operates with high throughput and predictable memory stability.

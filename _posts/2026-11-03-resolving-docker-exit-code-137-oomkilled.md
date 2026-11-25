@@ -3,6 +3,7 @@ layout: post
 title: "Resolving Docker & Kubernetes Exit Code 137 (OOMKilled): Root Cause & JVM Memory Tuning"
 date: 2026-11-03 10:28:43 +0900
 category: "Cloud & DevOps"
+categories: ["Cloud & DevOps"]
 tags: [docker, kubernetes, java, devops, troubleshooting]
 author: "IdeaSpot360 Engineering Notes"
 excerpt: "When your production container abruptly terminates with exit code 137, increasing -Xmx usually makes it crash faster. Here is how Linux cgroups v2, off-heap buffers, and container memory limits actually interact."

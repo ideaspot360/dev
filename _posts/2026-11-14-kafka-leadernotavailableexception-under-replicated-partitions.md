@@ -91,7 +91,7 @@ Consumers can only read records up to the $HW$. When a producer sends a batch wi
 [Partition Leader (Broker 1)]
 Log: [Msg 100] [Msg 101] [Msg 102] [Msg 103 (uncommitted)]
       ^                             ^
-      HW = 102                      LEO = 104
+      HW = 103                      LEO = 104
 
 [Follower Replica (Broker 2 - ISR Member)]
 Log: [Msg 100] [Msg 101] [Msg 102]

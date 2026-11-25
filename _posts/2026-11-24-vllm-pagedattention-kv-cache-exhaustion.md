@@ -3,6 +3,7 @@ layout: post
 title: "Troubleshooting vLLM PagedAttention KV Cache Exhaustion & GPU OOM Under High Concurrency"
 date: 2026-11-24 11:27:38 +0900
 category: "Systems & Networking"
+categories: ["Systems & Networking"]
 tags: ['vLLM', 'LLM', 'PagedAttention', 'KVCache', 'Inference', 'Production', 'Kubernetes', 'H100']
 fact_check_sources:
   - "https://docs.vllm.ai/en/latest/models/engine_args.html"
@@ -50,21 +51,21 @@ For an 8,192-token sequence, each request demands $80\text{ KiB} \times 8,192 = 
 
 PagedAttention divides the KV cache into fixed-size physical blocks (`block_size`, default 16 tokens). Each 16-token block consumes $16 \times 80\text{ KiB} = 1.25\text{ MiB}$ per GPU [Source: PagedAttention Paper (SOSP 2023) - Kwon et al. (https://arxiv.org/abs/2309.06180)].
 
-By default, vLLM sizes its PagedAttention KV cache pool using `--gpu-memory-utilization` (default 0.90) [Source: vLLM Engine Arguments Documentation (https://docs.vllm.ai/en/latest/models/engine_args.html)]. When configured with `0.95`, vLLM reserves 95% of available VRAM ($80\text{ GB} \times 0.95 = 76.0\text{ GB}$) strictly for static KV blocks and model weights.
+By default, vLLM sizes its PagedAttention KV cache pool using `--gpu-memory-utilization` (default 0.90) [Source: vLLM Engine Arguments Documentation (https://docs.vllm.ai/en/latest/models/engine_args.html)]. When configured with `0.95`, vLLM reserves 95% of usable VRAM ($79.15\text{ GiB} \times 0.95 = 75.19\text{ GiB}$) strictly for static KV blocks and model weights.
 
-On an 80GB GPU holding 35GB of model weights, setting `--gpu-memory-utilization 0.95` allocates:
+On an H100 GPU (79.15 GiB usable) holding 32.60 GiB (35.00 GB) of model weights, setting `--gpu-memory-utilization 0.95` allocates:
 
 ```text
-[ Physical GPU VRAM: 80.00 GB Total (H100 SXM5, ~79.65 GiB Frame Buffer) ]
-├─ Model Weights (Llama-3-70B FP16, TP=4)                 : 35.00 GB (~32.60 GiB)
-├─ PagedAttention KV Cache Pool (33,600 Blocks @ 1.25MB)  : 41.00 GB (~41.01 GiB)
-├─ Total Reserved by vLLM (gpu_memory_utilization = 0.95) : 76.00 GB (~73.61 GiB)
-└─ Unreserved Headroom for Dynamic Prefill Activations    :  4.00 GB (Critical Bottleneck)
+[ Physical GPU VRAM: 79.15 GiB Usable Frame Buffer (NVIDIA H100 80GB SXM5) ]
+├─ Model Weights (Llama-3-70B FP16, TP=4)                 : 32.60 GiB (35.00 GB)
+├─ PagedAttention KV Cache Pool (~34,889 Blocks @ 1.25MiB): 42.59 GiB (45.73 GB)
+├─ Total Reserved by vLLM (gpu_memory_utilization = 0.95) : 75.19 GiB (80.73 GB)
+└─ Unreserved Headroom for Dynamic Prefill Activations    :  3.96 GiB (Critical Bottleneck)
 ```
 
-This static allocation leaves only **4.00 GB of unreserved VRAM per GPU**. 
+This static allocation leaves only **3.96 GiB (~4.25 GB) of unreserved VRAM per GPU**. 
 
-When a concurrent surge of requests arrives requiring long-prompt Prefill steps, PyTorch's intermediate matrix multiplication activations temporarily surge past 4 GB. Without chunked prefill enabled, vLLM attempts to execute the entire prompt in a single forward pass, requiring massive activation memory. The CUDA Caching Allocator fails to claim contiguous unreserved VRAM from the driver, raising an uncatchable CUDA OOM that causes the Ray and vLLM worker processes to be terminated with SIGKILL (Exit Code 137).
+When a concurrent surge of requests arrives requiring long-prompt Prefill steps, PyTorch's intermediate matrix multiplication activations temporarily surge past 3.96 GiB. Without chunked prefill enabled, vLLM attempts to execute the entire prompt in a single forward pass, requiring massive activation memory. The CUDA Caching Allocator fails to claim contiguous unreserved VRAM from the driver, raising an uncatchable CUDA OOM that causes the Ray and vLLM worker processes to be terminated with SIGKILL (Exit Code 137).
 
 ---
 
@@ -97,7 +98,7 @@ The sustainable solution balances VRAM reservation between static KV cache and d
 ```diff
 --- deploy/helm/vllm-llama3-70b/values.yaml.orig
 +++ deploy/helm/vllm-llama3-70b/values.yaml
-@@ -16,11 +16,22 @@
+@@ -16,10 +16,22 @@
    args:
      - "--model=meta-llama/Meta-Llama-3-70B-Instruct"
      - "--tensor-parallel-size=4"

@@ -3,6 +3,7 @@ layout: post
 title: "Mitigating Istio Envoy 503 UC Connection Termination & Circuit Breaker Pending Request Overflow"
 date: 2026-12-03 11:06:28 +0900
 category: "Cloud & DevOps"
+categories: ["Cloud & DevOps"]
 tags: ['Kubernetes', 'Istio', 'Envoy', 'ServiceMesh', 'CircuitBreaker', 'Troubleshooting']
 fact_check_sources:
   - "https://istio.io/latest/docs/reference/config/networking/destination-rule/"
@@ -187,7 +188,7 @@ Apply the following production patch:
 ```diff
 --- istio/destinationrule-order-service.yaml.orig
 +++ istio/destinationrule-order-service.yaml
-@@ -1,14 +1,31 @@
+@@ -1,14 +1,29 @@
  apiVersion: networking.istio.io/v1
  kind: DestinationRule
  metadata:

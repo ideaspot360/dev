@@ -3,6 +3,7 @@ layout: post
 title: "Fixing Elasticsearch CircuitBreakingException: Data Too Large & Fielddata Cache OOM"
 date: 2026-11-13 10:29:47 +0900
 category: "Database & Storage"
+categories: ["Database & Storage"]
 tags: [elasticsearch, circuitbreaker, jvm-heap, fielddata, doc-values, fulltextsearch, bigdata]
 author: "IdeaSpot360 Engineering Notes"
 excerpt: "When high-cardinality aggregations or wildcard queries hit Elasticsearch indices, nodes reject incoming requests with CircuitBreakingException ([parent] Data too large) and HTTP 429 status codes. Here is an architectural deep dive into why sorting or aggregating on unindexed text fields forces in-memory Fielddata allocation, how Lucene doc_values eliminate heap bloat via OS page cache, why raising breaker limits leads to fatal OutOfMemoryError crashes, and production runbooks for indices.breaker tuning and schema migrations."

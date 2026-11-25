@@ -3,6 +3,7 @@ layout: post
 title: "Resolving Linux & Kubernetes Conntrack Table Saturation: nf_conntrack: table full, dropping packet and Hash Bucket Sizing"
 date: 2026-12-12 11:34:58 +0900
 category: "Systems & Networking"
+categories: ["Systems & Networking"]
 tags: [Linux, Kubernetes, Networking, DevOps, Sysctl, Conntrack, Performance, Netfilter]
 pair_id: pair_20261212
 fact_check_sources:
@@ -177,7 +178,7 @@ Apply the following modifications to `/etc/sysctl.d/99-conntrack.conf`:
 ```diff
 --- /etc/sysctl.d/99-conntrack.conf.orig
 +++ /etc/sysctl.d/99-conntrack.conf
-@@ -1,7 +1,24 @@
+@@ -1,5 +1,19 @@
 -# Default conservative Linux distribution settings
 -net.netfilter.nf_conntrack_max = 262144
 -net.netfilter.nf_conntrack_tcp_timeout_established = 432000
@@ -211,7 +212,7 @@ Because `nf_conntrack_buckets` cannot be altered through sysctl on all kernel ve
 ```diff
 --- /etc/modprobe.d/nf_conntrack.conf.orig
 +++ /etc/modprobe.d/nf_conntrack.conf
-@@ -1 +1,2 @@
+@@ -1,1 +1,1 @@
 -# Set initial hash bucket size during module initialization
 +options nf_conntrack hashsize=262144
 ```
@@ -230,7 +231,7 @@ Ensure `kube-proxy` does not overwrite kernel parameters with lower values by co
 ```diff
 --- kube-proxy-config.yaml.orig
 +++ kube-proxy-config.yaml
-@@ -14,5 +14,7 @@
+@@ -14,5 +14,8 @@
  iptables:
    masqueradeAll: false
    syncPeriod: 30s
@@ -250,7 +251,7 @@ To safely exempt high-frequency, non-NAT local traffic (such as Prometheus node-
 ```diff
 --- daemonset-conntrack-bypass.yaml.orig
 +++ daemonset-conntrack-bypass.yaml
-@@ -20,6 +20,20 @@
+@@ -20,9 +20,20 @@
        initContainers:
          - name: raw-table-notrack-tuning
            image: alpine:3.19

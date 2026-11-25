@@ -3,6 +3,7 @@ layout: post
 title: "Fixing Kubernetes Pod Evictions and CrashLoopBackOff: Ephemeral Storage Limits & EmptyDir Sizing"
 date: 2026-11-03 10:24:43 +0900
 category: "Cloud & DevOps"
+categories: ["Cloud & DevOps"]
 tags: [kubernetes, devops, docker, containers, troubleshooting]
 author: "IdeaSpot360 Engineering Notes"
 excerpt: "When your Kubernetes pods suddenly enter an Evicted or CrashLoopBackOff state due to 'ephemeral-storage exceeded', increasing CPU or RAM limits will not prevent node drain. Here is how k8s local storage accounting actually works."
@@ -105,7 +106,7 @@ To protect the container filesystem from unconstrained writes, explicitly route 
 ```diff
 --- deploy/kubernetes/billing-worker.yaml.orig
 +++ deploy/kubernetes/billing-worker.yaml
-@@ -14,6 +14,15 @@
+@@ -14,7 +14,20 @@
            resources:
              requests:
                cpu: "1000m"

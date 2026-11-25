@@ -3,6 +3,7 @@ layout: post
 title: "Resolving Linux TCP Listen Backlog Drops: net.core.somaxconn & tcp_max_syn_backlog Saturation Under High Connection Bursts"
 date: 2026-12-11 10:15:24 +0900
 category: "Systems & Networking"
+categories: ["Systems & Networking"]
 tags: [Linux, Networking, TCP, DevOps, Kubernetes, Sysctl, Performance]
 pair_id: pair_20261211
 fact_check_sources:
@@ -209,7 +210,7 @@ We tuned host networking limits to accommodate burst depths up to 65,535 connect
 ```diff
 --- a/etc/sysctl.d/99-network-tuning.conf
 +++ b/etc/sysctl.d/99-network-tuning.conf
-@@ -1,8 +1,20 @@
+@@ -1,5 +1,18 @@
 -# Legacy Default Networking Configuration
 -net.core.somaxconn = 4096
 -net.ipv4.tcp_max_syn_backlog = 1024
@@ -241,7 +242,7 @@ We updated Nginx listen directives to explicitly set the socket backlog to match
 ```diff
 --- a/k8s/ingress/nginx-configmap.yaml
 +++ b/k8s/ingress/nginx-configmap.yaml
-@@ -10,6 +10,12 @@ data:
+@@ -10,3 +10,9 @@ data:
    worker-processes: "auto"
    worker-connections: "65535"
    worker-rlimit-nofile: "131072"
@@ -259,7 +260,7 @@ We increased the application-level listen backlog in Spring Boot to ensure that 
 ```diff
 --- a/src/main/resources/application.yml
 +++ b/src/main/resources/application.yml
-@@ -14,6 +14,11 @@ server:
+@@ -14,6 +14,8 @@ server:
    port: 8080
    tomcat:
      threads:
@@ -277,7 +278,7 @@ For microservices running directly under systemd socket activation, the socket u
 ```diff
 --- a/etc/systemd/system/microservice.socket
 +++ b/etc/systemd/system/microservice.socket
-@@ -5,4 +5,7 @@ Description=High-Performance Microservice Socket
+@@ -5,6 +5,7 @@ Description=High-Performance Microservice Socket
  [Socket]
  ListenStream=8080
 -Backlog=128

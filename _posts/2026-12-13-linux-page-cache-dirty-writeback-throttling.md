@@ -3,6 +3,7 @@ layout: post
 title: "Resolving Linux Page Cache Dirty Memory Writeback Throttling: High I/O Wait, D-State Thread Freezes, and vm.dirty_ratio Sizing"
 date: 2026-12-13 10:18:25 +0900
 category: "Systems & Networking"
+categories: ["Systems & Networking"]
 tags: [Linux, Kernel, Performance, Storage, DevOps, Sysctl, Architecture, HighConcurrency]
 pair_id: pair_20261213
 fact_check_sources:
@@ -88,7 +89,7 @@ The initial incorrect diagnosis assumed that the system ran out of dirty page wr
 ```diff
 --- /etc/sysctl.conf.orig
 +++ /etc/sysctl.conf
-@@ -62,2 +62,3 @@
+@@ -62,2 +62,2 @@
  # Naive attempt: Increasing dirty ratio from 20% to 40%
 -vm.dirty_ratio = 20
 +vm.dirty_ratio = 40
@@ -208,7 +209,7 @@ We created a dedicated system configuration file `/etc/sysctl.d/99-dirty-writeba
 ```diff
 --- /etc/sysctl.d/99-dirty-writeback.conf.orig
 +++ /etc/sysctl.d/99-dirty-writeback.conf
-@@ -1,8 +1,14 @@
+@@ -1,5 +1,7 @@
 -# Default Linux kernel page cache ratio configuration
 -vm.dirty_background_ratio = 10
 -vm.dirty_ratio = 20

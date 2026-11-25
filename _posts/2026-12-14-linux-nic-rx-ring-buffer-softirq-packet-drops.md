@@ -3,6 +3,7 @@ layout: post
 title: "Resolving Linux NIC RX Ring Buffer Drops & SoftIRQ Saturation: High PPS Packet Loss, ksoftirqd 100% CPU, and RPS/RFS Multi-Queue Sizing"
 date: 2026-12-14 10:34:09 +0900
 category: "Systems & Networking"
+categories: ["Systems & Networking"]
 tags: [Linux, Networking, Kernel, Performance, DevOps, Sysctl, Ethtool, HighConcurrency]
 pair_id: pair_20261214
 fact_check_sources:
@@ -279,7 +280,7 @@ We tune the kernel network subsystem sysctl parameters to give `net_rx_action()`
 ```diff
 --- /etc/sysctl.d/99-network-ringbuffer.conf.orig	2026-12-14 04:00:00.000000000 +0900
 +++ /etc/sysctl.d/99-network-ringbuffer.conf	2026-12-14 04:30:00.000000000 +0900
-@@ -1,5 +1,11 @@
+@@ -1,5 +1,9 @@
 -# Default Linux networking settings
 -net.core.netdev_budget = 300
 -net.core.netdev_budget_usecs = 2000
@@ -458,7 +459,6 @@ groups:
     rules:
       - alert: NodeSoftnetPacketDropped
         expr: sum(rate(node_softnet_dropped_total[2m])) by (instance) > 0
-          or sum(rate(node_netstat_softnet_dropped[2m])) by (instance) > 0
         for: 1m
         labels:
           severity: critical
@@ -468,8 +468,6 @@ groups:
 
       - alert: NodeSoftnetTimeSqueezeHigh
         expr: sum(rate(node_softnet_times_squeezed_total[2m])) by (instance) > 50
-          or sum(rate(node_softnet_timesqueeze_total[2m])) by (instance) > 50
-          or sum(rate(node_netstat_softnet_timesqueeze[2m])) by (instance) > 50
         for: 2m
         labels:
           severity: warning
@@ -478,7 +476,7 @@ groups:
           description: "net_rx_action is repeatedly running out of netdev_budget or netdev_budget_usecs."
 
       - alert: NodeSoftirqCpuSaturation
-        expr: rate(node_cpu_seconds_total{mode="softirq"}[2m]) * 100 > 70
+        expr: avg by (instance, cpu) (rate(node_cpu_seconds_total{mode="softirq"}[2m])) * 100 > 70
         for: 2m
         labels:
           severity: critical

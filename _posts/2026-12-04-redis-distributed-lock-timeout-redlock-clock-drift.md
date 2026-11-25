@@ -3,6 +3,7 @@ layout: post
 title: "Redis Distributed Lock Timeout & Redlock Clock Drift Pitfalls in Distributed Systems"
 date: 2026-12-04 10:18:37 +0900
 category: "Database & Storage"
+categories: ["Database & Storage"]
 tags: ['Redis', 'DistributedSystems', 'Redlock', 'Concurrency', 'Troubleshooting', 'Redisson']
 fact_check_sources:
   - "https://redis.io/docs/latest/develop/use/patterns/distributed-locks/"
@@ -81,7 +82,7 @@ Client 1 (Worker Pod A)          Redis Ensemble (5 Nodes)          Client 2 (Wor
        │                                     │                                     │
        ├─── 1. Acquire Lock (TTL: 10s) ─────►│                                     │
        │    Consensus achieved (3/5 nodes)   │                                     │
-       │    Validity: 9,780ms                │                                     │
+       │    Validity: 9,956ms                │                                     │
        │                                     │                                     │
        │ ── [Long GC Pause / DB IO Stall] ── │                                     │
        │    JVM thread paused for 7.84s      │                                     │
@@ -113,7 +114,7 @@ The lock is considered valid if and only if:
    where clock drift is modeled as:
    $$\text{drift} = (\text{TTL} \times 0.002) + 2\,\text{ms}$$
 
-In our deployment, the application configured an explicit TTL of 10,000 ms (`leaseTime = 10000`). While acquisition latency $T_{\text{acquire}}$ averaged 22 ms (yielding an initial $T_{\text{valid}} \approx 9,758\,\text{ms}$), our architecture failed to account for execution anomalies exceeding this validity boundary.
+In our deployment, the application configured an explicit TTL of 10,000 ms (`leaseTime = 10000`). While acquisition latency $T_{\text{acquire}}$ averaged 22 ms (with drift $= (10000 \times 0.002) + 2 = 22\,\text{ms}$, yielding an initial $T_{\text{valid}} = 10000 - 22 - 22 = 9,956\,\text{ms}$), our architecture failed to account for execution anomalies exceeding this validity boundary.
 
 ### 3.2 Asynchronous Process Pauses (JVM Stop-the-World GC & I/O Stalls)
 
@@ -182,7 +183,7 @@ Apply the following patch to the settlement locking service to transition from n
 ```diff
 --- service/SettlementLockManager.java.orig
 +++ service/SettlementLockManager.java
-@@ -15,25 +15,52 @@
+@@ -15,22 +15,40 @@
  @Service
  @Slf4j
  public class SettlementLockManager {
@@ -249,7 +250,7 @@ Update the database schema and MyBatis mapper to validate the monotonic fencing 
 ```diff
 --- repository/MerchantLedgerRepository.xml.orig
 +++ repository/MerchantLedgerRepository.xml
-@@ -4,8 +4,11 @@
+@@ -4,6 +4,9 @@
      <update id="applySettlement">
          UPDATE merchant_ledger
          SET balance = balance + #{amount},
@@ -268,7 +269,7 @@ Update `/etc/chrony/chrony.conf` across all 5 Redis hosts and Kubernetes worker 
 ```diff
 --- /etc/chrony/chrony.conf.orig
 +++ /etc/chrony/chrony.conf
-@@ -10,8 +10,12 @@
+@@ -10,7 +10,12 @@
  # Amazon Time Sync Service link-local IP
  server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4
  

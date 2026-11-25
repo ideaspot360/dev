@@ -4,6 +4,7 @@ pair_id: pair_20261207
 title: "Spring Security & OAuth 2.0 PKCE Authorization Code Verification Failure"
 date: 2026-12-07 10:35:22 +0900
 category: "Systems & Networking"
+categories: ["Systems & Networking"]
 tags: ['SpringSecurity', 'OAuth2', 'PKCE', 'Keycloak', 'Troubleshooting', 'Security']
 fact_check_sources:
   - "https://datatracker.ietf.org/doc/html/rfc7636"
@@ -121,7 +122,7 @@ Apply the following production patch to configure `HttpCookieOAuth2Authorization
 ```diff
 --- config/SecurityConfig.java.orig
 +++ config/SecurityConfig.java
-@@ -15,18 +15,36 @@
+@@ -15,18 +15,29 @@
 +import org.springframework.session.data.redis.config.annotation.web.http.EnableRedisHttpSession;
  
  @Configuration
@@ -184,7 +185,9 @@ public class HttpCookieOAuth2AuthorizationRequestRepository
     @Override
     public OAuth2AuthorizationRequest removeAuthorizationRequest(HttpServletRequest request, 
             HttpServletResponse response) {
-        return this.loadAuthorizationRequest(request);
+        OAuth2AuthorizationRequest authRequest = this.loadAuthorizationRequest(request);
+        CookieUtils.deleteCookie(request, response, OAUTH2_AUTHORIZATION_REQUEST_COOKIE_NAME);
+        return authRequest;
     }
 }
 ```
@@ -194,7 +197,7 @@ Apply the following patch to the client-side cryptographic PKCE utility:
 ```diff
 --- utils/PkceUtil.java.orig
 +++ utils/PkceUtil.java
-@@ -12,12 +16,21 @@
+@@ -12,7 +16,11 @@
      public static String generateCodeChallenge(String codeVerifier) throws NoSuchAlgorithmException {
          byte[] bytes = codeVerifier.getBytes(StandardCharsets.US_ASCII);
          MessageDigest messageDigest = MessageDigest.getInstance("SHA-256");
@@ -215,9 +218,8 @@ Update Redis Session configuration in `application.yml`:
 ```diff
 --- src/main/resources/application.yml.orig
 +++ src/main/resources/application.yml
-@@ -8,6 +8,14 @@
+@@ -8,0 +8,5 @@
 +  session:
-+    store-type: redis
 +    redis:
 +      namespace: spring:session:oauth2
 +      flush-mode: immediate

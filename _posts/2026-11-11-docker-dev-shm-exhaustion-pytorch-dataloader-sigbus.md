@@ -3,6 +3,7 @@ layout: post
 title: "Fixing Docker /dev/shm Exhaustion: Python PyTorch DataLoader Bus Error (SIGBUS)"
 date: 2026-11-11 11:18:37 +0900
 category: "Cloud & DevOps"
+categories: ["Cloud & DevOps"]
 tags: [docker, pytorch, shared-memory, devops, kubernetes, linux, deep-learning, dataloader]
 author: "IdeaSpot360 Engineering Notes"
 excerpt: "When multi-process PyTorch DataLoader workers (num_workers > 0) crash with RuntimeError: DataLoader worker is killed by signal: Bus error, the culprit is Docker's default 64MB /dev/shm tmpfs limit. Here is why the Linux kernel raises SIGBUS on shmem_fault page allocation failures, how zero-copy tensor IPC exhausts POSIX shared memory, and how to configure --shm-size and Kubernetes emptyDir memory volumes for zero-overhead deep learning pipelines."

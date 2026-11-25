@@ -4,6 +4,7 @@ pair_id: pair_20261205
 title: "PostgreSQL Transaction ID Wraparound & Autovacuum Freezing Failure"
 date: 2026-12-05 10:27:14 +0900
 category: "Database & Storage"
+categories: ["Database & Storage"]
 tags: ['PostgreSQL', 'Autovacuum', 'DatabaseInternals', 'Performance', 'Troubleshooting', 'DBA']
 fact_check_sources:
   - "https://www.postgresql.org/docs/16/routine-vacuuming.html#VACUUM-FOR-WRAPAROUND"
@@ -39,15 +40,15 @@ Under a sustained ingestion load of 8,500 write TPS distributed across 32 applic
 Prometheus metrics scraped from `postgres_exporter` and local host socket diagnostics documented the instantaneous drop in write commits and the surge in client connection errors:
 
 ```text
-# HELP postgres_xid_age Age of the oldest transaction ID across all databases
-# TYPE postgres_xid_age gauge
-postgres_xid_age{datname="prod_financial_db"} 2144483648
-# HELP postgres_deadlocks_total Total number of detected transaction deadlocks
-# TYPE postgres_deadlocks_total counter
-postgres_deadlocks_total{datname="prod_financial_db"} 0
-# HELP postgres_connections_active Current active backend connections
-# TYPE postgres_connections_active gauge
-postgres_connections_active{datname="prod_financial_db"} 800
+# HELP pg_stat_database_xid_age Age of the oldest transaction ID across all databases (custom collector)
+# TYPE pg_stat_database_xid_age gauge
+pg_stat_database_xid_age{datname="prod_financial_db"} 2144483648
+# HELP pg_stat_database_deadlocks Total number of detected transaction deadlocks
+# TYPE pg_stat_database_deadlocks counter
+pg_stat_database_deadlocks{datname="prod_financial_db"} 0
+# HELP pg_stat_database_numbackends Current active backend connections
+# TYPE pg_stat_database_numbackends gauge
+pg_stat_database_numbackends{datname="prod_financial_db"} 800
 # ERROR: database is not accepting commands to avoid wraparound data loss in database "prod_financial_db"
 # Critical alert threshold breached: age(datfrozenxid) >= 2144483647
 ```
@@ -119,7 +120,7 @@ Introduced in PostgreSQL 14, `vacuum_failsafe_age` (default: 1,600,000,000 trans
 
 ### 4. Emergency Stop Thresholds and The Root Cause Blockades
 PostgreSQL enforces hard safety ceilings in `src/backend/access/transam/varsup.c`:
-* **Warning Limit (`xid_warn_limit`)**: When `2147483647 - age(datfrozenxid) <= 10,000,000`, PostgreSQL logs `WARNING: database must be vacuumed within ... transactions`.
+* **Warning Limit (`xid_warn_limit`)**: When `2147483647 - age(datfrozenxid) <= 40,000,000`, PostgreSQL logs `WARNING: database must be vacuumed within ... transactions`.
 * **Shutdown Limit (`xid_stop_limit`)**: When `2147483647 - age(datfrozenxid) <= 3,000,000`, the postmaster rejects all new write transactions with `ERROR: database is not accepting commands to avoid wraparound data loss`.
 
 In our incident, autovacuum attempted to run anti-wraparound freezing, but the freeze horizon was pinned by three compounding root cause blockades:
@@ -160,7 +161,7 @@ Apply the following unified diff to `postgresql.conf` (or custom parameter group
 ```diff
 --- postgresql.conf.orig
 +++ postgresql.conf
-@@ -140,15 +140,28 @@
+@@ -140,10 +140,16 @@
  # Autovacuum Worker and Cost Throttling Tuning
  autovacuum = on
 -autovacuum_max_workers = 3
@@ -210,7 +211,7 @@ vmstat 1 5
 ss -tan '( sport = :5432 or dport = :5432 )'
 
 # 2. Check Prometheus exporter health and current replication metrics
-curl -s http://localhost:9187/metrics | grep -E "postgres_xid_age|postgres_up"
+curl -s http://localhost:9187/metrics | grep -E "pg_stat_database_xid_age|postgres_up"
 
 # 3. Query database-level XID age and calculate transactions remaining until shutdown
 psql -U postgres -d prod_financial_db -c "
@@ -248,7 +249,7 @@ vacuumdb -U postgres -d prod_financial_db --table='financial_ledger' --freeze --
 # sudo -u postgres test ! -f /var/lib/postgresql/data/postmaster.pid || sudo -u postgres rm -f /var/lib/postgresql/data/postmaster.pid
 # sudo -u postgres postgres --single -D /var/lib/postgresql/data prod_financial_db
 # backend> VACUUM (FREEZE, VERBOSE);
-# backend> \q
+# Press Ctrl+D (EOF) to exit single-user mode cleanly
 # sudo systemctl start postgresql
 
 # 8. Monitor real-time progress and page processing rates during freezing

@@ -3,6 +3,7 @@ layout: post
 title: "Resolving gRPC HTTP/2 Flow Control Window Exhaustion and Stream Deadlocks Under High-Throughput Streaming"
 date: 2026-11-30 10:52:43 +0900
 category: "Systems & Networking"
+categories: ["Systems & Networking"]
 tags: ['gRPC', 'HTTP2', 'FlowControl', 'Streaming', 'Microservices', 'Troubleshooting']
 fact_check_sources:
   - "https://www.rfc-editor.org/rfc/rfc9113.html#section-5.2"
@@ -132,7 +133,7 @@ To remediate the deadlock, we adjusted both the initial stream flow control wind
 ```diff
 --- internal/transport/grpc_client.go.orig
 +++ internal/transport/grpc_client.go
-@@ -14,6 +14,21 @@
+@@ -14,6 +14,17 @@
  func NewTelemetryClient(ctx context.Context, target string) (*grpc.ClientConn, error) {
 -	// Default dialer without HTTP/2 window tuning (defaults: 64 KB stream / conn window)
 -	return grpc.DialContext(ctx, target,
@@ -159,7 +160,7 @@ To remediate the deadlock, we adjusted both the initial stream flow control wind
 ```diff
 --- internal/transport/grpc_server.go.orig
 +++ internal/transport/grpc_server.go
-@@ -10,6 +10,18 @@
+@@ -10,4 +10,14 @@
  func NewTelemetryServer() *grpc.Server {
 -	// Default server with standard 64 KB flow control window
 -	return grpc.NewServer()
@@ -187,7 +188,7 @@ To implement reactive backpressure safely, client streaming calls must supply a 
 ```diff
 --- src/main/java/com/telemetry/pipeline/GrpcClientTransport.java.orig
 +++ src/main/java/com/telemetry/pipeline/GrpcClientTransport.java
-@@ -18,6 +18,17 @@
+@@ -18,7 +18,9 @@
  public class GrpcClientTransport {
      public static ManagedChannel buildChannel(String host, int port) {
 -        return ManagedChannelBuilder.forAddress(host, port)
@@ -251,7 +252,7 @@ asyncStub.streamTelemetry(responseObserver);
 ```diff
 --- deploy/envoy/envoy-config.yaml.orig
 +++ deploy/envoy/envoy-config.yaml
-@@ -18,6 +18,14 @@
+@@ -18,6 +18,9 @@
          typed_config:
            "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
            http2_protocol_options:

@@ -3,6 +3,7 @@ layout: post
 title: "Resolving Spring Boot HikariCP Connection Timeout: Pool Leak & LeakDetectionThreshold"
 date: 2026-11-10 10:37:42 +0900
 category: "Database & Storage"
+categories: ["Database & Storage"]
 tags: [springboot, hikaricp, connection-pool, postgresql, database-tuning, java, jpa, performance]
 author: "IdeaSpot360 Engineering Notes"
 excerpt: "When high-concurrency traffic bursts trigger HikariCP Connection is not available request timed out after 30000ms errors, expanding maximum-pool-size often collapses PostgreSQL. Here is how holding connections during external HTTP I/O and OSIV causes starvation, how leak-detection-threshold detects leaks, and how transaction decoupling restores database throughput."
@@ -366,7 +367,7 @@ Under high-concurrency synthetic testing at 1,500 requests/sec with an simulated
 | **HikariCP Pending Threads** | 185 threads waiting | 0 threads waiting | Queue fully drained |
 | **Connection Hold Time ($T_{\text{hold}}$)** | 3,420 ms | 2.1 ms | 99.9% reduction |
 | **Tomcat Worker Thread Saturation** | 200 / 200 threads (Exhausted) | 18 / 200 threads | Normal capacity |
-| **$P_{50}$ API Response Latency** | 3,120 ms | 3,015 ms (Pure PG latency) | Preserved |
+| **$P_{50}$ API Response Latency** | 3,120 ms | 3,015 ms (External PG HTTP I/O) | Preserved |
 | **$P_{99}$ API Response Latency** | **31,850 ms (Timeout cascade)** | **3,085 ms** | 90.3% improvement |
 | **Kubernetes Health Check Failures** | Pods restarted (`CrashLoopBackOff`) | 100% Healthy (0 restarts) | Cluster stabilized |
 

@@ -3,6 +3,7 @@ layout: post
 title: "Troubleshooting JVM G1GC Humongous Allocation Spikes & To-space Exhaustion Latency Pauses"
 date: 2026-12-08 10:22:41 +0900
 category: "Systems & Networking"
+categories: ["Systems & Networking"]
 tags: ['Java', 'JVM', 'GarbageCollection', 'G1GC', 'Performance', 'Troubleshooting']
 fact_check_sources:
   - "https://docs.oracle.com/en/java/javase/21/gctuning/garbage-first-g1-garbage-collector1.html"
@@ -139,7 +140,7 @@ The original consumer deserializer duplicated the entire record payload into a m
 ```diff
 --- a/src/main/java/com/enterprise/telemetry/consumer/KafkaBatchPayloadDecoder.java
 +++ b/src/main/java/com/enterprise/telemetry/consumer/KafkaBatchPayloadDecoder.java
-@@ -10,21 +10,38 @@
+@@ -10,17 +10,37 @@
  package com.enterprise.telemetry.consumer;
  
  import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -193,7 +194,7 @@ The container runtime flags were updated in the Kubernetes deployment manifest t
 ```diff
 --- a/deploy/kubernetes/deployment.yaml
 +++ b/deploy/kubernetes/deployment.yaml
-@@ -28,9 +28,17 @@ spec:
+@@ -28,10 +28,18 @@ spec:
            env:
              - name: JAVA_OPTS
 -              value: "-Xms16g -Xmx16g -XX:+UseG1GC -XX:MaxGCPauseMillis=200"

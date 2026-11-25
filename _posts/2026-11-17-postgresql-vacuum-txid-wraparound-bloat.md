@@ -24,8 +24,6 @@ fact_check_sources:
 During peak data ingestion hours, a high-throughput write-heavy PostgreSQL 16 cluster abruptly locked down and rejected all write transactions across all client application services [Source: PostgreSQL Documentation - Routine Vacuuming](https://www.postgresql.org/docs/16/routine-vacuuming.html). The database engine initiated an emergency protective shutdown to prevent silent, irrecoverable data loss caused by 32-bit transaction ID (XID) wraparound.
 
 ```text
-2026-11-17 01:42:19.412 UTC [31842] WARNING:  database "analytics_events" must be vacuumed within 100000000 transactions
-2026-11-17 01:42:19.412 UTC [31842] DETAIL:  Approximately 4.66% of transaction ID space remains before wraparound.
 2026-11-17 01:52:04.108 UTC [31842] WARNING:  database "analytics_events" must be vacuumed within 40000000 transactions
 2026-11-17 01:52:04.108 UTC [31842] DETAIL:  Approximately 1.86% of transaction ID space remains before wraparound.
 2026-11-17 02:04:12.891 UTC [1082] ERROR:  database is not accepting commands that assign new transaction IDs to avoid wraparound data loss in database "analytics_events"
@@ -170,12 +168,12 @@ PostgreSQL governs proactive and forced table-level vacuuming through four confi
 ┌──────────────┬───────────────────────┬───────────────────────┬────────────────────────┬────────────────────┬───────────────┬───────────┐
 │ Normal       │ Aggressive Vacuum     │ Forced Anti-Wraparound│ Vacuum Failsafe        │ Warning Threshold  │ Stop Limit    │ Wraparound│
 │ Autovacuum   │ (Scans All Pages)     │ Autovacuum Worker     │ (Bypasses Cost Delays) │ xidWarnLimit       │ xidStopLimit  │ Limit     │
-│ (Dead Tuples)│ relfrozenxid > 150M   │ relfrozenxid > 200M   │ relfrozenxid > 1.6B    │ (100M XIDs left)   │ (3M XIDs left)│ (0 left)  │
+│ (Dead Tuples)│ relfrozenxid > 150M   │ relfrozenxid > 200M   │ relfrozenxid > 1.6B    │ (40M XIDs left)    │ (3M XIDs left)│ (0 left)  │
 └──────────────┴───────────────────────┴───────────────────────┴────────────────────────┴────────────────────┴───────────────┴───────────┘
 ```
 
 The backend enforces escalating safety thresholds defined in `src/backend/access/transam/varsup.c` as the oldest unfrozen XID approaches $2^{31} - 1$ (`xidWrapLimit = oldest_datfrozenxid + (MaxTransactionId >> 1)`):
-* **100,000,000 transactions remaining** (`xidWarnLimit = xidWrapLimit - 100000000`):
+* **40,000,000 transactions remaining** (`xidWarnLimit = xidWrapLimit - 40000000`):
   `WARNING: database "%s" must be vacuumed within %u transactions`
   `DETAIL: Approximately %.2f%% of transaction ID space remains before wraparound.`
   `HINT: To avoid a shutdown, execute a database-wide VACUUM in that database.`
@@ -257,7 +255,7 @@ VACUUM FULL raw_events;
 # DANGEROUS: Pushing freeze threshold close to the 2-billion hard ceiling
 autovacuum_freeze_max_age = 1800000000
 ```
-* **Why this fails**: Raising `autovacuum_freeze_max_age` to near 1.8 billion narrows the critical margin between normal aggressive vacuuming and the hard emergency shutdown point (2,146,483,648). At 45,000 writes/sec, 300 million transactions are consumed in less than 2 hours. If an autovacuum worker encounters lock starvation, an uncommitted prepared transaction, or disk I/O saturation, the cluster will crash into emergency mode before operators can diagnose or resolve the underlying bottleneck.
+* **Why this fails**: Raising `autovacuum_freeze_max_age` to near 1.8 billion narrows the critical margin between normal aggressive vacuuming and the hard emergency shutdown point (2,144,483,648). At 45,000 writes/sec, 300 million transactions are consumed in less than 2 hours. If an autovacuum worker encounters lock starvation, an uncommitted prepared transaction, or disk I/O saturation, the cluster will crash into emergency mode before operators can diagnose or resolve the underlying bottleneck.
 
 ### Misstep 4: Forcibly Updating System Catalogs via `UPDATE pg_database`
 ```sql
@@ -363,7 +361,7 @@ To ensure autovacuum processes keep pace with 45,000 writes/sec on NVMe storage 
 ```diff
 --- /etc/postgresql/16/main/postgresql.conf.orig	2026-11-17 01:00:00.000000000 +0000
 +++ /etc/postgresql/16/main/postgresql.conf	2026-11-17 03:30:00.000000000 +0000
-@@ -140,15 +140,24 @@
+@@ -140,14 +140,17 @@
 -# Conservative defaults choked autovacuum workers on high-throughput NVMe storage
 -autovacuum_max_workers = 3
 -autovacuum_vacuum_cost_limit = 200
@@ -424,7 +422,7 @@ To prevent page-cache writeback spikes during large vacuum scans, Linux virtual 
 ```diff
 --- /etc/sysctl.d/99-postgresql.conf.orig	2026-11-17 01:00:00.000000000 +0000
 +++ /etc/sysctl.d/99-postgresql.conf	2026-11-17 03:30:00.000000000 +0000
-@@ -10,4 +10,8 @@
+@@ -10,2 +10,5 @@
 -vm.dirty_background_ratio = 10
 -vm.dirty_ratio = 20
 +vm.dirty_background_ratio = 3
@@ -513,7 +511,7 @@ JOIN pg_stat_activity a ON a.pid = p.pid;
 
 ## 6. Prometheus Alerting Rules & Production Runbook Checklist
 
-To detect transaction ID aging and autovacuum stall before emergency lockdown thresholds are breached, configure Prometheus alerting rules via `postgres_exporter`:
+To detect transaction ID aging and autovacuum stall before emergency lockdown thresholds are breached, configure Prometheus alerting rules via `postgres_exporter` (with custom `queries.yaml` collectors for XID age and prepared transactions):
 
 ```yaml
 groups:

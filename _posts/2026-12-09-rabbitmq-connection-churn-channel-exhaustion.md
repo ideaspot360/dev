@@ -3,6 +3,7 @@ layout: post
 title: "Resolving RabbitMQ Connection Churn, AMQP Channel Exhaustion, and Broker CPU Spikes"
 date: 2026-12-09 10:16:34 +0900
 category: "Systems & Networking"
+categories: ["Systems & Networking"]
 tags: ['RabbitMQ', 'AMQP', 'Networking', 'Erlang', 'Microservices', 'Troubleshooting']
 fact_check_sources:
   - "https://www.rabbitmq.com/docs/connections"
@@ -90,7 +91,7 @@ Before identifying client-side connection pooling as the primary bottleneck, two
 
 ### Failed Attempt 1: Raising Erlang Max Process Limit (`+P 2097152`)
 * **Hypothesis**: Doubling the maximum allowed Erlang processes in `vm.args` from 1,048,576 to 2,097,152 would prevent the broker from reaching the process exhaustion limit.
-* **Failure Outcome**: While the `System operating on low process count` error temporarily paused, memory consumption exploded. Each Erlang process requires ~2.6KB of native heap memory at initialization. Holding 1.8 million transient processes consumed over 22GB of RAM on each node, triggering RabbitMQ's memory alarm (`vm_memory_high_watermark`). The broker put all publishers in a blocked state (`connection.blocked`), completely stopping cluster traffic. Furthermore, BEAM scheduler context switching on 16 vCPUs became completely saturated (`beam.smp` at 100% CPU), causing missed heartbeats and socket disconnects.
+* **Failure Outcome**: While the `System operating on low process count` error temporarily paused, memory consumption exploded. Each Erlang process requires ~2.6KB of baseline heap memory ($1.8 \times 10^6 \times 2.6\text{ KB} \approx 4.68\text{ GB}$), and combined with per-connection TLS state, socket buffers, and transient message frames, 1.8 million transient processes consumed over 22GB of RAM on each node, triggering RabbitMQ's memory alarm (`vm_memory_high_watermark`). The broker put all publishers in a blocked state (`connection.blocked`), completely stopping cluster traffic. Furthermore, BEAM scheduler context switching on 16 vCPUs became completely saturated (`beam.smp` at 100% CPU), causing missed heartbeats and socket disconnects.
 
 ### Failed Attempt 2: Bumping `channel_max` in RabbitMQ Configuration
 * **Hypothesis**: Increasing the maximum allowed channels from 2047 to 65535 would give clients more headroom to open channels concurrently.
@@ -110,7 +111,7 @@ Crucially, in Spring AMQP, `connectionCacheSize` only dictates how many *idle* c
 ```diff
 --- a/src/main/java/com/enterprise/order/config/RabbitMqClientConfig.java
 +++ b/src/main/java/com/enterprise/order/config/RabbitMqClientConfig.java
-@@ -10,18 +10,27 @@ import org.springframework.context.annotation.Configuration;
+@@ -10,19 +10,23 @@ import org.springframework.context.annotation.Configuration;
  
  @Configuration
  public class RabbitMqClientConfig {
@@ -146,7 +147,7 @@ The RabbitMQ cluster definition was tuned via `rabbitmq.conf` to optimize the TC
 ```diff
 --- a/deploy/rabbitmq/rabbitmq.conf
 +++ b/deploy/rabbitmq/rabbitmq.conf
-@@ -12,6 +12,14 @@ loopback_users.guest = false
+@@ -12,4 +12,13 @@ loopback_users.guest = false
  ssl_options.cacertfile = /etc/rabbitmq-certs/ca.pem
  ssl_options.certfile   = /etc/rabbitmq-certs/cert.pem
  ssl_options.keyfile    = /etc/rabbitmq-certs/key.pem
@@ -168,7 +169,7 @@ To support rapid socket recycling and prevent SYN queue drops during bursty reco
 ```diff
 --- a/etc/sysctl.d/99-rabbitmq.conf
 +++ b/etc/sysctl.d/99-rabbitmq.conf
-@@ -1,3 +1,6 @@
+@@ -1,1 +1,4 @@
 -# Default host TCP configuration
 +# Optimized TCP parameters for high-throughput RabbitMQ messaging nodes
 +net.core.somaxconn = 4096
@@ -252,7 +253,7 @@ groups:
           description: "Connection open rate is {{ $value | printf '%.1f' }}/sec. Unpooled client connections may saturate Erlang BEAM processes."
 
       - alert: RabbitMQErlangProcessUtilizationHigh
-        expr: (rabbitmq_process_count / rabbitmq_process_limit) * 100 > 75
+        expr: (erlang_vm_process_count / erlang_vm_process_limit) * 100 > 75
         for: 2m
         labels:
           severity: warning
@@ -260,14 +261,14 @@ groups:
           summary: "RabbitMQ Erlang process limit nearing saturation on {{ $labels.instance }}"
           description: "Erlang process count is at {{ $value | printf '%.1f' }}% of total limit."
 
-      - alert: RabbitMQPublishAcknowledgeLatencyHigh
-        expr: histogram_quantile(0.99, sum(rate(rabbitmq_channel_messages_confirmed_duration_seconds_bucket[5m])) by (le)) > 0.050
+      - alert: RabbitMQChannelConsumerDrop
+        expr: sum(rabbitmq_channel_consumers) by (instance) < 1
         for: 1m
         labels:
           severity: critical
         annotations:
-          summary: "RabbitMQ publish confirm P99 latency exceeded 50ms"
-          description: "Publish confirm P99 latency is {{ $value | printf '%.3f' }} seconds."
+          summary: "RabbitMQ active channel consumers dropped to zero on {{ $labels.instance }}"
+          description: "No active consumers on {{ $labels.instance }}; check connection pool health."
 ```
 
 ### Performance & Metric Comparison

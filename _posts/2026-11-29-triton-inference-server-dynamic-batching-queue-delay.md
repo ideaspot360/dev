@@ -3,6 +3,7 @@ layout: post
 title: "Optimizing Triton Inference Server Dynamic Batching & P99 Queue Delay Under Burst Traffic"
 date: 2026-11-29 11:32:43 +0900
 category: "Systems & Networking"
+categories: ["Systems & Networking"]
 tags: ['Triton', 'Inference', 'ModelServing', 'Performance', 'HighThroughput', 'Latency']
 fact_check_sources:
   - "https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/model_configuration.html"
@@ -154,7 +155,7 @@ The production remediation combines four complementary mechanisms [Source: NVIDI
 ```diff
 --- models/fraud_scoring_trt/config.pbtxt.orig
 +++ models/fraud_scoring_trt/config.pbtxt
-@@ -1,18 +1,41 @@
+@@ -1,16 +1,41 @@
  name: "fraud_scoring_trt"
 -backend: "tensorrt"
 -max_batch_size: 128

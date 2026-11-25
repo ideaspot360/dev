@@ -3,6 +3,7 @@ layout: post
 title: "PostgreSQL Connection Exhaustion & 53300 'sorry, too many clients already': Why Increasing max_connections Fails and How PgBouncer Fixes It"
 date: 2026-11-06 09:14:38 +0900
 category: "Database & Storage"
+categories: ["Database & Storage"]
 tags: [postgresql, pgbouncer, performance-tuning, database-architecture, high-availability]
 author: "IdeaSpot360 Engineering Notes"
 excerpt: "When PostgreSQL rejects connections with FATAL: sorry, too many clients already, jacking up max_connections triggers catastrophic context switching and memory starvation. Here is how PgBouncer transaction pooling decouples client sessions from backend worker processes."

@@ -353,7 +353,7 @@ To resolve the dual bottlenecks of TTSP loop starvation and G1 evacuation failur
 ```diff
 --- /etc/default/ledger-core.jvm.orig
 +++ /etc/default/ledger-core.jvm
-@@ -1,11 +1,18 @@
+@@ -1,9 +1,13 @@
  -Xms32g
  -Xmx32g
 --XX:+UseG1GC
@@ -431,14 +431,14 @@ To ensure early warning of any potential regression in JVM pause metrics, we dep
 groups:
   - name: jvm_latency_rules
     rules:
-      - alert: JvmHighSafepointSyncLatency
-        expr: jvm_safepoint_sync_time_seconds{job="ledger-core"} > 0.010
+      - alert: JvmHighGcMeanPauseLatency
+        expr: rate(jvm_gc_pause_seconds_sum{job="ledger-core"}[1m]) / rate(jvm_gc_pause_seconds_count{job="ledger-core"}[1m]) > 0.010
         for: 1m
         labels:
           severity: critical
         annotations:
-          summary: "JVM Time-to-Safepoint (TTSP) exceeded 10ms"
-          description: "Mutator threads are taking >10ms to reach safepoints on {{ $labels.instance }}. Check for uncounted loops or CPU starvation."
+          summary: "JVM mean GC/safepoint pause exceeded 10ms"
+          description: "Average GC pause exceeded 10ms on {{ $labels.instance }}. Check for safepoint stalls or allocation surges."
 
       - alert: JvmHighGcPauseTime
         expr: jvm_gc_pause_seconds_max{job="ledger-core"} > 0.005

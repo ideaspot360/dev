@@ -3,6 +3,7 @@ layout: post
 title: "Fixing ONNX Runtime TensorRT Dynamic Shape Engine Serialization Failures in Production Serving"
 date: 2026-11-27 11:18:42 +0900
 category: "Systems & Networking"
+categories: ["Systems & Networking"]
 tags: ['ONNX', 'TensorRT', 'DeepLearning', 'ModelServing', 'Inference', 'NVIDIA', 'Kubernetes', 'DevOps']
 fact_check_sources:
   - "https://onnxruntime.ai/docs/execution-providers/TensorRT-ExecutionProvider.html"
@@ -133,7 +134,7 @@ To establish a resilient, high-performance serving architecture, we implemented 
 ```diff
 --- serving/inference_engine.py.orig
 +++ serving/inference_engine.py
-@@ -10,14 +10,36 @@
+@@ -10,12 +10,39 @@
  session_options = ort.SessionOptions()
  session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
  
@@ -185,7 +186,7 @@ To establish a resilient, high-performance serving architecture, we implemented 
 ```diff
 --- model_repository/vit_base/config.pbtxt.orig
 +++ model_repository/vit_base/config.pbtxt
-@@ -1,15 +1,39 @@
+@@ -1,16 +1,41 @@
  name: "vit_base"
  backend: "onnxruntime"
 -max_batch_size: 0
@@ -237,7 +238,7 @@ To establish a resilient, high-performance serving architecture, we implemented 
 ```diff
 --- deploy/kubernetes/deployment.yaml.orig
 +++ deploy/kubernetes/deployment.yaml
-@@ -22,6 +22,25 @@
+@@ -22,4 +22,23 @@
          resources:
            limits:
              nvidia.com/gpu: "1"

@@ -271,7 +271,7 @@ For external API endpoints configured in static application manifests, appending
 ```diff
 --- config/payment-service-config.yaml.orig
 +++ config/payment-service-config.yaml
-@@ -14,7 +14,7 @@
+@@ -14,4 +14,4 @@
    retry_limit: 3
    endpoints:
 -    stripe_gateway: "https://api.stripe.com/v1"
@@ -290,7 +290,7 @@ For dynamic workloads querying diverse external endpoints, configure `ndots: 2` 
 ```diff
 --- deploy/payment-worker-deployment.yaml.orig
 +++ deploy/payment-worker-deployment.yaml
-@@ -24,6 +24,13 @@
+@@ -24,4 +24,12 @@
      spec:
 +      dnsPolicy: "ClusterFirst"
 +      dnsConfig:
@@ -320,7 +320,7 @@ NodeLocal DNSCache runs a specialized CoreDNS instance on every node, listening 
 ```diff
 --- deploy/nodelocaldns-corefile.yaml.orig
 +++ deploy/nodelocaldns-corefile.yaml
-@@ -10,8 +10,14 @@
+@@ -10,5 +10,12 @@
      cache 30
      reload
      loop

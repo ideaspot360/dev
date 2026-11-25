@@ -191,7 +191,7 @@ To enable upstream connection pooling and eradicate keepalive race conditions, y
 ```diff
 --- a/etc/nginx/conf.d/upstream.conf
 +++ b/etc/nginx/conf.d/upstream.conf
-@@ -1,14 +1,33 @@
+@@ -1,16 +1,41 @@
  upstream backend_nodes {
 -    server 10.244.2.45:8080;
 -    server 10.244.2.46:8080;
@@ -210,11 +210,11 @@ To enable upstream connection pooling and eradicate keepalive race conditions, y
 +    # Maximum connection lifetime to guarantee DNS re-resolution and pod load spread
 +    keepalive_time 1h;
  }
-
+ 
  server {
      listen 80;
      server_name api.shop.com;
-
+ 
      location / {
          proxy_pass http://backend_nodes;
 +
@@ -249,7 +249,7 @@ Crucially, in Apache Tomcat, if `server.tomcat.keep-alive-timeout` is omitted, t
 ```diff
 --- a/src/main/resources/application.yml
 +++ b/src/main/resources/application.yml
-@@ -1,6 +1,11 @@
+@@ -1,4 +1,9 @@
  server:
    port: 8080
    tomcat:
@@ -272,10 +272,10 @@ Crucially, in the Node.js HTTP parser:
 ```diff
 --- a/server.js
 +++ b/server.js
-@@ -1,7 +1,16 @@
+@@ -1,6 +1,15 @@
  const express = require('express');
  const app = express();
-
+ 
  const server = app.listen(8080, () => {
    console.log('API Gateway target listening on port 8080');
  });
@@ -313,7 +313,7 @@ In Go, `IdleTimeout` on `http.Server` controls the maximum amount of time to wai
 ```diff
 --- a/main.go
 +++ b/main.go
-@@ -15,6 +15,10 @@ func main() {
+@@ -15,8 +15,11 @@ func main() {
  	server := &http.Server{
  		Addr:              ":8080",
  		Handler:           mux,

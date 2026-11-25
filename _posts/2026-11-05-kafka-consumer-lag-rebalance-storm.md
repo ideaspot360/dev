@@ -3,6 +3,7 @@ layout: post
 title: "Fixing Kafka Consumer Lag & Rebalance Storms: CommitFailedException, max.poll.interval.ms, and Cooperative Sticky Assignor"
 date: 2026-11-05 10:18:42 +0900
 category: "Systems & Networking"
+categories: ["Systems & Networking"]
 tags: [kafka, distributed-systems, backend, spring-boot, microservices, troubleshooting]
 author: "IdeaSpot360 Engineering Notes"
 excerpt: "When Kafka consumers repeatedly crash with CommitFailedException and trigger rebalance storms, increasing max.poll.interval.ms masks thread starvation. Here is how decoupled heartbeat threads, bounded poll records sizing, KIP-345 static membership, and CooperativeStickyAssignor eliminate cascading rebalances."
@@ -188,7 +189,7 @@ To eliminate rebalance storms, modern Kafka architectures decouple partition ass
 
 | Protocol Dimension | Classic Eager Protocol (Legacy) | Incremental Cooperative (KIP-429) | Next-Gen Consumer Protocol (KIP-848) |
 | :--- | :--- | :--- | :--- |
-| **Introduced In** | Kafka 0.9 | Kafka 2.4 / 3.x [Source: KIP-429] | Kafka 4.0 GA [Source: KIP-848] |
+| **Introduced In** | Kafka 0.9 | Kafka 2.4 / 3.x [Source: KIP-429](https://cwiki.apache.org/confluence/display/KAFKA/KIP-429%3A+Kafka+Consumer+Incremental+Rebalance+Protocol) | Kafka 4.0 GA [Source: KIP-848](https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol) |
 | **Partition Assignment Class** | `RangeAssignor` / `RoundRobinAssignor` | `CooperativeStickyAssignor` | Broker-side assignor (`uniform`, `range`) |
 | **Rebalance Scope** | Global Stop-The-World (all partitions revoked) | Incremental (only reassigned partitions pause) | Asynchronous partition migrations via heartbeat frames |
 | **Ingestion During Rebalance** | 0% (Halted across entire group) | 100% on unaffected partitions | 100% uninterrupted processing |
@@ -257,42 +258,44 @@ This fencing mechanism guarantees data integrity and prevents split-brain partit
 Apply the following hardening diff to `application.yml` and client properties:
 
 ```diff
-# application.yml (Spring Boot / Apache Kafka Consumer)
-spring:
-  kafka:
-+   listener:
-+     # REQUIRED: Explicit MANUAL_IMMEDIATE mode allows Acknowledgment injection in listeners
-+     ack-mode: manual_immediate
-    consumer:
--     # VULNERABLE: Automatic offset commits hide batch processing failures and cause duplicate processing
--     enable-auto-commit: true
--     auto-commit-interval: 5000
-+     # RESILIENT: Disable auto-commit to hand offset management over to application transaction boundaries
-+     enable-auto-commit: false
-      auto-offset-reset: earliest
-      
-      properties:
--       # VULNERABLE: Default 500 records easily breaches 300s under downstream latency spikes
--       max.poll.records: 500
--       # VULNERABLE: Eager RangeAssignor triggers global Stop-The-World rebalance cascades
--       partition.assignment.strategy: org.apache.kafka.clients.consumer.RangeAssignor
--       session.timeout.ms: 10000
--       heartbeat.interval.ms: 3000
-
-+       # RESILIENT: Bounded batch size ensures processing completes well within the 300s window
-+       max.poll.records: 40
-+       max.poll.interval.ms: 300000
-+       # RESILIENT: Extended session timeout accommodates Kubernetes StatefulSet pod restart grace windows
-+       session.timeout.ms: 60000
-+       heartbeat.interval.ms: 15000
-+       # RESILIENT: Zero-downtime incremental partition rebalancing
-+       partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
-+       # RESILIENT: Static membership prevents pod restart rebalance storms (StatefulSet pod ID)
-+       group.instance.id: ${KAFKA_GROUP_INSTANCE_ID:}
-        
-        # Socket transport and buffer safety
-        receive.buffer.bytes: 1048576       # 1 MiB socket receive buffer
-        max.partition.fetch.bytes: 1048576  # 1 MiB per-partition fetch buffer
+--- a/src/main/resources/application.yml
++++ b/src/main/resources/application.yml
+@@ -1,20 +1,26 @@
+ # application.yml (Spring Boot / Apache Kafka Consumer)
+ spring:
+   kafka:
++    listener:
++      # REQUIRED: Explicit MANUAL_IMMEDIATE mode allows Acknowledgment injection in listeners
++      ack-mode: manual_immediate
+     consumer:
+-      # VULNERABLE: Automatic offset commits hide batch processing failures and cause duplicate processing
+-      enable-auto-commit: true
+-      auto-commit-interval: 5000
++      # RESILIENT: Disable auto-commit to hand offset management over to application transaction boundaries
++      enable-auto-commit: false
+       auto-offset-reset: earliest
+ 
+       properties:
+-        # VULNERABLE: Default 500 records easily breaches 300s under downstream latency spikes
+-        max.poll.records: 500
+-        # VULNERABLE: Eager RangeAssignor triggers global Stop-The-World rebalance cascades
+-        partition.assignment.strategy: org.apache.kafka.clients.consumer.RangeAssignor
+-        session.timeout.ms: 10000
+-        heartbeat.interval.ms: 3000
++        # RESILIENT: Bounded batch size ensures processing completes well within the 300s window
++        max.poll.records: 40
++        max.poll.interval.ms: 300000
++        # RESILIENT: Extended session timeout accommodates Kubernetes StatefulSet pod restart grace windows
++        session.timeout.ms: 60000
++        heartbeat.interval.ms: 15000
++        # RESILIENT: Zero-downtime incremental partition rebalancing
++        partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
++        # RESILIENT: Static membership prevents pod restart rebalance storms (StatefulSet pod ID)
++        group.instance.id: ${KAFKA_GROUP_INSTANCE_ID:}
+ 
+         # Socket transport and buffer safety
+         receive.buffer.bytes: 1048576       # 1 MiB socket receive buffer
+         max.partition.fetch.bytes: 1048576  # 1 MiB per-partition fetch buffer
 ```
 
 ### Step 4: Java Listener Implementation with Manual Immediate Acknowledgment

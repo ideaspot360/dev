@@ -3,6 +3,7 @@ layout: post
 title: "Troubleshooting Kubernetes GPU Scheduling & NVIDIA Container Toolkit Driver Mismatch"
 date: 2026-11-28 10:41:38 +0900
 category: "Cloud & DevOps"
+categories: ["Cloud & DevOps"]
 tags: ['Kubernetes', 'GPU', 'NVIDIA', 'DevOps', 'Troubleshooting', 'Containers']
 fact_check_sources:
   - "https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/index.html"
@@ -177,7 +178,7 @@ Pin driver packages to exact production-tested versions and blacklist NVIDIA rep
 ```diff
 --- bootstrap/gpu-node-userdata.sh.orig
 +++ bootstrap/gpu-node-userdata.sh
-@@ -14,8 +14,26 @@
+@@ -14,6 +14,28 @@
  apt-get update -y
  apt-get install -y linux-headers-$(uname -r)
 -apt-get install -y nvidia-driver-535 nvidia-utils-535 nvidia-container-toolkit
@@ -217,7 +218,7 @@ Modern container architectures leverage Container Device Interface (CDI) specifi
 ```diff
 --- /etc/containerd/config.toml.orig
 +++ /etc/containerd/config.toml
-@@ -32,10 +32,23 @@
+@@ -32,6 +32,17 @@
    [plugins."io.containerd.grpc.v1.cri"]
 +    # Enable Container Device Interface (CDI) spec parsing in containerd CRI
 +    enable_cdi = true
@@ -244,7 +245,7 @@ Configure the Device Plugin to validate NVML health on startup, support CDI devi
 ```diff
 --- deployments/helm/nvidia-device-plugin/values.yaml.orig
 +++ deployments/helm/nvidia-device-plugin/values.yaml
-@@ -8,9 +8,17 @@
+@@ -8,7 +8,16 @@
    failOnInitError: true
    passDeviceSpecs: true
 -  deviceListStrategy: "envvar"

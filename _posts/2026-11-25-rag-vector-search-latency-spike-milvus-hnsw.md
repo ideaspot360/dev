@@ -3,6 +3,7 @@ layout: post
 title: "Resolving RAG Vector Search Latency Spikes: Milvus HNSW Index Parameter & M/efConstruction Tuning"
 date: 2026-11-25 10:38:43 +0900
 category: "Database & Storage"
+categories: ["Database & Storage"]
 tags: ['RAG', 'Milvus', 'VectorSearch', 'HNSW', 'Embeddings', 'Performance', 'Kubernetes']
 fact_check_sources:
   - "https://milvus.io/docs/index-vector-fields.md"
@@ -110,7 +111,7 @@ Remediating vector search latency requires right-sizing the graph topology geome
 ```diff
 --- rag/indexing/create_collection.py.orig
 +++ rag/indexing/create_collection.py
-@@ -1,25 +1,38 @@
+@@ -1,19 +1,28 @@
 -from pymilvus import Collection
 +from pymilvus import Collection, CollectionSchema, FieldSchema, DataType
  
@@ -152,7 +153,7 @@ Remediating vector search latency requires right-sizing the graph topology geome
 ```diff
 --- rag/retriever/search_service.py.orig
 +++ rag/retriever/search_service.py
-@@ -10,13 +10,16 @@
+@@ -10,14 +10,17 @@
  def query_similar_chunks(collection, query_embedding, tenant_id, top_k=10):
 -    # Unbounded ef caused over 12,000 hops and severe disk thrashing
      search_params = {
@@ -177,7 +178,7 @@ Remediating vector search latency requires right-sizing the graph topology geome
 ```diff
 --- deploy/helm/milvus/values.yaml.orig
 +++ deploy/helm/milvus/values.yaml
-@@ -24,10 +24,21 @@
+@@ -24,9 +24,17 @@
  queryNode:
    replicas: 4
    resources:
@@ -200,7 +201,7 @@ Remediating vector search latency requires right-sizing the graph topology geome
 ```
 
 ### Key Engineering Levers:
-1. **Geometric Index Right-Sizing ($M=16, efConstruction=200$)**: Setting $M=16$ limits Layer 0 maximum degree to 32 (down from 128), cutting graph topology memory footprint by 75% (from 6.40 GB down to 1.62 GB cluster-wide). Pairing $M=16$ with $efConstruction=200$ maintains 98.3% recall while accelerating index construction [Source: HNSW Research Paper (Malkov & Yashunin 2018) - arXiv:1603.09320 (https://arxiv.org/abs/1603.09320)].
+1. **Geometric Index Right-Sizing ($M=16, efConstruction=200$)**: Setting $M=16$ limits Layer 0 maximum degree to 32 (down from 128), cutting graph topology memory footprint by 60% (from 6.40 GB down to 2.56 GB cluster-wide, matching $10^7 \times (32 \times 4 + 128)$ bytes). Pairing $M=16$ with $efConstruction=200$ maintains 98.3% recall while accelerating index construction [Source: HNSW Research Paper (Malkov & Yashunin 2018) - arXiv:1603.09320 (https://arxiv.org/abs/1603.09320)].
 2. **Runtime Candidate Pool Tuning ($ef=64$)**: Setting $ef=64$ delivers an optimal candidate evaluation ratio ($\frac{ef}{top\_k} = \frac{64}{10} = 6.4$). Maximum graph exploration hops dropped from 12,480 to under 210 per query, eliminating latency tail spikes [Source: Milvus Vector Index Documentation (https://milvus.io/docs/index-vector-fields.md)].
 3. **Hybrid MMap Memory Management (`mmap.enabled: true`)**: Setting `collection.set_properties({"mmap.enabled": True})` and configuring `vectorField: true, vectorIndex: false` pins the random-access HNSW graph index in physical RAM to prevent OS page faults, while offloading sequential raw vectors to local high-speed storage via mmap, reducing physical RAM pressure by ~55% [Source: Milvus MMap Storage Documentation (https://milvus.io/docs/mmap.md)].
 4. **Tenant Scoping & Partition Key Pruning**: Defining `is_partition_key=True` on `tenant_id` enables automated partition pruning. QueryCoord routes queries directly to hashed physical partition segments, preventing sparse bitset graph navigation during filtered ANN queries [Source: Milvus Partition Key Documentation (https://milvus.io/docs/use-partition-key.md)].

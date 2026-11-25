@@ -3,6 +3,7 @@ layout: post
 title: "Fixing Kafka Producer BufferExhaustedException & Record Expiring Batch Timeouts Under Heavy Ingestion"
 date: 2026-12-02 10:14:52 +0900
 category: "Cloud & DevOps"
+categories: ["Cloud & DevOps"]
 tags: ['Kafka', 'Producer', 'BufferExhausted', 'Backpressure', 'DistributedSystems', 'Troubleshooting']
 fact_check_sources:
   - "https://kafka.apache.org/documentation/#producerconfigs"
@@ -269,22 +270,20 @@ A permanent resolution required addressing the root mismatch between ingress rat
 ```diff
 --- src/main/resources/application.yml.orig	2026-11-23 10:14:00.000000000 +0000
 +++ src/main/resources/application.yml	2026-11-23 10:45:00.000000000 +0000
-@@ -14,14 +14,19 @@
+@@ -14,11 +14,23 @@
      producer:
        bootstrap-servers: b-1.msk-telemetry.production.kafka:9092,b-2.msk-telemetry.production.kafka:9092,b-3.msk-telemetry.production.kafka:9092
        acks: all
 -      batch-size: 16384
 -      buffer-memory: 33554432
 -      compression-type: none
--      linger-ms: 0
--      max-block-ms: 60000
 +      batch-size: 65536
 +      buffer-memory: 134217728
 +      compression-type: lz4
-+      linger-ms: 20
-+      max-block-ms: 15000
        properties:
 -        delivery.timeout.ms: 120000
++        linger.ms: 20
++        max.block.ms: 15000
 +        delivery.timeout.ms: 180000
          request.timeout.ms: 30000
          max.in.flight.requests.per.connection: 5

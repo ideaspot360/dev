@@ -3,6 +3,7 @@ layout: post
 title: "Debugging PostgreSQL Deadlocks: Root Cause, Row-Level Lock Queues & Advisory Locks"
 date: 2026-11-03 14:18:27 +0900
 category: "Database & Storage"
+categories: ["Database & Storage"]
 tags: [postgresql, database, backend, sql, troubleshooting]
 author: "IdeaSpot360 Engineering Notes"
 excerpt: "When PostgreSQL throws 'deadlock detected: Process waits for ShareLock on transaction', simply retrying hides race conditions. Here is how row-level lock trees, tuple headers, and advisory locks actually behave."

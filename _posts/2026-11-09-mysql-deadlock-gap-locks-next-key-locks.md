@@ -3,6 +3,7 @@ layout: post
 title: "Fixing MySQL Deadlock in High-Concurrency Transactions: Gap Locks vs Next-Key Locks"
 date: 2026-11-09 10:14:38 +0900
 category: "Database & Storage"
+categories: ["Database & Storage"]
 tags: [mysql, innodb, deadlock, gap-lock, next-key-lock, transaction-isolation, database-tuning, performance]
 author: "IdeaSpot360 Engineering Notes"
 excerpt: "When concurrent INSERT statements fail with MySQL Error 1213 (Deadlock found when trying to get lock), application retries only worsen lock contention. Here is how InnoDB Gap Locks, Next-Key Locks, and Insert Intention Locks interact, and how transitioning to READ COMMITTED and atomic idempotency eliminates deadlocks."
@@ -312,7 +313,7 @@ Instead of executing speculative `SELECT ... FOR UPDATE` queries that lock non-e
 ```diff
 --- a/src/main/java/com/ideaspot360/shop/order/OrderRepository.java
 +++ b/src/main/java/com/ideaspot360/shop/order/OrderRepository.java
-@@ -24,20 +24,19 @@ public class OrderRepository {
+@@ -24,12 +24,13 @@ public class OrderRepository {
      public Order createOrder(Order order) {
 -        // FLAWED APPROACH: Speculative range check under REPEATABLE READ acquires gap locks
 -        String checkSql = "SELECT id FROM orders WHERE id BETWEEN ? AND ? FOR UPDATE";
