@@ -395,14 +395,16 @@ footer.site-footer {
 
 /* Ad Slot Container */
 .ad-slot {
-  margin: 32px 0;
-  padding: 16px;
+  margin: 24px 0;
   text-align: center;
-  background: var(--card-bg);
-  border: 1px dashed var(--border-color);
-  border-radius: 6px;
-  color: var(--text-muted);
-  font-size: 0.8rem;
+}
+
+.ad-slot:has(ins[data-ad-status="unfilled"]),
+.ad-slot:has(ins:empty),
+ins.adsbygoogle[data-ad-status="unfilled"] {
+  display: none !important;
+  margin: 0;
+  padding: 0;
 }
 
 /* Responsive */
