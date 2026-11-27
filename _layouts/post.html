@@ -12,20 +12,13 @@ layout: default
     <span class="bc-current" aria-current="page">{{ page.title | truncate: 45 }}</span>
   </nav>
 
-  <header style="margin-bottom: 28px;">
+  <header style="margin-bottom: 24px;">
     <div class="post-meta" style="flex-wrap: wrap; gap: 8px;">
       <time datetime="{{ page.date | date_to_xmlschema }}" style="white-space: nowrap;">📅 {{ page.date | date: "%B %d, %Y" }}</time>
       <span>&bull;</span>
       <span style="white-space: nowrap;">✍️ {{ page.author | default: site.author.name }}</span>
     </div>
-    <h1 style="margin-top: 10px; margin-bottom: 14px;">{{ page.title }}</h1>
-    {% if page.tags %}
-    <div class="tags" style="margin-top: 0;">
-      {% for tag in page.tags %}
-      <a href="{{ '/' | relative_url }}#tag={{ tag | slugify }}" class="tag">#{{ tag }}</a>
-      {% endfor %}
-    </div>
-    {% endif %}
+    <h1 style="margin-top: 10px; margin-bottom: 0;">{{ page.title }}</h1>
   </header>
 
   {% include ads_slot.html %}
@@ -33,6 +26,14 @@ layout: default
   <div class="entry-content">
     {{ content }}
   </div>
+
+  {% if page.tags %}
+  <div class="tags" style="margin-top: 32px; padding-top: 20px; border-top: 1px solid var(--border-color);">
+    {% for tag in page.tags %}
+    <a href="{{ '/' | relative_url }}#tag={{ tag | slugify }}" class="tag">#{{ tag }}</a>
+    {% endfor %}
+  </div>
+  {% endif %}
 
   {% include ads_slot.html %}
 
